@@ -143,6 +143,51 @@ Publishes to `hermes-stackchan/desk/cmd/sound`.
 
 Currently supports simple local tones through the speaker.
 
+### audio
+
+Publishes to `hermes-stackchan/desk/cmd/audio`.
+
+This is the V1.0 control contract for wakeword and push-to-talk state. It currently controls and reports speech mode over MQTT; microphone PCM upload and real wakeword detection are the next implementation layer.
+
+Supported actions: `set_wakeword`, `simulate_wakeword`, `start_recording`, `stop_recording`.
+
+Enable wakeword listening:
+
+```json
+{
+  "schema_version": "1.0",
+  "action": "set_wakeword",
+  "wakeword": "Computer",
+  "enabled": true,
+  "request_id": "audio-001"
+}
+```
+
+Push-to-talk start and stop:
+
+```json
+{
+  "schema_version": "1.0",
+  "action": "start_recording",
+  "source": "push_to_talk",
+  "min_ms": 5000,
+  "max_ms": 20000,
+  "request_id": "ptt-001"
+}
+```
+
+```json
+{
+  "schema_version": "1.0",
+  "action": "stop_recording",
+  "source": "push_to_talk",
+  "reason": "touch_release",
+  "request_id": "ptt-002"
+}
+```
+
+Wakeword recording uses `min_ms` plus `silence_timeout_ms` as the first auto-stop rule until real microphone level detection is implemented.
+
 ### system
 
 Publishes to `hermes-stackchan/desk/cmd/system`.
@@ -151,7 +196,7 @@ Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`.
 
 ## Status
 
-StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, temperatures, `firmware`, and `firmware_version`.
+StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, temperatures, `firmware`, and `firmware_version`.
 
 Battery fields:
 
@@ -185,6 +230,28 @@ Temperature fields:
 
 Temperature value `-1` means unavailable. Servo temperatures are only known while the servo bus is powered and answering.
 
+Audio-control fields:
+
+```json
+{
+  "wakeword_enabled": true,
+  "recording": false,
+  "audio": {
+    "input_ready": false,
+    "wakeword_enabled": true,
+    "wakeword": "Computer",
+    "recording": false,
+    "recording_source": "none",
+    "recording_started_ms": 0,
+    "recording_min_ms": 5000,
+    "recording_silence_timeout_ms": 1000,
+    "recording_max_ms": 15000
+  }
+}
+```
+
+StackChan also publishes realtime audio events to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
+
 Hermes HTTP responses consumed by the bridge must be JSON:
 
 ```json
@@ -199,8 +266,8 @@ Hermes HTTP responses consumed by the bridge must be JSON:
 
 ## Forbidden In This Slice
 
-- Audio capture
-- Wake word handling
+- Microphone PCM streaming
+- Real wake word detection
 - Camera commands
 - Multi-device routing
 - Cloud TTS playback

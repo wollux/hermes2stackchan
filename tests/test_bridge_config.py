@@ -41,6 +41,8 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(config.pairs["desk"].move_topic, "hermes-stackchan/desk/cmd/move")
         self.assertEqual(config.pairs["desk"].motion_topic, "hermes-stackchan/desk/cmd/motion")
         self.assertEqual(config.pairs["desk"].device_topic, "hermes-stackchan/desk/cmd/device")
+        self.assertEqual(config.pairs["desk"].audio_topic, "hermes-stackchan/desk/cmd/audio")
+        self.assertEqual(config.pairs["desk"].events_topic, "hermes-stackchan/desk/events")
 
     def test_rejects_wrong_namespace(self) -> None:
         raw = {
@@ -284,17 +286,66 @@ class BridgeConfigTests(unittest.TestCase):
             "volume_pct": 80,
             "brightness_pct": 75,
             "display_sleeping": False,
+            "wakeword_enabled": True,
+            "recording": False,
+            "speaking": False,
             "head": {"pan_pct": 0, "tilt_pct": 0, "ready": True},
             "face": {"emotion": "neutral", "intensity_pct": 60},
             "ui": {"mode": "face"},
             "led": {"mode": "off", "mode_id": 0, "r": 0, "g": 0, "b": 0, "ready": True},
             "speaker": {"ready": True, "volume_pct": 80},
             "temperature": {"soc_c": 40, "servo_yaw_c": -1, "servo_pitch_c": -1},
+            "audio": {
+                "input_ready": False,
+                "wakeword_enabled": True,
+                "wakeword": "Computer",
+                "recording": False,
+                "recording_source": "none",
+                "recording_started_ms": 0,
+                "recording_min_ms": 5000,
+                "recording_silence_timeout_ms": 1000,
+                "recording_max_ms": 15000,
+            },
         }
 
         self.assertEqual(missing_status_paths(status), [])
         del status["firmware"]
         self.assertEqual(missing_status_paths(status), ["firmware"])
+
+    def test_audio_action_to_topic_payload_start_recording(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {
+                "action": "start_recording",
+                "source": "push_to_talk",
+                "min_ms": 5000,
+                "silence_timeout_ms": 1000,
+                "max_ms": 20000,
+            },
+            "audio-001",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/audio")
+        self.assertEqual(payload["action"], "start_recording")
+        self.assertEqual(payload["source"], "push_to_talk")
+        self.assertEqual(payload["request_id"], "audio-001")
+        self.assertEqual(payload["min_ms"], 5000)
+
+    def test_audio_action_to_topic_payload_set_wakeword(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {"action": "audio", "audio_action": "set_wakeword", "wakeword": "Computer", "enabled": True},
+            "wake-001",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/audio")
+        self.assertEqual(payload["action"], "set_wakeword")
+        self.assertEqual(payload["wakeword"], "Computer")
+        self.assertTrue(payload["enabled"])
 
     def test_life_animation_only_runs_on_idle_face(self) -> None:
         status = {

@@ -10,12 +10,14 @@ This is the first Hermes2StackChan V1.0 hardware slice: the bridge sends MQTT co
 - Move command: `hermes-stackchan/desk/cmd/move`
 - Motion command: `hermes-stackchan/desk/cmd/motion`
 - Sound command: `hermes-stackchan/desk/cmd/sound`
+- Audio command: `hermes-stackchan/desk/cmd/audio`
 - LED command: `hermes-stackchan/desk/cmd/led`
 - Device command: `hermes-stackchan/desk/cmd/device`
 - Say command: `hermes-stackchan/desk/cmd/say`
 - Status: `hermes-stackchan/desk/status`
 - ACK: `hermes-stackchan/desk/ack`
 - Error: `hermes-stackchan/desk/error`
+- Events: `hermes-stackchan/desk/events`
 
 ## Bridge Setup
 
@@ -108,6 +110,42 @@ scripts/stop_life_animator.sh desk
 ```
 
 `animate-life` only sends small face and mostly subtle head impulses while the retained status reports `ui.mode: face`, the display is awake, and StackChan is not recording or speaking. The firmware renders blink, normal breathing, occasional deep breathing, tiny `Z` micro-sleeps, small mouth impulses, and pupil-glance impulses as short smooth frame animations and returns to the current default face. Sometimes StackChan first glances with the pupils, then gently turns the head in that direction, and finally centers the pupils again. Upward glances are slightly favored so he does not feel stuck looking down. Rarely, StackChan performs a bigger desk-scan sweep left/right and returns to center; the Bridge sends matching pupil glances for each sweep segment so the eyes track the head direction. Pitch stays small in those action moves. Firmware also glances in the detected movement direction for direct `move` and `motion` commands. Servo life motions are bounded and can be disabled with `--no-motion`. It never sends LED or sound commands.
+
+## Audio Control Slice
+
+Issue #6 starts with the control contract for wakeword and push-to-talk. This slice does not yet stream microphone PCM, but it gives firmware, bridge, MQTTX, and later Hermes one stable way to set and observe speech mode.
+
+Enable the configured wakeword:
+
+```sh
+scripts/h2s_bridge.sh send-audio \
+  --pair desk \
+  --action set_wakeword \
+  --wakeword Computer \
+  --enabled \
+  --wait-ack
+```
+
+Simulate a wakeword trigger and let the firmware auto-stop after the configured minimum plus silence timeout:
+
+```sh
+scripts/h2s_bridge.sh send-audio \
+  --pair desk \
+  --action simulate_wakeword \
+  --wakeword Computer \
+  --min-ms 5000 \
+  --silence-timeout-ms 1000 \
+  --wait-ack
+```
+
+Simulate push-to-talk while a touch/button is held:
+
+```sh
+scripts/h2s_bridge.sh send-audio --pair desk --action start_recording --source push_to_talk --wait-ack
+scripts/h2s_bridge.sh send-audio --pair desk --action stop_recording --source push_to_talk --reason touch_release --wait-ack
+```
+
+The retained status includes top-level `wakeword_enabled` and `recording`, plus an `audio` object with `input_ready`, `wakeword`, `recording_source`, and timing fields. The firmware also publishes realtime state changes to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
 
 ## Hermes HTTP Adapter
 

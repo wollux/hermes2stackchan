@@ -100,6 +100,15 @@ volatile int g_pending_yaw_target_pct = 101;
 volatile int g_pending_pitch_target_pct = 101;
 char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
+volatile bool g_audio_input_ready = false;
+volatile bool g_wakeword_enabled = false;
+volatile bool g_recording = false;
+volatile int64_t g_recording_started_ms = 0;
+volatile int g_recording_min_ms = 5000;
+volatile int g_recording_silence_timeout_ms = 1000;
+volatile int g_recording_max_ms = 15000;
+char g_wakeword[32] = "Computer";
+char g_recording_source[24] = "none";
 
 char g_topic_display[96] = {};
 char g_topic_system[96] = {};
@@ -107,12 +116,14 @@ char g_topic_face[96] = {};
 char g_topic_move[96] = {};
 char g_topic_motion[96] = {};
 char g_topic_sound[96] = {};
+char g_topic_audio[96] = {};
 char g_topic_led[96] = {};
 char g_topic_device[96] = {};
 char g_topic_say[96] = {};
 char g_topic_status[96] = {};
 char g_topic_ack[96] = {};
 char g_topic_error[96] = {};
+char g_topic_events[96] = {};
 char g_ui_mode[16] = "face";
 char g_mqtt_rx_topic[kMaxMqttTopic] = {};
 char g_mqtt_rx_payload[kMaxMqttPayload + 1] = {};
@@ -1823,12 +1834,14 @@ void build_topics()
     std::snprintf(g_topic_move, sizeof(g_topic_move), "hermes-stackchan/%s/cmd/move", pair_id);
     std::snprintf(g_topic_motion, sizeof(g_topic_motion), "hermes-stackchan/%s/cmd/motion", pair_id);
     std::snprintf(g_topic_sound, sizeof(g_topic_sound), "hermes-stackchan/%s/cmd/sound", pair_id);
+    std::snprintf(g_topic_audio, sizeof(g_topic_audio), "hermes-stackchan/%s/cmd/audio", pair_id);
     std::snprintf(g_topic_led, sizeof(g_topic_led), "hermes-stackchan/%s/cmd/led", pair_id);
     std::snprintf(g_topic_device, sizeof(g_topic_device), "hermes-stackchan/%s/cmd/device", pair_id);
     std::snprintf(g_topic_say, sizeof(g_topic_say), "hermes-stackchan/%s/cmd/say", pair_id);
     std::snprintf(g_topic_status, sizeof(g_topic_status), "hermes-stackchan/%s/status", pair_id);
     std::snprintf(g_topic_ack, sizeof(g_topic_ack), "hermes-stackchan/%s/ack", pair_id);
     std::snprintf(g_topic_error, sizeof(g_topic_error), "hermes-stackchan/%s/error", pair_id);
+    std::snprintf(g_topic_events, sizeof(g_topic_events), "hermes-stackchan/%s/events", pair_id);
 }
 
 bool topic_matches(const char* topic, int topic_len, const char* expected)
@@ -1899,6 +1912,25 @@ void publish_error(const char* request_id, const char* command, const char* mess
     publish_json(g_topic_error, payload);
 }
 
+void publish_event(const char* event, const char* source, const char* request_id, const char* message)
+{
+    char payload[512] = {};
+    std::snprintf(payload,
+                  sizeof(payload),
+                  "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
+                  "\"event\":\"%s\",\"source\":\"%s\",\"request_id\":\"%s\","
+                  "\"uptime_ms\":%lld,\"recording\":%s,\"message\":\"%s\"}",
+                  CONFIG_STACKCHAN_PAIR_ID,
+                  CONFIG_STACKCHAN_STACKCHAN_ID,
+                  event,
+                  source && *source ? source : "",
+                  request_id && *request_id ? request_id : "",
+                  static_cast<long long>(esp_timer_get_time() / 1000),
+                  g_recording ? "true" : "false",
+                  message && *message ? message : "");
+    publish_json(g_topic_events, payload);
+}
+
 void publish_status()
 {
     int rssi = 0;
@@ -1910,7 +1942,7 @@ void publish_status()
     update_soc_temperature();
     update_battery_status();
 
-    char payload[1500] = {};
+    char payload[1900] = {};
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
@@ -1921,7 +1953,10 @@ void publish_status()
                   "\"battery_current_direction\":%d,"
                   "\"volume_pct\":%d,\"brightness_pct\":%u,\"display_sleeping\":%s,"
                   "\"temperature\":{\"soc_c\":%d,\"servo_yaw_c\":%d,\"servo_pitch_c\":%d},"
-                  "\"wakeword_enabled\":false,\"recording\":false,\"speaking\":false,"
+                  "\"wakeword_enabled\":%s,\"recording\":%s,\"speaking\":false,"
+                  "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\","
+                  "\"recording\":%s,\"recording_source\":\"%s\",\"recording_started_ms\":%lld,"
+                  "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d},"
                   "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
                   "\"led\":{\"mode\":\"%s\",\"mode_id\":%d,\"r\":%d,\"g\":%d,\"b\":%d,\"ready\":%s},"
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
@@ -1949,6 +1984,17 @@ void publish_status()
                   static_cast<int>(g_temperature_soc_c),
                   static_cast<int>(g_temperature_servo_yaw_c),
                   static_cast<int>(g_temperature_servo_pitch_c),
+                  g_wakeword_enabled ? "true" : "false",
+                  g_recording ? "true" : "false",
+                  g_audio_input_ready ? "true" : "false",
+                  g_wakeword_enabled ? "true" : "false",
+                  g_wakeword,
+                  g_recording ? "true" : "false",
+                  g_recording_source,
+                  static_cast<long long>(g_recording_started_ms),
+                  static_cast<int>(g_recording_min_ms),
+                  static_cast<int>(g_recording_silence_timeout_ms),
+                  static_cast<int>(g_recording_max_ms),
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
@@ -2380,6 +2426,71 @@ void handle_say_command(const char* data, int len)
     cJSON_Delete(root);
 }
 
+void set_recording_state(bool enabled, const char* source, const char* request_id, const char* reason)
+{
+    if (enabled) {
+        g_recording = true;
+        g_recording_started_ms = esp_timer_get_time() / 1000;
+        copy_cstr(g_recording_source, sizeof(g_recording_source), source && *source ? source : "manual");
+        copy_cstr(g_ui_mode, sizeof(g_ui_mode), "recording");
+        set_lcd_sleep(false);
+        draw_face("speaking", 70);
+        publish_event("recording_started", g_recording_source, request_id, reason);
+    } else {
+        char previous_source[sizeof(g_recording_source)] = {};
+        copy_cstr(previous_source, sizeof(previous_source), g_recording_source);
+        g_recording = false;
+        g_recording_started_ms = 0;
+        copy_cstr(g_recording_source, sizeof(g_recording_source), "none");
+        copy_cstr(g_ui_mode, sizeof(g_ui_mode), "face");
+        draw_face(g_face_emotion, g_face_intensity_pct);
+        publish_event("recording_stopped", previous_source, request_id, reason);
+    }
+    publish_status();
+}
+
+void handle_audio_command(const char* data, int len)
+{
+    cJSON* root = cJSON_ParseWithLength(data, len);
+    if (!root) {
+        publish_error("", "audio", "invalid json");
+        return;
+    }
+    const char* request_id = json_string(root, "request_id");
+    const char* action = json_string(root, "action");
+
+    if (std::strcmp(action, "set_wakeword") == 0) {
+        g_wakeword_enabled = json_bool(root, "enabled", true);
+        const char* wakeword = json_string(root, "wakeword", g_wakeword);
+        if (wakeword && *wakeword) {
+            copy_cstr(g_wakeword, sizeof(g_wakeword), wakeword);
+        }
+        publish_ack(request_id, "audio", g_wakeword_enabled ? "wakeword enabled" : "wakeword disabled");
+        publish_status();
+    } else if (std::strcmp(action, "start_recording") == 0) {
+        const char* source = json_string(root, "source", "manual");
+        g_recording_min_ms = clamp_int(json_int(root, "min_ms", static_cast<int>(g_recording_min_ms)), 0, 30000);
+        g_recording_silence_timeout_ms = clamp_int(json_int(root, "silence_timeout_ms", static_cast<int>(g_recording_silence_timeout_ms)), 0, 10000);
+        g_recording_max_ms = clamp_int(json_int(root, "max_ms", static_cast<int>(g_recording_max_ms)), 1000, 60000);
+        set_recording_state(true, source, request_id, "start requested");
+        publish_ack(request_id, "audio", "recording started");
+    } else if (std::strcmp(action, "stop_recording") == 0) {
+        const char* source = json_string(root, "source", g_recording_source);
+        const char* reason = json_string(root, "reason", "stop requested");
+        set_recording_state(false, source, request_id, reason);
+        publish_ack(request_id, "audio", "recording stopped");
+    } else if (std::strcmp(action, "simulate_wakeword") == 0) {
+        const char* wakeword = json_string(root, "wakeword", g_wakeword);
+        publish_event("wakeword_detected", wakeword, request_id, "simulated wakeword");
+        g_wakeword_enabled = true;
+        set_recording_state(true, "wakeword", request_id, "wakeword detected");
+        publish_ack(request_id, "audio", "wakeword simulated");
+    } else {
+        publish_error(request_id, "audio", "unsupported action");
+    }
+    cJSON_Delete(root);
+}
+
 void handle_system_command(const char* data, int len)
 {
     cJSON* root = cJSON_ParseWithLength(data, len);
@@ -2429,6 +2540,8 @@ void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, i
         handle_motion_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_sound)) {
         handle_sound_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_audio)) {
+        handle_audio_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_led)) {
         handle_led_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_device)) {
@@ -2530,6 +2643,27 @@ void ui_task(void*)
             draw_face(g_face_emotion, g_face_intensity_pct);
         }
         publish_status();
+    }
+}
+
+void audio_state_task(void*)
+{
+    while (true) {
+        if (g_recording) {
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            const int64_t elapsed_ms = now_ms - g_recording_started_ms;
+            const bool wakeword_source = std::strcmp(g_recording_source, "wakeword") == 0;
+            const int auto_stop_ms = wakeword_source
+                                         ? static_cast<int>(g_recording_min_ms + g_recording_silence_timeout_ms)
+                                         : static_cast<int>(g_recording_max_ms);
+            if (elapsed_ms >= auto_stop_ms) {
+                set_recording_state(false,
+                                    wakeword_source ? "wakeword" : g_recording_source,
+                                    "",
+                                    wakeword_source ? "silence timeout" : "max duration");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -2799,6 +2933,7 @@ void mqtt_event_handler(void*, esp_event_base_t, int32_t event_id, void* event_d
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_move, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_motion, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_sound, 1);
+        esp_mqtt_client_subscribe(g_mqtt_client, g_topic_audio, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_led, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_device, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_say, 1);
@@ -2900,6 +3035,7 @@ extern "C" void app_main()
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
+    xTaskCreate(audio_state_task, "audio_state", 4096, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;

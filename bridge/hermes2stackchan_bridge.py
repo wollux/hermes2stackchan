@@ -72,6 +72,10 @@ class PairConfig:
         return f"{self.mqtt_prefix}/cmd/sound"
 
     @property
+    def audio_topic(self) -> str:
+        return f"{self.mqtt_prefix}/cmd/audio"
+
+    @property
     def led_topic(self) -> str:
         return f"{self.mqtt_prefix}/cmd/led"
 
@@ -94,6 +98,10 @@ class PairConfig:
     @property
     def error_topic(self) -> str:
         return f"{self.mqtt_prefix}/error"
+
+    @property
+    def events_topic(self) -> str:
+        return f"{self.mqtt_prefix}/events"
 
 
 @dataclass(frozen=True)
@@ -464,6 +472,9 @@ REQUIRED_STATUS_PATHS = (
     "volume_pct",
     "brightness_pct",
     "display_sleeping",
+    "wakeword_enabled",
+    "recording",
+    "speaking",
     "head.pan_pct",
     "head.tilt_pct",
     "head.ready",
@@ -481,6 +492,15 @@ REQUIRED_STATUS_PATHS = (
     "temperature.soc_c",
     "temperature.servo_yaw_c",
     "temperature.servo_pitch_c",
+    "audio.input_ready",
+    "audio.wakeword_enabled",
+    "audio.wakeword",
+    "audio.recording",
+    "audio.recording_source",
+    "audio.recording_started_ms",
+    "audio.recording_min_ms",
+    "audio.recording_silence_timeout_ms",
+    "audio.recording_max_ms",
 )
 
 
@@ -794,6 +814,26 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         if action.get("volume_pct") is not None:
             payload["volume_pct"] = action["volume_pct"]
         return pair.sound_topic, with_request_id(payload, action_request_id)
+
+    if name in {"audio", "start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"}:
+        audio_action = optional_string(action.get("audio_action") or action.get("command"))
+        if name != "audio":
+            audio_action = name
+        if not audio_action:
+            raise ConfigError("audio action needs audio_action or command")
+        audio_action = audio_action.strip().lower().replace("-", "_")
+        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"}:
+            raise ConfigError(f"unsupported audio action: {audio_action}")
+        payload: dict[str, Any] = {"action": audio_action}
+        for key in ("source", "wakeword", "reason"):
+            if optional_string(action.get(key)):
+                payload[key] = optional_string(action.get(key))
+        for key in ("min_ms", "silence_timeout_ms", "max_ms"):
+            if action.get(key) is not None:
+                payload[key] = parse_int_value(action.get(key), 0, f"audio.{key}")
+        if action.get("enabled") is not None:
+            payload["enabled"] = parse_bool_value(action.get("enabled"), True)
+        return pair.audio_topic, with_request_id(payload, action_request_id)
 
     if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake"}:
         system_action = optional_string(action.get("system_action") or action.get("command"))
@@ -1586,6 +1626,31 @@ def send_sound(args: argparse.Namespace) -> int:
     return send_payload(args, pair.sound_topic, with_request_id(payload, args.request_id))
 
 
+def send_audio(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    if args.enabled and args.disabled:
+        raise ConfigError("send-audio accepts either --enabled or --disabled, not both")
+    payload: dict[str, Any] = {"action": args.action}
+    if args.source:
+        payload["source"] = args.source
+    if args.wakeword:
+        payload["wakeword"] = args.wakeword
+    if args.reason:
+        payload["reason"] = args.reason
+    if args.min_ms is not None:
+        payload["min_ms"] = args.min_ms
+    if args.silence_timeout_ms is not None:
+        payload["silence_timeout_ms"] = args.silence_timeout_ms
+    if args.max_ms is not None:
+        payload["max_ms"] = args.max_ms
+    if args.enabled:
+        payload["enabled"] = True
+    if args.disabled:
+        payload["enabled"] = False
+    return send_payload(args, pair.audio_topic, with_request_id(payload, args.request_id))
+
+
 def send_say(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
@@ -1725,6 +1790,24 @@ def build_parser() -> argparse.ArgumentParser:
     sound.add_argument("--duration-ms", type=int, default=140, help="Tone duration.")
     sound.add_argument("--volume-pct", type=int, default=None, help="Optional volume update before tone.")
     sound.set_defaults(func=send_sound)
+
+    audio = subcommands.add_parser("send-audio", help="Control wakeword and push-to-talk recording state.")
+    add_common_send_options(audio)
+    audio.add_argument(
+        "--action",
+        required=True,
+        choices=["start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"],
+        help="Audio-control action to send.",
+    )
+    audio.add_argument("--source", default=None, help="Recording source, for example wakeword, push_to_talk, or manual.")
+    audio.add_argument("--wakeword", default=None, help="Wakeword label, for example Computer.")
+    audio.add_argument("--reason", default=None, help="Stop reason, for example touch_release or silence_timeout.")
+    audio.add_argument("--min-ms", type=int, default=None, help="Minimum recording time hint.")
+    audio.add_argument("--silence-timeout-ms", type=int, default=None, help="Wakeword silence timeout hint.")
+    audio.add_argument("--max-ms", type=int, default=None, help="Maximum recording time hint.")
+    audio.add_argument("--enabled", action="store_true", help="Enable wakeword listening for set_wakeword.")
+    audio.add_argument("--disabled", action="store_true", help="Disable wakeword listening for set_wakeword.")
+    audio.set_defaults(func=send_audio)
 
     say = subcommands.add_parser("send-say", help="Display a short text with optional beep.")
     add_common_send_options(say)
