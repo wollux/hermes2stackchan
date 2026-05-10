@@ -8,6 +8,7 @@ This is the first Hermes2StackChan V1.0 hardware slice: the bridge sends MQTT co
 - System command: `hermes-stackchan/desk/cmd/system`
 - Face command: `hermes-stackchan/desk/cmd/face`
 - Move command: `hermes-stackchan/desk/cmd/move`
+- Motion command: `hermes-stackchan/desk/cmd/motion`
 - Sound command: `hermes-stackchan/desk/cmd/sound`
 - LED command: `hermes-stackchan/desk/cmd/led`
 - Device command: `hermes-stackchan/desk/cmd/device`
@@ -71,10 +72,14 @@ Try hardware commands:
 python3 -m bridge.hermes2stackchan_bridge --env .env send-face --pair desk --emotion happy --wait-ack
 python3 -m bridge.hermes2stackchan_bridge --env .env send-move --pair desk --direction left --wait-ack
 python3 -m bridge.hermes2stackchan_bridge --env .env send-move --pair desk --direction center --wait-ack
+python3 -m bridge.hermes2stackchan_bridge --env .env send-motion --pair desk --profile circle --curve spline --speed-pct 35 --steps 40 --wait-ack
+python3 -m bridge.hermes2stackchan_bridge --env .env send-motion --pair desk --curve linear --points '[[0,0,0,25],[0,28,0,25],[0,-18,0,25],[0,0,0,25]]' --wait-ack
 python3 -m bridge.hermes2stackchan_bridge --env .env send-led --pair desk --mode party --wait-ack
 python3 -m bridge.hermes2stackchan_bridge --env .env send-device --pair desk --volume-pct 80 --brightness-pct 70 --wait-ack
 python3 -m bridge.hermes2stackchan_bridge --env .env send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
 ```
+
+`send-motion --profile ...` is only a bridge-side test helper. The MQTT payload sent to StackChan always contains concrete `points`; the firmware does not keep named motion profiles. For Hermes integration, let Hermes compute the waypoint sequence and publish `points` directly.
 
 ## Firmware Setup
 

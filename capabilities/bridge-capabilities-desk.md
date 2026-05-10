@@ -62,6 +62,58 @@ Allowed directions: `left`, `right`, `up`, `down`, `center`, `straight`.
 
 Also supported: `yaw_delta`, `pitch_delta`, `yaw_target_pct`, `pitch_target_pct`.
 
+### motion
+
+Publishes to `hermes-stackchan/desk/cmd/motion`.
+
+This sends a computed motion path to StackChan. Hermes or the bridge must calculate the waypoints. The firmware does not store named choreographies; it only validates, clamps to safe hardware limits, and interpolates between received waypoints.
+
+Rules:
+
+- `points` is required.
+- Maximum `points`: 48.
+- `yaw_pct`: -100..100, where 0 is the center/start position.
+- `pitch_pct`: -100..100, where 0 is the center/start position.
+- `speed_pct`: 1..100. Used when a point has no `duration_ms`.
+- `duration_ms`: 0 or omitted means derive timing from `speed_pct`; otherwise 40..4000 per segment.
+- `hold_ms`: optional pause after a point, 0..4000.
+- `curve`: `linear` or `spline`. Use `spline` for round/organic paths and `linear` for hard corners.
+- Firmware also enforces servo soft limits and a safe maximum raw servo step rate.
+
+Path command with per-point speed:
+
+```json
+{
+  "schema_version": "1.0",
+  "curve": "spline",
+  "speed_pct": 35,
+  "points": [
+    {"yaw_pct": 0, "pitch_pct": 0},
+    {"yaw_pct": 20, "pitch_pct": 15, "speed_pct": 35},
+    {"yaw_pct": 0, "pitch_pct": 30, "speed_pct": 35},
+    {"yaw_pct": -20, "pitch_pct": 15, "speed_pct": 35},
+    {"yaw_pct": 0, "pitch_pct": 0, "speed_pct": 35}
+  ],
+  "request_id": "motion-001"
+}
+```
+
+Path command with explicit segment durations:
+
+```json
+{
+  "schema_version": "1.0",
+  "curve": "linear",
+  "points": [
+    [0, 0, 120, 40],
+    [0, 30, 260, 30],
+    [0, -22, 260, 30],
+    [0, 0, 260, 30, 120]
+  ],
+  "request_id": "path-001"
+}
+```
+
 ### led
 
 Publishes to `hermes-stackchan/desk/cmd/led`.

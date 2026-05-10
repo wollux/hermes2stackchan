@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import ssl
 import sys
@@ -57,6 +58,10 @@ class PairConfig:
     @property
     def move_topic(self) -> str:
         return f"{self.mqtt_prefix}/cmd/move"
+
+    @property
+    def motion_topic(self) -> str:
+        return f"{self.mqtt_prefix}/cmd/motion"
 
     @property
     def sound_topic(self) -> str:
@@ -254,6 +259,10 @@ def optional_string(value: Any) -> str | None:
     return value or None
 
 
+def clamp_int(value: int, min_value: int, max_value: int) -> int:
+    return max(min_value, min(max_value, int(value)))
+
+
 def build_display_payload(text: str, duration_ms: int, request_id: str | None = None) -> dict[str, Any]:
     text = text.strip()
     if not text:
@@ -407,6 +416,161 @@ def send_move(args: argparse.Namespace) -> int:
     return send_payload(args, pair.move_topic, with_request_id(payload, args.request_id))
 
 
+def send_motion(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    payload: dict[str, Any] = {"speed_pct": clamp_int(args.speed_pct, 1, 100)}
+    if args.points:
+        curve = args.curve if args.curve != "auto" else "linear"
+        try:
+            points = json.loads(args.points)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"--points must be JSON: {exc}") from exc
+        points = normalize_motion_points(points, payload["speed_pct"], args.segment_ms)
+        payload["points"] = points
+        payload["curve"] = curve
+        if args.segment_ms is not None:
+            payload["segment_ms"] = clamp_int(args.segment_ms, 0, 4000)
+    else:
+        curve = args.curve if args.curve != "auto" else ("spline" if args.profile == "circle" else "linear")
+        payload["points"] = build_motion_profile_points(args)
+        payload["curve"] = curve
+    return send_payload(args, pair.motion_topic, with_request_id(payload, args.request_id))
+
+
+def normalize_motion_points(points: Any, default_speed_pct: int, default_duration_ms: int | None = None) -> list[dict[str, int]]:
+    if not isinstance(points, list):
+        raise ConfigError("--points must be a JSON array")
+    if not points:
+        raise ConfigError("--points must contain at least one waypoint")
+    if len(points) > 48:
+        raise ConfigError("--points may contain at most 48 waypoints")
+
+    normalized: list[dict[str, int]] = []
+    for index, raw in enumerate(points):
+        duration_ms = default_duration_ms
+        speed_pct = default_speed_pct
+        hold_ms = 0
+        if isinstance(raw, list):
+            if len(raw) < 2:
+                raise ConfigError(f"point {index} needs yaw_pct and pitch_pct")
+            yaw = raw[0]
+            pitch = raw[1]
+            if len(raw) > 2:
+                duration_ms = raw[2]
+            if len(raw) > 3:
+                speed_pct = raw[3]
+            if len(raw) > 4:
+                hold_ms = raw[4]
+        elif isinstance(raw, dict):
+            yaw = raw.get("yaw_pct", raw.get("yaw"))
+            pitch = raw.get("pitch_pct", raw.get("pitch"))
+            duration_ms = raw.get("duration_ms", duration_ms)
+            speed_pct = raw.get("speed_pct", speed_pct)
+            hold_ms = raw.get("hold_ms", hold_ms)
+        else:
+            raise ConfigError(f"point {index} must be an array or object")
+
+        if not isinstance(yaw, (int, float)) or not isinstance(pitch, (int, float)):
+            raise ConfigError(f"point {index} needs numeric yaw/pitch values")
+        if not isinstance(speed_pct, (int, float)):
+            raise ConfigError(f"point {index} speed_pct must be numeric")
+
+        item = {
+            "yaw_pct": clamp_int(round(yaw), -100, 100),
+            "pitch_pct": clamp_int(round(pitch), -100, 100),
+            "speed_pct": clamp_int(round(speed_pct), 1, 100),
+        }
+        if duration_ms is not None:
+            if not isinstance(duration_ms, (int, float)):
+                raise ConfigError(f"point {index} duration_ms must be numeric")
+            item["duration_ms"] = clamp_int(round(duration_ms), 40, 4000) if duration_ms > 0 else 0
+        if hold_ms:
+            if not isinstance(hold_ms, (int, float)):
+                raise ConfigError(f"point {index} hold_ms must be numeric")
+            item["hold_ms"] = clamp_int(round(hold_ms), 0, 4000)
+        normalized.append(item)
+
+    return normalized
+
+
+def build_motion_profile_points(args: argparse.Namespace) -> list[dict[str, int]]:
+    speed_pct = clamp_int(args.speed_pct, 1, 100)
+    total_duration_ms = args.duration_ms
+
+    def point(yaw: int, pitch: int, hold_ms: int = 0, duration_ms: int | None = None) -> dict[str, int]:
+        item = {
+            "yaw_pct": clamp_int(yaw, -100, 100),
+            "pitch_pct": clamp_int(pitch, -100, 100),
+            "speed_pct": speed_pct,
+        }
+        if duration_ms is not None:
+            item["duration_ms"] = clamp_int(duration_ms, 40, 4000)
+        if hold_ms:
+            item["hold_ms"] = clamp_int(hold_ms, 0, 4000)
+        return item
+
+    profile = args.profile
+    if profile == "circle":
+        steps = max(12, int(args.steps))
+        loops = max(1, int(args.loops))
+        if total_duration_ms is None:
+            avg_radius = (abs(args.yaw_radius_pct) + abs(args.pitch_radius_pct)) / 2.0
+            ms_per_pct = 5.0 + (100 - speed_pct) * 0.30
+            total_duration_ms = round((2.0 * math.pi * max(1.0, avg_radius) * loops) * ms_per_pct)
+        total_steps = clamp_int(steps * loops, 12, 46)
+        arc_segment_duration = clamp_int(round(total_duration_ms / total_steps), 50, 4000)
+        approach_duration = clamp_int(round(arc_segment_duration * 6), 300, 1200)
+        points: list[dict[str, int]] = [
+            point(args.yaw_radius_pct, 0, duration_ms=approach_duration),
+        ]
+        for i in range(1, total_steps + 1):
+            angle = 2.0 * math.pi * loops * i / total_steps
+            points.append(
+                point(
+                    round(math.cos(angle) * args.yaw_radius_pct),
+                    round(math.sin(angle) * args.pitch_radius_pct),
+                    duration_ms=arc_segment_duration,
+                )
+            )
+        points.append(point(0, 0, duration_ms=approach_duration))
+        return points
+
+    if profile in {"nod", "yes"}:
+        segment_duration = max(40, total_duration_ms // 5) if total_duration_ms is not None else None
+        return [
+            point(0, 0, duration_ms=segment_duration),
+            point(0, 30, duration_ms=segment_duration),
+            point(0, -22, duration_ms=segment_duration),
+            point(0, 28, duration_ms=segment_duration),
+            point(0, 0, duration_ms=segment_duration),
+        ]
+
+    if profile in {"shake", "no"}:
+        segment_duration = max(40, total_duration_ms // 6) if total_duration_ms is not None else None
+        return [
+            point(0, 0, duration_ms=segment_duration),
+            point(-32, 0, duration_ms=segment_duration),
+            point(32, 0, duration_ms=segment_duration),
+            point(-26, 0, duration_ms=segment_duration),
+            point(26, 0, duration_ms=segment_duration),
+            point(0, 0, duration_ms=segment_duration),
+        ]
+
+    if profile in {"look_around", "look-around"}:
+        segment_duration = max(40, total_duration_ms // 6) if total_duration_ms is not None else None
+        return [
+            point(0, 0, duration_ms=segment_duration),
+            point(-38, 8, 120, duration_ms=segment_duration),
+            point(-18, -22, 80, duration_ms=segment_duration),
+            point(36, 12, 120, duration_ms=segment_duration),
+            point(16, -18, 80, duration_ms=segment_duration),
+            point(0, 0, duration_ms=segment_duration),
+        ]
+
+    raise ConfigError(f"unsupported motion profile: {profile}")
+
+
 def send_led(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
@@ -551,6 +715,20 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument("--yaw-target-pct", type=int, default=None, help="Target yaw percent -100..100.")
     move.add_argument("--pitch-target-pct", type=int, default=None, help="Target pitch percent -100..100.")
     move.set_defaults(func=send_move)
+
+    motion = subcommands.add_parser("send-motion", help="Send a computed smooth motion path to StackChan.")
+    add_common_send_options(motion)
+    motion.add_argument("--profile", default="circle", choices=["circle", "nod", "yes", "shake", "no", "look_around", "look-around"])
+    motion.add_argument("--duration-ms", type=int, default=None, help="Optional total duration for generated profiles.")
+    motion.add_argument("--speed-pct", type=int, default=45, help="Motion speed 1..100 when point durations are omitted.")
+    motion.add_argument("--loops", type=int, default=1, help="Circle loops.")
+    motion.add_argument("--yaw-radius-pct", type=int, default=32, help="Circle yaw radius percent.")
+    motion.add_argument("--pitch-radius-pct", type=int, default=26, help="Circle pitch radius percent.")
+    motion.add_argument("--steps", type=int, default=32, help="Circle interpolation waypoints.")
+    motion.add_argument("--curve", default="auto", choices=["auto", "linear", "spline"], help="Path interpolation curve.")
+    motion.add_argument("--points", default=None, help="JSON array of [yaw_pct,pitch_pct,duration_ms,speed_pct,hold_ms] or objects.")
+    motion.add_argument("--segment-ms", type=int, default=None, help="Default path segment duration when --points omit duration.")
+    motion.set_defaults(func=send_motion)
 
     led = subcommands.add_parser("send-led", help="Set LED/neon mode.")
     add_common_send_options(led)

@@ -45,6 +45,8 @@ constexpr uint8_t kAw88298Addr = AW88298_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
 constexpr int kAudioSampleRate = 16000;
 constexpr int kDefaultSpeakerVolumePct = 80;
+constexpr int kMaxMqttTopic = 128;
+constexpr int kMaxMqttPayload = 4096;
 constexpr gpio_num_t kAudioMclk = GPIO_NUM_0;
 constexpr gpio_num_t kAudioBclk = GPIO_NUM_34;
 constexpr gpio_num_t kAudioWs = GPIO_NUM_33;
@@ -86,6 +88,7 @@ char g_topic_display[96] = {};
 char g_topic_system[96] = {};
 char g_topic_face[96] = {};
 char g_topic_move[96] = {};
+char g_topic_motion[96] = {};
 char g_topic_sound[96] = {};
 char g_topic_led[96] = {};
 char g_topic_device[96] = {};
@@ -93,6 +96,10 @@ char g_topic_say[96] = {};
 char g_topic_status[96] = {};
 char g_topic_ack[96] = {};
 char g_topic_error[96] = {};
+char g_mqtt_rx_topic[kMaxMqttTopic] = {};
+char g_mqtt_rx_payload[kMaxMqttPayload + 1] = {};
+int g_mqtt_rx_expected_len = 0;
+int g_mqtt_rx_received_len = 0;
 
 struct SoundCommand {
     int frequency_hz;
@@ -100,7 +107,22 @@ struct SoundCommand {
     int volume_pct;
 };
 
+struct MotionPoint {
+    int yaw_pct;
+    int pitch_pct;
+    int duration_ms;
+    int speed_pct;
+    int hold_ms;
+};
+
+struct MotionCommand {
+    int point_count;
+    int curve;
+    MotionPoint points[48];
+};
+
 QueueHandle_t g_sound_queue = nullptr;
+QueueHandle_t g_motion_queue = nullptr;
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -1148,6 +1170,21 @@ void write_safe_servo_position(const ServoAxis& axis, int position)
     g_servo_bus.WritePos(axis.id, position, 20, 0);
 }
 
+void write_safe_servo_positions(const ServoAxis& yaw, const ServoAxis& pitch,
+                                int yaw_position, int pitch_position)
+{
+    yaw_position = clamp_int(yaw_position, effective_raw_min(yaw), effective_raw_max(yaw));
+    pitch_position = clamp_int(pitch_position, effective_raw_min(pitch), effective_raw_max(pitch));
+    u8 ids[2] = {yaw.id, pitch.id};
+    u16 positions[2] = {
+        static_cast<u16>(yaw_position),
+        static_cast<u16>(pitch_position),
+    };
+    u16 times[2] = {20, 20};
+    u16 speeds[2] = {0, 0};
+    g_servo_bus.SyncWritePos(ids, 2, positions, times, speeds);
+}
+
 void move_axes_toward(const ServoAxis& yaw, const ServoAxis& pitch,
                       int& yaw_current, int& pitch_current,
                       int yaw_target, int pitch_target)
@@ -1170,6 +1207,130 @@ void move_axes_toward(const ServoAxis& yaw, const ServoAxis& pitch,
     }
 }
 
+float catmull_rom_value(float p0, float p1, float p2, float p3, float t)
+{
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return 0.5f * ((2.0f * p1) +
+                   (-p0 + p2) * t +
+                   (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                   (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+int motion_segment_duration_ms(const ServoAxis& yaw, const ServoAxis& pitch,
+                               int yaw_start_raw, int pitch_start_raw,
+                               const MotionPoint& target)
+{
+    if (target.duration_ms > 0) {
+        return target.duration_ms;
+    }
+
+    const int yaw_start_pct = raw_position_to_target_pct(yaw, yaw_start_raw);
+    const int pitch_start_pct = raw_position_to_target_pct(pitch, pitch_start_raw);
+    const int pct_distance = std::max(std::abs(target.yaw_pct - yaw_start_pct),
+                                      std::abs(target.pitch_pct - pitch_start_pct));
+    const int speed_pct = clamp_int(target.speed_pct, 1, 100);
+    const float ms_per_pct = 5.0f + (100 - speed_pct) * 0.30f;
+    return clamp_int(static_cast<int>(std::lround(std::max(1, pct_distance) * ms_per_pct)), 40, 4000);
+}
+
+int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
+                      int yaw_target_raw, int pitch_target_raw,
+                      int duration_ms)
+{
+    const int raw_distance = std::max(std::abs(yaw_target_raw - yaw_start_raw),
+                                      std::abs(pitch_target_raw - pitch_start_raw));
+    const int min_safe_steps = std::max(1, (raw_distance + 17) / 18);
+    const int requested_steps = std::max(1, duration_ms / 20);
+    return std::max(min_safe_steps, requested_steps);
+}
+
+void write_motion_sample(const ServoAxis& yaw, const ServoAxis& pitch,
+                         int& yaw_pos, int& pitch_pos,
+                         int yaw_raw, int pitch_raw)
+{
+    yaw_pos = clamp_int(yaw_raw, effective_raw_min(yaw), effective_raw_max(yaw));
+    pitch_pos = clamp_int(pitch_raw, effective_raw_min(pitch), effective_raw_max(pitch));
+    write_safe_servo_positions(yaw, pitch, yaw_pos, pitch_pos);
+    update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
+}
+
+void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
+                            int& yaw_pos, int& pitch_pos,
+                            int yaw0, int pitch0,
+                            int yaw1, int pitch1,
+                            int yaw2, int pitch2,
+                            int yaw3, int pitch3,
+                            int duration_ms,
+                            bool spline)
+{
+    const int steps = safe_motion_steps(yaw1, pitch1, yaw2, pitch2, duration_ms);
+    for (int step = 1; step <= steps; ++step) {
+        const float t = static_cast<float>(step) / static_cast<float>(steps);
+        int yaw_next = 0;
+        int pitch_next = 0;
+        if (spline) {
+            yaw_next = static_cast<int>(std::lround(catmull_rom_value(yaw0, yaw1, yaw2, yaw3, t)));
+            pitch_next = static_cast<int>(std::lround(catmull_rom_value(pitch0, pitch1, pitch2, pitch3, t)));
+        } else {
+            yaw_next = yaw1 + static_cast<int>(std::lround((yaw2 - yaw1) * t));
+            pitch_next = pitch1 + static_cast<int>(std::lround((pitch2 - pitch1) * t));
+        }
+        write_motion_sample(yaw, pitch, yaw_pos, pitch_pos, yaw_next, pitch_next);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void execute_motion_command(const ServoAxis& yaw, const ServoAxis& pitch,
+                            int& yaw_pos, int& pitch_pos,
+                            const MotionCommand& command)
+{
+    if (command.point_count <= 0) {
+        return;
+    }
+
+    int yaw_raw[48] = {};
+    int pitch_raw[48] = {};
+    for (int i = 0; i < command.point_count; ++i) {
+        yaw_raw[i] = target_pct_to_raw_position(yaw, command.points[i].yaw_pct);
+        pitch_raw[i] = target_pct_to_raw_position(pitch, command.points[i].pitch_pct);
+    }
+
+    const bool spline = command.curve == 1;
+    const int first_duration = motion_segment_duration_ms(yaw, pitch, yaw_pos, pitch_pos, command.points[0]);
+    move_axes_path_segment(yaw, pitch,
+                           yaw_pos, pitch_pos,
+                           yaw_pos, pitch_pos,
+                           yaw_pos, pitch_pos,
+                           yaw_raw[0], pitch_raw[0],
+                           command.point_count > 1 ? yaw_raw[1] : yaw_raw[0],
+                           command.point_count > 1 ? pitch_raw[1] : pitch_raw[0],
+                           first_duration,
+                           false);
+
+    if (command.points[0].hold_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(command.points[0].hold_ms));
+    }
+
+    for (int i = 0; i < command.point_count - 1; ++i) {
+        const int prev = i > 0 ? i - 1 : i;
+        const int next = i + 1;
+        const int next2 = i + 2 < command.point_count ? i + 2 : next;
+        const int duration_ms = motion_segment_duration_ms(yaw, pitch, yaw_raw[i], pitch_raw[i], command.points[next]);
+        move_axes_path_segment(yaw, pitch,
+                               yaw_pos, pitch_pos,
+                               yaw_raw[prev], pitch_raw[prev],
+                               yaw_raw[i], pitch_raw[i],
+                               yaw_raw[next], pitch_raw[next],
+                               yaw_raw[next2], pitch_raw[next2],
+                               duration_ms,
+                               spline);
+        if (command.points[next].hold_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(command.points[next].hold_ms));
+        }
+    }
+}
+
 void build_topics()
 {
     const char* pair_id = CONFIG_STACKCHAN_PAIR_ID;
@@ -1177,6 +1338,7 @@ void build_topics()
     std::snprintf(g_topic_system, sizeof(g_topic_system), "hermes-stackchan/%s/cmd/system", pair_id);
     std::snprintf(g_topic_face, sizeof(g_topic_face), "hermes-stackchan/%s/cmd/face", pair_id);
     std::snprintf(g_topic_move, sizeof(g_topic_move), "hermes-stackchan/%s/cmd/move", pair_id);
+    std::snprintf(g_topic_motion, sizeof(g_topic_motion), "hermes-stackchan/%s/cmd/motion", pair_id);
     std::snprintf(g_topic_sound, sizeof(g_topic_sound), "hermes-stackchan/%s/cmd/sound", pair_id);
     std::snprintf(g_topic_led, sizeof(g_topic_led), "hermes-stackchan/%s/cmd/led", pair_id);
     std::snprintf(g_topic_device, sizeof(g_topic_device), "hermes-stackchan/%s/cmd/device", pair_id);
@@ -1186,10 +1348,10 @@ void build_topics()
     std::snprintf(g_topic_error, sizeof(g_topic_error), "hermes-stackchan/%s/error", pair_id);
 }
 
-bool topic_matches(const esp_mqtt_event_handle_t event, const char* expected)
+bool topic_matches(const char* topic, int topic_len, const char* expected)
 {
-    return event->topic_len == static_cast<int>(std::strlen(expected)) &&
-           std::strncmp(event->topic, expected, event->topic_len) == 0;
+    return topic_len == static_cast<int>(std::strlen(expected)) &&
+           std::strncmp(topic, expected, topic_len) == 0;
 }
 
 const char* json_string(cJSON* root, const char* key, const char* fallback = "")
@@ -1297,6 +1459,87 @@ void publish_status()
     publish_json(g_topic_status, payload, 1, 1);
 }
 
+bool append_motion_point(MotionCommand& command, int yaw_pct, int pitch_pct,
+                         int duration_ms, int speed_pct, int hold_ms)
+{
+    if (command.point_count >= static_cast<int>(sizeof(command.points) / sizeof(command.points[0]))) {
+        return false;
+    }
+    MotionPoint& point = command.points[command.point_count++];
+    point.yaw_pct = clamp_int(yaw_pct, -100, 100);
+    point.pitch_pct = clamp_int(pitch_pct, -100, 100);
+    point.duration_ms = duration_ms > 0 ? clamp_int(duration_ms, 40, 4000) : 0;
+    point.speed_pct = clamp_int(speed_pct, 1, 100);
+    point.hold_ms = clamp_int(hold_ms, 0, 4000);
+    return true;
+}
+
+bool build_path_motion(cJSON* root, MotionCommand& command)
+{
+    cJSON* points = cJSON_GetObjectItemCaseSensitive(root, "points");
+    if (!cJSON_IsArray(points)) {
+        return false;
+    }
+
+    const int default_segment_ms = clamp_int(json_int(root, "segment_ms", 0), 0, 4000);
+    const int default_speed_pct = clamp_int(json_int(root, "speed_pct", json_int(root, "default_speed_pct", 45)), 1, 100);
+    const char* curve = json_string(root, "curve", "linear");
+    command.curve = (std::strcmp(curve, "spline") == 0 ||
+                     std::strcmp(curve, "smooth") == 0 ||
+                     std::strcmp(curve, "catmull_rom") == 0 ||
+                     std::strcmp(curve, "catmull-rom") == 0)
+                        ? 1
+                        : 0;
+    command.point_count = 0;
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, points)
+    {
+        int yaw = 0;
+        int pitch = 0;
+        int duration_ms = default_segment_ms;
+        int speed_pct = default_speed_pct;
+        int hold_ms = 0;
+        if (cJSON_IsArray(item)) {
+            cJSON* yaw_item = cJSON_GetArrayItem(item, 0);
+            cJSON* pitch_item = cJSON_GetArrayItem(item, 1);
+            cJSON* duration_item = cJSON_GetArrayItem(item, 2);
+            cJSON* speed_item = cJSON_GetArrayItem(item, 3);
+            cJSON* hold_item = cJSON_GetArrayItem(item, 4);
+            if (!cJSON_IsNumber(yaw_item) || !cJSON_IsNumber(pitch_item)) {
+                return false;
+            }
+            yaw = yaw_item->valueint;
+            pitch = pitch_item->valueint;
+            if (cJSON_IsNumber(duration_item)) {
+                duration_ms = duration_item->valueint;
+            }
+            if (cJSON_IsNumber(speed_item)) {
+                speed_pct = speed_item->valueint;
+            }
+            if (cJSON_IsNumber(hold_item)) {
+                hold_ms = hold_item->valueint;
+            }
+        } else if (cJSON_IsObject(item)) {
+            yaw = json_int(item, "yaw_pct", json_int(item, "yaw", 0));
+            pitch = json_int(item, "pitch_pct", json_int(item, "pitch", 0));
+            duration_ms = json_int(item, "duration_ms", default_segment_ms);
+            speed_pct = json_int(item, "speed_pct", default_speed_pct);
+            hold_ms = json_int(item, "hold_ms", 0);
+        } else {
+            return false;
+        }
+        if (!append_motion_point(command, yaw, pitch, duration_ms, speed_pct, hold_ms)) {
+            return false;
+        }
+    }
+    return command.point_count > 0;
+}
+
+bool enqueue_motion_command(const MotionCommand& command)
+{
+    return g_motion_queue && xQueueSend(g_motion_queue, &command, pdMS_TO_TICKS(50)) == pdTRUE;
+}
+
 void handle_display_command(const char* data, int len)
 {
     cJSON* root = cJSON_ParseWithLength(data, len);
@@ -1400,6 +1643,32 @@ void handle_move_command(const char* data, int len)
         g_pending_pitch_target_pct = clamp_int(pitch_target_pct, -100, 100);
     }
     publish_ack(request_id, "move", "movement queued");
+    cJSON_Delete(root);
+}
+
+void handle_motion_command(const char* data, int len)
+{
+    cJSON* root = cJSON_ParseWithLength(data, len);
+    if (!root) {
+        publish_error("", "motion", "invalid json");
+        return;
+    }
+
+    const char* request_id = json_string(root, "request_id");
+    MotionCommand command = {};
+    const bool ok = build_path_motion(root, command);
+    if (!ok || command.point_count <= 0) {
+        publish_error(request_id, "motion", "points array required");
+        cJSON_Delete(root);
+        return;
+    }
+    if (!enqueue_motion_command(command)) {
+        publish_error(request_id, "motion", "motion queue full");
+        cJSON_Delete(root);
+        return;
+    }
+
+    publish_ack(request_id, "motion", "motion queued");
     cJSON_Delete(root);
 }
 
@@ -1562,6 +1831,76 @@ void handle_system_command(const char* data, int len)
     cJSON_Delete(root);
 }
 
+void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, int data_len)
+{
+    if (topic_matches(topic, topic_len, g_topic_display)) {
+        handle_display_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_system)) {
+        handle_system_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_face)) {
+        handle_face_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_move)) {
+        handle_move_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_motion)) {
+        handle_motion_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_sound)) {
+        handle_sound_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_led)) {
+        handle_led_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_device)) {
+        handle_device_command(data, data_len);
+    } else if (topic_matches(topic, topic_len, g_topic_say)) {
+        handle_say_command(data, data_len);
+    }
+}
+
+void handle_mqtt_data_event(const esp_mqtt_event_handle_t event)
+{
+    if (event->total_data_len <= event->data_len && event->current_data_offset == 0) {
+        dispatch_mqtt_payload(event->topic, event->topic_len, event->data, event->data_len);
+        return;
+    }
+
+    if (event->current_data_offset == 0) {
+        g_mqtt_rx_expected_len = event->total_data_len;
+        g_mqtt_rx_received_len = 0;
+        std::memset(g_mqtt_rx_topic, 0, sizeof(g_mqtt_rx_topic));
+        std::memset(g_mqtt_rx_payload, 0, sizeof(g_mqtt_rx_payload));
+        if (event->topic_len <= 0 || event->topic_len >= kMaxMqttTopic ||
+            event->total_data_len <= 0 || event->total_data_len > kMaxMqttPayload) {
+            ESP_LOGW(kTag, "mqtt payload too large or invalid: topic_len=%d total=%d",
+                     event->topic_len, event->total_data_len);
+            publish_error("", "mqtt", "payload too large");
+            g_mqtt_rx_expected_len = 0;
+            return;
+        }
+        std::memcpy(g_mqtt_rx_topic, event->topic, event->topic_len);
+        g_mqtt_rx_topic[event->topic_len] = '\0';
+    }
+
+    if (g_mqtt_rx_expected_len <= 0 ||
+        event->current_data_offset < 0 ||
+        event->current_data_offset + event->data_len > kMaxMqttPayload ||
+        event->current_data_offset + event->data_len > g_mqtt_rx_expected_len) {
+        ESP_LOGW(kTag, "mqtt fragmented payload out of bounds");
+        g_mqtt_rx_expected_len = 0;
+        g_mqtt_rx_received_len = 0;
+        return;
+    }
+
+    std::memcpy(g_mqtt_rx_payload + event->current_data_offset, event->data, event->data_len);
+    g_mqtt_rx_received_len = std::max(g_mqtt_rx_received_len, event->current_data_offset + event->data_len);
+    if (g_mqtt_rx_received_len >= g_mqtt_rx_expected_len) {
+        g_mqtt_rx_payload[g_mqtt_rx_expected_len] = '\0';
+        dispatch_mqtt_payload(g_mqtt_rx_topic,
+                              static_cast<int>(std::strlen(g_mqtt_rx_topic)),
+                              g_mqtt_rx_payload,
+                              g_mqtt_rx_expected_len);
+        g_mqtt_rx_expected_len = 0;
+        g_mqtt_rx_received_len = 0;
+    }
+}
+
 void sound_task(void*)
 {
     SoundCommand command = {};
@@ -1677,6 +2016,8 @@ void hardware_servo_task(void*)
     update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
 
     while (true) {
+        MotionCommand motion = {};
+        const bool has_motion = g_motion_queue && xQueueReceive(g_motion_queue, &motion, 0) == pdTRUE;
         const int yaw_delta = g_pending_yaw_delta;
         const int pitch_delta = g_pending_pitch_delta;
         const int yaw_target_pct = g_pending_yaw_target_pct;
@@ -1684,7 +2025,7 @@ void hardware_servo_task(void*)
         const bool has_yaw_target = yaw_target_pct >= -100 && yaw_target_pct <= 100;
         const bool has_pitch_target = pitch_target_pct >= -100 && pitch_target_pct <= 100;
 
-        if (yaw_delta == 0 && pitch_delta == 0 && !has_yaw_target && !has_pitch_target) {
+        if (!has_motion && yaw_delta == 0 && pitch_delta == 0 && !has_yaw_target && !has_pitch_target) {
             const int64_t now_us = esp_timer_get_time();
             if (servo_powered && last_servo_activity_us > 0 && now_us - last_servo_activity_us > 8LL * 1000 * 1000) {
                 set_servo_vm_power(false);
@@ -1739,6 +2080,15 @@ void hardware_servo_task(void*)
 
         g_servo_bus.EnableTorque(yaw.id, 1);
         g_servo_bus.EnableTorque(pitch.id, 1);
+        if (has_motion) {
+            execute_motion_command(yaw, pitch, yaw_pos, pitch_pos, motion);
+            g_servo_bus.EnableTorque(yaw.id, 0);
+            g_servo_bus.EnableTorque(pitch.id, 0);
+            last_servo_activity_us = esp_timer_get_time();
+            publish_status();
+            continue;
+        }
+
         const int yaw_target = has_yaw_target ? target_pct_to_raw_position(yaw, yaw_target_pct) : yaw_pos + yaw_delta;
         const int pitch_target = has_pitch_target ? target_pct_to_raw_position(pitch, pitch_target_pct) : pitch_pos + pitch_delta;
         ESP_LOGI(kTag, "servo target raw yaw=%d pitch=%d", yaw_target, pitch_target);
@@ -1832,6 +2182,7 @@ void mqtt_event_handler(void*, esp_event_base_t, int32_t event_id, void* event_d
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_system, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_face, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_move, 1);
+        esp_mqtt_client_subscribe(g_mqtt_client, g_topic_motion, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_sound, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_led, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, g_topic_device, 1);
@@ -1844,23 +2195,7 @@ void mqtt_event_handler(void*, esp_event_base_t, int32_t event_id, void* event_d
         ESP_LOGW(kTag, "mqtt disconnected");
         break;
     case MQTT_EVENT_DATA:
-        if (topic_matches(event, g_topic_display)) {
-            handle_display_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_system)) {
-            handle_system_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_face)) {
-            handle_face_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_move)) {
-            handle_move_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_sound)) {
-            handle_sound_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_led)) {
-            handle_led_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_device)) {
-            handle_device_command(event->data, event->data_len);
-        } else if (topic_matches(event, g_topic_say)) {
-            handle_say_command(event->data, event->data_len);
-        }
+        handle_mqtt_data_event(event);
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGW(kTag, "mqtt error");
@@ -1920,6 +2255,7 @@ extern "C" void app_main()
     display_boot();
     init_speaker();
     g_sound_queue = xQueueCreate(4, sizeof(SoundCommand));
+    g_motion_queue = xQueueCreate(3, sizeof(MotionCommand));
     if (g_sound_queue) {
         xTaskCreate(sound_task, "sound", 3072, nullptr, 3, nullptr);
     }

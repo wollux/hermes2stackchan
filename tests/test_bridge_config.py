@@ -5,11 +5,19 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from bridge.hermes2stackchan_bridge import ConfigError, build_display_payload, load_config, parse_env_file
+from bridge.hermes2stackchan_bridge import (
+    ConfigError,
+    build_display_payload,
+    build_motion_profile_points,
+    load_config,
+    normalize_motion_points,
+    parse_env_file,
+)
 
 
 class BridgeConfigTests(unittest.TestCase):
@@ -20,6 +28,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("desk", config.pairs)
         self.assertEqual(config.pairs["desk"].display_topic, "hermes-stackchan/desk/cmd/display")
         self.assertEqual(config.pairs["desk"].move_topic, "hermes-stackchan/desk/cmd/move")
+        self.assertEqual(config.pairs["desk"].motion_topic, "hermes-stackchan/desk/cmd/motion")
         self.assertEqual(config.pairs["desk"].device_topic, "hermes-stackchan/desk/cmd/device")
 
     def test_rejects_wrong_namespace(self) -> None:
@@ -83,6 +92,43 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "text")
         self.assertEqual(payload["text"], "Hallo StackChan")
         self.assertEqual(payload["request_id"], "test-001")
+
+    def test_motion_points_are_clamped_and_normalized(self) -> None:
+        points = normalize_motion_points(
+            [[120, -130, 25, 200, 5000], {"yaw": -10.4, "pitch": 20.6}],
+            default_speed_pct=50,
+            default_duration_ms=None,
+        )
+
+        self.assertEqual(
+            points,
+            [
+                {"yaw_pct": 100, "pitch_pct": -100, "speed_pct": 100, "duration_ms": 40, "hold_ms": 4000},
+                {"yaw_pct": -10, "pitch_pct": 21, "speed_pct": 50},
+            ],
+        )
+
+    def test_generated_circle_is_points_only(self) -> None:
+        args = SimpleNamespace(
+            profile="circle",
+            speed_pct=35,
+            duration_ms=None,
+            steps=12,
+            loops=1,
+            yaw_radius_pct=30,
+            pitch_radius_pct=20,
+        )
+
+        points = build_motion_profile_points(args)
+
+        self.assertGreaterEqual(len(points), 14)
+        self.assertEqual(points[0]["yaw_pct"], 30)
+        self.assertEqual(points[0]["pitch_pct"], 0)
+        self.assertGreaterEqual(points[0]["duration_ms"], 300)
+        self.assertEqual(points[-1]["yaw_pct"], 0)
+        self.assertEqual(points[-1]["pitch_pct"], 0)
+        self.assertGreaterEqual(points[-1]["duration_ms"], 300)
+        self.assertTrue(all("profile" not in point for point in points))
 
 
 if __name__ == "__main__":
