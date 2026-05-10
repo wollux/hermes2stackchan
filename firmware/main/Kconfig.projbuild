@@ -1,0 +1,39 @@
+menu "Hermes2StackChan"
+
+config STACKCHAN_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        Local WiFi SSID. Keep this in the ignored firmware/sdkconfig file.
+
+config STACKCHAN_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+    help
+        Local WiFi password. Keep this in the ignored firmware/sdkconfig file.
+
+config STACKCHAN_MQTT_URI
+    string "MQTT broker URI"
+    default ""
+    help
+        MQTT URI such as mqtt://192.168.99.58:1883.
+
+config STACKCHAN_PAIR_ID
+    string "Pair ID"
+    default "desk"
+
+config STACKCHAN_STACKCHAN_ID
+    string "StackChan ID"
+    default "stackchan-desk"
+
+config STACKCHAN_STATUS_INTERVAL_MS
+    int "Status publish interval in ms"
+    default 5000
+    range 1000 60000
+
+config STACKCHAN_DISPLAY_BRIGHTNESS
+    int "Display brightness percent"
+    default 80
+    range 0 100
+
+endmenu

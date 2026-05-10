@@ -1,0 +1,20 @@
+{
+  "mqtt": {
+    "host": "localhost",
+    "port": 1883,
+    "client_id": "hermes2stackchan-bridge",
+    "username": null,
+    "password": null,
+    "tls": false
+  },
+  "pairs": [
+    {
+      "pair_id": "desk",
+      "hermes_id": "hermes-desk",
+      "stackchan_id": "stackchan-desk",
+      "mqtt_prefix": "hermes-stackchan/desk",
+      "capabilities_file": "capabilities/bridge-capabilities-desk.md",
+      "personality_file": "personalities/hermes-desk.md"
+    }
+  ]
+}

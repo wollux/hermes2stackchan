@@ -1,6 +1,10 @@
 /Ressourcen/
 /MEGAPLAN_EN.MD
 .DS_Store
+.env
+.env.*
+!.env.example
+config/pairs.json
 
 # Python
 __pycache__/
@@ -23,6 +27,8 @@ dist/
 managed_components/
 dependencies.lock
 sdkconfig.old
+firmware/sdkconfig
+firmware/sdkconfig.old
 firmware/build/
 firmware/managed_components/
 firmware_clock/build/
@@ -35,4 +41,3 @@ firmware_clock/managed_components/
 *.wav
 *.mp3
 *.ogg
-

@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "main.cpp"
+        "drivers/SCServo_lib/src/SCS.cpp"
+        "drivers/SCServo_lib/src/SCSCL.cpp"
+        "drivers/SCServo_lib/src/SCSerial.cpp"
+    INCLUDE_DIRS
+        "."
+        "drivers/SCServo_lib/src"
+    REQUIRES
+        driver
+        esp_codec_dev
+        esp_event
+        esp_lcd
+        esp_netif
+        esp_timer
+        esp_wifi
+        json
+        mqtt
+        nvs_flash
+)
