@@ -33,7 +33,7 @@ Payload:
 
 Publishes to `hermes-stackchan/desk/cmd/face`.
 
-Supported emotions: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `wink`, `sleep`, `speaking`, `error`.
+Supported emotions: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `wink`, `blink`, `look_left`, `look_right`, `look_up`, `look_down`, `breathe`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
 
 ```json
 {
@@ -151,7 +151,51 @@ Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`.
 
 ## Status
 
-StackChan publishes retained status to `hermes-stackchan/desk/status`, including volume, brightness, display sleep state, head position, LED mode, speaker readiness, face emotion, and firmware version.
+StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, temperatures, `firmware`, and `firmware_version`.
+
+Battery fields:
+
+```json
+{
+  "battery_pct": 82,
+  "charging": true,
+  "battery_charging": true,
+  "battery_discharging": false,
+  "battery_charging_done": false,
+  "battery_known": true,
+  "usb_power": true,
+  "external_power": true,
+  "battery_current_direction": 1
+}
+```
+
+The bridge command `watch-power` watches `external_power`/`usb_power` in these retained status updates and reacts to plug/unplug transitions with a battery percentage/charge overlay plus immediate head motion. After about five seconds, plugging in triggers a happy face; unplugging triggers a neutral face. It must not change LEDs or sound for power changes. `battery_charging` only means active charging; a full battery can have `external_power: true` and `battery_charging: false`.
+
+Temperature fields:
+
+```json
+{
+  "temperature": {
+    "soc_c": 42,
+    "servo_yaw_c": 31,
+    "servo_pitch_c": 32
+  }
+}
+```
+
+Temperature value `-1` means unavailable. Servo temperatures are only known while the servo bus is powered and answering.
+
+Hermes HTTP responses consumed by the bridge must be JSON:
+
+```json
+{
+  "reply": "Kurz und freundlich antworten.",
+  "actions": [
+    {"action": "say", "text": "Kurz und freundlich antworten.", "emotion": "speaking"},
+    {"action": "face", "emotion": "happy", "intensity_pct": 70}
+  ]
+}
+```
 
 ## Forbidden In This Slice
 

@@ -4,17 +4,21 @@ import argparse
 import json
 import math
 import os
+import random
 import ssl
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event
+from threading import Event, Timer
 from typing import Any
 
 
 SCHEMA_VERSION = "1.0"
+POWER_DISPLAY_DURATION_MS = 5000
 DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
@@ -93,9 +97,18 @@ class PairConfig:
 
 
 @dataclass(frozen=True)
+class HermesConfig:
+    base_url: str = "http://127.0.0.1:8642"
+    api_key: str | None = None
+    model: str = "default"
+    timeout_s: float = 30.0
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     mqtt: MqttConfig
     pairs: dict[str, PairConfig]
+    hermes: HermesConfig = field(default_factory=HermesConfig)
 
 
 def load_config(
@@ -122,6 +135,15 @@ def load_config(
         username=optional_string(env.get("H2S_MQTT_USERNAME", mqtt_raw.get("username"))),
         password=optional_string(env.get("H2S_MQTT_PASSWORD", mqtt_raw.get("password"))),
         tls=parse_bool(env.get("H2S_MQTT_TLS"), bool(mqtt_raw.get("tls", False)), "H2S_MQTT_TLS"),
+    )
+    hermes_raw = raw.get("hermes") or {}
+    if not isinstance(hermes_raw, dict):
+        raise ConfigError("hermes must be an object when present")
+    hermes = HermesConfig(
+        base_url=(env.get("H2S_HERMES_BASE_URL") or str(hermes_raw.get("base_url") or "http://127.0.0.1:8642")).rstrip("/"),
+        api_key=optional_string(env.get("H2S_HERMES_API_KEY") or env.get("API_SERVER_KEY") or hermes_raw.get("api_key")),
+        model=env.get("H2S_HERMES_MODEL") or str(hermes_raw.get("model") or "default"),
+        timeout_s=parse_float(env.get("H2S_HERMES_TIMEOUT_S"), float(hermes_raw.get("timeout_s", 30.0)), "H2S_HERMES_TIMEOUT_S"),
     )
 
     pairs_raw = raw.get("pairs")
@@ -164,7 +186,7 @@ def load_config(
             )
         }
 
-    return BridgeConfig(mqtt=mqtt, pairs=pairs)
+    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes)
 
 
 def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -174,7 +196,7 @@ def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> di
 
     source = os.environ if environ is None else environ
     for key, value in source.items():
-        if key.startswith("H2S_"):
+        if key.startswith("H2S_") or key == "API_SERVER_KEY":
             env[key] = value
     return {key: value for key, value in env.items() if value != ""}
 
@@ -210,6 +232,15 @@ def parse_int(value: str | None, default: int, label: str) -> int:
         return int(value)
     except ValueError as exc:
         raise ConfigError(f"{label} must be an integer") from exc
+
+
+def parse_float(value: str | None, default: float, label: str) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ConfigError(f"{label} must be a number") from exc
 
 
 def parse_bool(value: str | None, default: bool, label: str) -> bool:
@@ -374,6 +405,922 @@ def send_payload(
                 return 0 if response.get("_topic") == pair.ack_topic else 2
             print(f"[bridge] no ACK within {args.timeout:.1f}s for {payload['request_id']}", file=sys.stderr)
             return 3
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
+def read_latest_status(config: BridgeConfig, pair: PairConfig, timeout_s: float = 2.0) -> dict[str, Any] | None:
+    client = create_mqtt_client(config.mqtt)
+    status_seen = Event()
+    status: dict[str, Any] = {}
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        try:
+            data = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        status.clear()
+        status.update(data)
+        status_seen.set()
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe(pair.status_topic, qos=0)
+        if status_seen.wait(timeout_s):
+            return status
+        return None
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
+def read_status(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    status = read_latest_status(config, pair, args.timeout)
+    if status is None:
+        print(f"[bridge] no retained status within {args.timeout:.1f}s for {pair.status_topic}", file=sys.stderr)
+        return 3
+    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+REQUIRED_STATUS_PATHS = (
+    "schema_version",
+    "pair_id",
+    "stackchan_id",
+    "uptime_ms",
+    "firmware",
+    "firmware_version",
+    "battery_pct",
+    "battery_known",
+    "battery_charging",
+    "battery_discharging",
+    "usb_power",
+    "external_power",
+    "volume_pct",
+    "brightness_pct",
+    "display_sleeping",
+    "head.pan_pct",
+    "head.tilt_pct",
+    "head.ready",
+    "face.emotion",
+    "face.intensity_pct",
+    "ui.mode",
+    "led.mode",
+    "led.mode_id",
+    "led.r",
+    "led.g",
+    "led.b",
+    "led.ready",
+    "speaker.ready",
+    "speaker.volume_pct",
+    "temperature.soc_c",
+    "temperature.servo_yaw_c",
+    "temperature.servo_pitch_c",
+)
+
+
+def nested_status_value(status: dict[str, Any], path: str) -> Any:
+    value: Any = status
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def missing_status_paths(status: dict[str, Any]) -> list[str]:
+    return [path for path in REQUIRED_STATUS_PATHS if nested_status_value(status, path) is None]
+
+
+def status_health(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    status = read_latest_status(config, pair, args.timeout)
+    if status is None:
+        print(f"[bridge] status health failed: no retained status within {args.timeout:.1f}s for {pair.status_topic}", file=sys.stderr)
+        return 3
+
+    missing = missing_status_paths(status)
+    if missing:
+        print("[bridge] status health failed: missing required fields", file=sys.stderr)
+        for path in missing:
+            print(f"- {path}", file=sys.stderr)
+        if args.show_status:
+            print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+        return 2
+
+    print(
+        "[bridge] status health ok: "
+        f"battery={status.get('battery_pct')}% "
+        f"external_power={status.get('external_power')} "
+        f"head=({nested_status_value(status, 'head.pan_pct')},{nested_status_value(status, 'head.tilt_pct')}) "
+        f"face={nested_status_value(status, 'face.emotion')} "
+        f"firmware={status.get('firmware')}",
+        flush=True,
+    )
+    if args.show_status:
+        print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def resolve_asset_path(path_value: str | None, config_path: Path) -> Path | None:
+    if not path_value:
+        return None
+    raw_path = Path(path_value)
+    if raw_path.is_absolute():
+        return raw_path
+    candidates = [
+        Path.cwd() / raw_path,
+        config_path.parent / raw_path,
+        config_path.parent.parent / raw_path if config_path.parent.name == "config" else config_path.parent / raw_path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def read_optional_text(path_value: str | None, config_path: Path) -> str:
+    path = resolve_asset_path(path_value, config_path)
+    if path is None:
+        return ""
+    if not path.exists():
+        raise ConfigError(f"referenced file not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def hermes_chat_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def hermes_health_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return f"{base}/health"
+
+
+def hermes_headers(api_key: str | None) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def http_get_text(url: str, api_key: str | None, timeout_s: float) -> str:
+    request = urllib.request.Request(url, headers=hermes_headers(api_key), method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ConfigError(f"Hermes HTTP {exc.code} at {url}: {body}") from exc
+
+
+def http_post_json(url: str, api_key: str | None, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers=hermes_headers(api_key), method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ConfigError(f"Hermes HTTP {exc.code} at {url}: {error_body}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Hermes returned non-JSON response: {raw[:500]}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError("Hermes response must be a JSON object")
+    return data
+
+
+def strip_json_code_fence(content: str) -> str:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def parse_hermes_action_response(content: str) -> dict[str, Any]:
+    text = strip_json_code_fence(content)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"reply": content.strip(), "actions": [{"action": "say", "text": content.strip(), "emotion": "speaking"}]}
+    if isinstance(parsed, list):
+        return {"reply": "", "actions": parsed}
+    if not isinstance(parsed, dict):
+        raise ConfigError("Hermes action response must be an object or array")
+    actions = parsed.get("actions", [])
+    if isinstance(actions, dict):
+        actions = [actions]
+    if actions is None:
+        actions = []
+    if not isinstance(actions, list):
+        raise ConfigError("Hermes response field actions must be an array")
+    parsed["actions"] = actions
+    return parsed
+
+
+def extract_hermes_message_content(response: dict[str, Any]) -> str:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ConfigError("Hermes response has no choices")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise ConfigError("Hermes response choice must be an object")
+    message = first.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    if isinstance(first.get("text"), str):
+        return first["text"]
+    raise ConfigError("Hermes response has no message content")
+
+
+def build_hermes_messages(
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+) -> list[dict[str, str]]:
+    status_text = json.dumps(status or {}, ensure_ascii=False, sort_keys=True)
+    system_parts = [
+        f"You are {pair.hermes_id}. You control exactly one StackChan: {pair.stackchan_id}.",
+        f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
+        "Return JSON only. Do not wrap it in Markdown.",
+        "Schema: {\"reply\":\"short German text\",\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system\",...}]}",
+        "Use action say for the spoken/displayed answer. Keep answers concise unless the user asks for detail.",
+        "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
+        f"Current StackChan status JSON: {status_text}",
+    ]
+    if capabilities:
+        system_parts.append(f"Bridge capabilities:\n{capabilities}")
+    if personality:
+        system_parts.append(f"Personality notes:\n{personality}")
+    return [
+        {"role": "system", "content": "\n\n".join(system_parts)},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def ask_hermes_http(
+    config: BridgeConfig,
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+) -> dict[str, Any]:
+    payload = {
+        "model": config.hermes.model,
+        "messages": build_hermes_messages(pair, capabilities, personality, status, user_text),
+        "temperature": 0.3,
+    }
+    response = http_post_json(
+        hermes_chat_url(config.hermes.base_url),
+        config.hermes.api_key,
+        payload,
+        config.hermes.timeout_s,
+    )
+    return parse_hermes_action_response(extract_hermes_message_content(response))
+
+
+def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    if not isinstance(action, dict):
+        raise ConfigError("Hermes action must be an object")
+    raw_name = action.get("action") or action.get("type") or action.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ConfigError("Hermes action needs an action name")
+    name = raw_name.strip().lower().replace("-", "_")
+    action_request_id = optional_string(action.get("request_id")) or request_id
+
+    if name == "display":
+        text = optional_string(action.get("text"))
+        if not text:
+            raise ConfigError("display action needs text")
+        payload = build_display_payload(text, parse_int_value(action.get("duration_ms"), 5000, "display.duration_ms"), action_request_id)
+        return pair.display_topic, payload
+
+    if name == "say":
+        text = optional_string(action.get("text"))
+        if not text:
+            raise ConfigError("say action needs text")
+        payload = with_request_id(
+            {
+                "text": text,
+                "emotion": optional_string(action.get("emotion")) or "speaking",
+                "beep": parse_bool_value(action.get("beep"), True),
+            },
+            action_request_id,
+        )
+        return pair.say_topic, payload
+
+    if name == "face":
+        payload = with_request_id(
+            {
+                "emotion": optional_string(action.get("emotion")) or "neutral",
+                "intensity_pct": parse_int_value(action.get("intensity_pct"), 60, "face.intensity_pct"),
+            },
+            action_request_id,
+        )
+        return pair.face_topic, payload
+
+    if name in {"move", "look"}:
+        payload: dict[str, Any] = {}
+        if name == "look" and optional_string(action.get("direction")):
+            payload["direction"] = optional_string(action.get("direction"))
+        for key in ("direction", "yaw_delta", "pitch_delta", "yaw_target_pct", "pitch_target_pct"):
+            if key in action and action[key] is not None:
+                payload[key] = action[key]
+        if "pan_pct" in action and "yaw_target_pct" not in payload:
+            payload["yaw_target_pct"] = action["pan_pct"]
+        if "tilt_pct" in action and "pitch_target_pct" not in payload:
+            payload["pitch_target_pct"] = action["tilt_pct"]
+        if not payload:
+            raise ConfigError("move action needs direction, delta, or target percent")
+        return pair.move_topic, with_request_id(payload, action_request_id)
+
+    if name == "motion":
+        points = action.get("points")
+        if points is None:
+            raise ConfigError("motion action needs points")
+        speed_pct = parse_int_value(action.get("speed_pct"), 45, "motion.speed_pct")
+        segment_ms = parse_optional_int_value(action.get("segment_ms"), "motion.segment_ms")
+        payload = {
+            "curve": optional_string(action.get("curve")) or "spline",
+            "speed_pct": clamp_int(speed_pct, 1, 100),
+            "points": normalize_motion_points(points, clamp_int(speed_pct, 1, 100), segment_ms),
+        }
+        if segment_ms is not None:
+            payload["segment_ms"] = clamp_int(segment_ms, 0, 4000)
+        return pair.motion_topic, with_request_id(payload, action_request_id)
+
+    if name == "led":
+        payload: dict[str, Any] = {"mode": optional_string(action.get("mode")) or "solid"}
+        for key in ("r", "g", "b"):
+            if key in action and action[key] is not None:
+                payload[key] = action[key]
+        return pair.led_topic, with_request_id(payload, action_request_id)
+
+    if name == "device":
+        payload = {}
+        for key in ("volume_pct", "brightness_pct", "display_sleep", "display_wake"):
+            if key in action and action[key] is not None:
+                payload[key] = action[key]
+        if not payload:
+            raise ConfigError("device action needs at least one device field")
+        return pair.device_topic, with_request_id(payload, action_request_id)
+
+    if name == "sound":
+        payload = {
+            "frequency_hz": parse_int_value(action.get("frequency_hz"), 880, "sound.frequency_hz"),
+            "duration_ms": parse_int_value(action.get("duration_ms"), 140, "sound.duration_ms"),
+        }
+        if action.get("volume_pct") is not None:
+            payload["volume_pct"] = action["volume_pct"]
+        return pair.sound_topic, with_request_id(payload, action_request_id)
+
+    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake"}:
+        system_action = optional_string(action.get("system_action") or action.get("command"))
+        if name != "system":
+            system_action = name
+        if not system_action:
+            raise ConfigError("system action needs system_action or command")
+        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake"}:
+            raise ConfigError(f"unsupported system action: {system_action}")
+        return pair.system_topic, with_request_id({"action": system_action}, action_request_id)
+
+    raise ConfigError(f"unsupported Hermes action: {raw_name}")
+
+
+def parse_int_value(value: Any, default: int, label: str) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be an integer")
+    if isinstance(value, (int, float)):
+        return int(round(value))
+    if isinstance(value, str):
+        return parse_int(value, default, label)
+    raise ConfigError(f"{label} must be an integer")
+
+
+def parse_optional_int_value(value: Any, label: str) -> int | None:
+    if value is None or value == "":
+        return None
+    return parse_int_value(value, 0, label)
+
+
+def parse_bool_value(value: Any, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return parse_bool(value, default, "boolean value")
+    raise ConfigError("boolean value must be true or false")
+
+
+def status_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "ja", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "nein", "off"}:
+            return False
+    return None
+
+
+def battery_snapshot(status: dict[str, Any]) -> dict[str, Any]:
+    pct = status.get("battery_pct")
+    if not isinstance(pct, int):
+        pct = None
+    charging = status_bool(status.get("battery_charging", status.get("charging")))
+    discharging = status_bool(status.get("battery_discharging"))
+    external_power = status_bool(status.get("external_power", status.get("usb_power")))
+    known = status_bool(status.get("battery_known"))
+    if known is None:
+        known = pct is not None and pct >= 0
+    if external_power is None:
+        external_power = bool(charging)
+    return {
+        "known": bool(known),
+        "pct": pct if pct is not None and pct >= 0 else None,
+        "charging": bool(charging),
+        "discharging": bool(discharging),
+        "external_power": bool(external_power),
+    }
+
+
+def format_battery_text(current: dict[str, Any]) -> str:
+    pct = current.get("pct")
+    pct_text = f"{pct}%" if isinstance(pct, int) else "?"
+    if current.get("charging"):
+        state = "LAEDT"
+    elif current.get("external_power"):
+        state = "AM STROM"
+    else:
+        state = "ENTLAEDT"
+    return f"AKKU {pct_text} {state}"
+
+
+def face_snapshot(status: dict[str, Any]) -> dict[str, Any] | None:
+    face = status.get("face")
+    if not isinstance(face, dict):
+        return None
+    emotion = optional_string(face.get("emotion")) or "neutral"
+    if emotion in {"battery", "charging", "battery_low"}:
+        emotion = "neutral"
+    intensity = face.get("intensity_pct")
+    if not isinstance(intensity, int):
+        intensity = 60
+    return {
+        "action": "face",
+        "emotion": emotion,
+        "intensity_pct": clamp_int(intensity, 0, 100),
+    }
+
+
+def build_power_change_actions(previous: dict[str, Any] | None, current: dict[str, Any]) -> list[dict[str, Any]]:
+    if previous is None or not current["known"]:
+        return []
+    if previous.get("external_power") == current.get("external_power"):
+        return []
+
+    pct = current["pct"]
+    if current["external_power"]:
+        return [
+            {"action": "display", "text": format_battery_text(current), "duration_ms": POWER_DISPLAY_DURATION_MS},
+        ]
+
+    if current["discharging"] or previous.get("external_power"):
+        return [
+            {"action": "display", "text": format_battery_text(current), "duration_ms": POWER_DISPLAY_DURATION_MS},
+        ]
+
+    return []
+
+
+def build_power_followup_actions(previous: dict[str, Any] | None, current: dict[str, Any]) -> list[dict[str, Any]]:
+    if previous is None or not current["known"]:
+        return []
+    if previous.get("external_power") == current.get("external_power"):
+        return []
+
+    if current["external_power"]:
+        return [
+            {"action": "face", "emotion": "happy", "intensity_pct": 84},
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 36,
+                "points": [
+                    {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 180, "speed_pct": 35},
+                    {"yaw_pct": 0, "pitch_pct": 26, "duration_ms": 650, "speed_pct": 35},
+                    {"yaw_pct": 0, "pitch_pct": 14, "duration_ms": 420, "speed_pct": 30},
+                ],
+            },
+        ]
+
+    if current["discharging"] or previous.get("external_power"):
+        return [
+            {"action": "face", "emotion": "neutral", "intensity_pct": 58},
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 42,
+                "points": [
+                    {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 120, "speed_pct": 38},
+                    {"yaw_pct": -14, "pitch_pct": -8, "duration_ms": 280, "speed_pct": 45},
+                    {"yaw_pct": 14, "pitch_pct": -12, "duration_ms": 280, "speed_pct": 45},
+                    {"yaw_pct": -8, "pitch_pct": -16, "duration_ms": 260, "speed_pct": 42},
+                    {"yaw_pct": 0, "pitch_pct": -24, "duration_ms": 600, "speed_pct": 34},
+                ],
+            },
+        ]
+
+    return []
+
+
+def status_allows_life_animation(status: dict[str, Any] | None) -> bool:
+    if not isinstance(status, dict):
+        return False
+    if status_bool(status.get("display_sleeping")):
+        return False
+    if status_bool(status.get("recording")) or status_bool(status.get("speaking")):
+        return False
+    ui_mode = nested_status_value(status, "ui.mode")
+    if isinstance(ui_mode, str) and ui_mode != "face":
+        return False
+    emotion = nested_status_value(status, "face.emotion")
+    if emotion in {"sleep", "error", "battery", "charging", "battery_low", "speaking"}:
+        return False
+    return True
+
+
+def current_face_action(status: dict[str, Any] | None, default_intensity: int = 60) -> dict[str, Any]:
+    if not isinstance(status, dict):
+        return {"action": "face", "emotion": "neutral", "intensity_pct": default_intensity}
+    emotion = optional_string(nested_status_value(status, "face.emotion")) or "neutral"
+    if emotion in {
+        "blink",
+        "glance_left",
+        "glance_right",
+        "glance_up",
+        "glance_down",
+        "mouth_smile",
+        "mouth_tiny",
+        "mouth_wiggle",
+        "look_left",
+        "look_right",
+        "look_up",
+        "look_down",
+        "breathe",
+        "deep_breathe",
+        "micro_sleep",
+    }:
+        emotion = "neutral"
+    intensity = nested_status_value(status, "face.intensity_pct")
+    if not isinstance(intensity, int):
+        intensity = default_intensity
+    return {"action": "face", "emotion": emotion, "intensity_pct": clamp_int(intensity, 35, 90)}
+
+
+def build_subtle_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
+    glance = rng.choice(["glance_left", "glance_right", "glance_up", "glance_up", "glance_down"])
+    yaw = -5 if glance == "glance_left" else 5 if glance == "glance_right" else rng.choice([-2, 2])
+    pitch = 4 if glance == "glance_up" else -4 if glance == "glance_down" else rng.choice([-2, 2])
+    return glance, {
+        "action": "motion",
+        "curve": "spline",
+        "speed_pct": 12,
+        "points": [
+            {"yaw_pct": yaw, "pitch_pct": pitch, "duration_ms": 1400, "speed_pct": 12, "hold_ms": 350},
+            {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 1800, "speed_pct": 10},
+        ],
+    }
+
+
+def build_big_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
+    yaw = rng.choice([-8, 0, 8])
+    return "glance_up", {
+        "action": "motion",
+        "curve": "spline",
+        "speed_pct": 18,
+        "points": [
+            {"yaw_pct": yaw, "pitch_pct": 18, "duration_ms": 1200, "speed_pct": 18, "hold_ms": 520},
+            {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 1700, "speed_pct": 12},
+        ],
+    }
+
+
+def build_life_sequence(
+    status: dict[str, Any] | None,
+    rng: random.Random,
+    include_motion: bool = True,
+) -> list[tuple[int, dict[str, Any]]]:
+    if not status_allows_life_animation(status):
+        return []
+
+    restore = current_face_action(status)
+    mood = restore["emotion"]
+    base_intensity = int(restore["intensity_pct"])
+    choice = rng.random()
+
+    if choice < 0.24:
+        return [(0, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity})]
+
+    if choice < 0.38:
+        return [
+            (0, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity}),
+            (360, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity}),
+        ]
+
+    if choice < 0.60:
+        glance = rng.choice(["glance_left", "glance_right", "glance_up", "glance_up", "glance_down"])
+        return [(0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity})]
+
+    if choice < 0.76:
+        mouth = rng.choice(["mouth_smile", "mouth_tiny", "mouth_wiggle"])
+        return [(0, {"action": "face", "emotion": mouth, "intensity_pct": base_intensity})]
+
+    if choice < 0.84:
+        return [(0, {"action": "face", "emotion": "deep_breathe", "intensity_pct": base_intensity})]
+
+    if choice < 0.88:
+        return [(0, {"action": "face", "emotion": "micro_sleep", "intensity_pct": base_intensity})]
+
+    if include_motion and choice >= 0.97:
+        glance, motion = build_big_life_motion(rng)
+        return [
+            (0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity}),
+            (640, motion),
+            (2600, {"action": "face", "emotion": mood, "intensity_pct": base_intensity}),
+        ]
+
+    if include_motion and choice >= 0.88:
+        glance, motion = build_subtle_life_motion(rng)
+        return [
+            (0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity}),
+            (760, motion),
+            (2200, {"action": "face", "emotion": mood, "intensity_pct": base_intensity}),
+        ]
+
+    return [(0, {"action": "face", "emotion": "breathe", "intensity_pct": base_intensity})]
+
+
+def ensure_reply_action(response: dict[str, Any]) -> list[dict[str, Any]]:
+    actions = list(response.get("actions") or [])
+    reply = optional_string(response.get("reply"))
+    has_visible_reply = any(
+        isinstance(action, dict) and str(action.get("action", "")).lower() in {"say", "display"}
+        for action in actions
+    )
+    if reply and not has_visible_reply:
+        actions.insert(0, {"action": "say", "text": reply, "emotion": "speaking", "beep": True})
+    return actions
+
+
+def dispatch_mqtt_actions(
+    config: BridgeConfig,
+    pair: PairConfig,
+    action_messages: list[tuple[str, dict[str, Any]]],
+    wait_ack: bool,
+    timeout_s: float,
+) -> int:
+    client = create_mqtt_client(config.mqtt)
+    pending = {payload["request_id"] for _topic, payload in action_messages if payload.get("request_id")}
+    responses: dict[str, dict[str, Any]] = {}
+    ack_seen = Event()
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        try:
+            data = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        request_id = data.get("request_id")
+        if request_id not in pending:
+            return
+        data["_topic"] = message.topic
+        responses[request_id] = data
+        if pending.issubset(responses):
+            ack_seen.set()
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        if wait_ack:
+            client.subscribe([(pair.ack_topic, 1), (pair.error_topic, 1)])
+        for topic, payload in action_messages:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            result = client.publish(topic, body, qos=1, retain=False)
+            result.wait_for_publish(timeout=5)
+            print(f"[bridge] sent {topic}: {body}")
+        if not wait_ack or not pending:
+            return 0
+        deadline = time.monotonic() + timeout_s
+        while pending.difference(responses) and time.monotonic() < deadline:
+            ack_seen.wait(min(0.2, max(0.0, deadline - time.monotonic())))
+        missing = pending.difference(responses)
+        for response in responses.values():
+            print(f"[bridge] response {response.get('_topic')}: {json.dumps(response, ensure_ascii=False)}")
+        if missing:
+            print(f"[bridge] missing ACK for: {', '.join(sorted(missing))}", file=sys.stderr)
+            return 3
+        return 0 if all(response.get("_topic") == pair.ack_topic for response in responses.values()) else 2
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
+def hermes_health(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    body = http_get_text(hermes_health_url(config.hermes.base_url), config.hermes.api_key, args.timeout)
+    print(body)
+    return 0
+
+
+def ask_hermes(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    config = load_config(config_path, Path(args.env))
+    pair = get_pair(config, args.pair)
+    user_text = args.text.strip()
+    if not user_text:
+        raise ConfigError("ask-hermes needs non-empty --text")
+    status = None if args.no_status else read_latest_status(config, pair, args.status_timeout)
+    capabilities = read_optional_text(pair.capabilities_file, config_path)
+    personality = read_optional_text(pair.personality_file, config_path)
+    response = ask_hermes_http(config, pair, capabilities, personality, status, user_text)
+    actions = ensure_reply_action(response)
+    if args.show_response or args.dry_run:
+        print(json.dumps({"hermes": response, "actions": actions}, ensure_ascii=False, indent=2))
+    action_messages = [
+        action_to_topic_payload(pair, action, f"hermes-{uuid.uuid4().hex[:12]}")
+        for action in actions
+    ]
+    if args.dry_run:
+        print(json.dumps(
+            [{"topic": topic, "payload": payload} for topic, payload in action_messages],
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return 0
+    return dispatch_mqtt_actions(config, pair, action_messages, not args.no_wait_ack, args.timeout)
+
+
+def publish_action_messages(client: Any, action_messages: list[tuple[str, dict[str, Any]]]) -> None:
+    for topic, payload in action_messages:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        result = client.publish(topic, body, qos=1, retain=False)
+        result.wait_for_publish(timeout=5)
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] sent {topic}: {body}", flush=True)
+
+
+def watch_power(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    previous: dict[str, Any] | None = None
+    last_event_at = 0.0
+    restore_timer: Timer | None = None
+    done = Event()
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        nonlocal previous, last_event_at, restore_timer
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(status, dict):
+            return
+        current = battery_snapshot(status)
+        if previous is None:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] power state initial: {json.dumps(current, ensure_ascii=False)}", flush=True)
+            if not args.announce_initial:
+                previous = current
+                return
+            previous = {
+                **current,
+                "charging": not current["charging"],
+                "discharging": not current["discharging"],
+                "external_power": not current["external_power"],
+            }
+
+        now = time.monotonic()
+        if now - last_event_at < args.debounce_s:
+            previous = current
+            return
+
+        followup_actions = build_power_followup_actions(previous, current)
+        immediate_followup_actions = [action for action in followup_actions if action.get("action") == "motion"]
+        delayed_followup_actions = [action for action in followup_actions if action.get("action") != "motion"]
+        actions = build_power_change_actions(previous, current)
+        previous = current
+        if not actions:
+            return
+
+        last_event_at = now
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] power change: {json.dumps(current, ensure_ascii=False)}", flush=True)
+        action_messages = [
+            action_to_topic_payload(pair, action, f"power-{uuid.uuid4().hex[:12]}")
+            for action in actions + immediate_followup_actions
+        ]
+        publish_action_messages(client, action_messages)
+        if delayed_followup_actions and not args.no_restore_face:
+            delay_ms = max(
+                (int(action.get("duration_ms", 0)) for action in actions if action.get("action") == "display"),
+                default=0,
+            )
+            if restore_timer:
+                restore_timer.cancel()
+
+            def publish_followup_actions() -> None:
+                publish_action_messages(
+                    client,
+                    [
+                        action_to_topic_payload(pair, action, f"power-followup-{uuid.uuid4().hex[:8]}")
+                        for action in delayed_followup_actions
+                    ],
+                )
+                if args.once:
+                    done.set()
+
+            restore_timer = Timer(max(0.0, delay_ms / 1000.0), publish_followup_actions)
+            restore_timer.daemon = True
+            restore_timer.start()
+        elif args.once:
+            done.set()
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe(pair.status_topic, qos=0)
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] watching power on {pair.status_topic}", flush=True)
+        while not done.wait(0.25):
+            pass
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if restore_timer:
+            restore_timer.cancel()
+        client.loop_stop()
+        client.disconnect()
+
+
+def animate_life(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    rng = random.Random(args.seed)
+    client = create_mqtt_client(config.mqtt)
+    emitted = 0
+
+    try:
+        connect_and_start(client, config.mqtt)
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] life animation active for {pair.pair_id}", flush=True)
+        while True:
+            status = read_latest_status(config, pair, args.status_timeout)
+            sequence = build_life_sequence(status, rng, include_motion=not args.no_motion)
+            if sequence:
+                for delay_ms, action in sequence:
+                    if delay_ms > 0:
+                        time.sleep(delay_ms / 1000.0)
+                    publish_action_messages(
+                        client,
+                        [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
+                    )
+                emitted += 1
+                if args.once:
+                    return 0
+            elif args.once:
+                print("[bridge] life animation skipped: StackChan is not idle on face", file=sys.stderr)
+                return 2
+
+            time.sleep(rng.uniform(args.min_interval_s, args.max_interval_s))
+    except KeyboardInterrupt:
         return 0
     finally:
         client.loop_stop()
@@ -771,9 +1718,53 @@ def build_parser() -> argparse.ArgumentParser:
     raw.add_argument("--json", required=True, help="JSON object payload.")
     raw.set_defaults(func=send_raw)
 
+    status_parser = subcommands.add_parser("read-status", help="Read the retained StackChan status once.")
+    status_parser.add_argument("--pair", default="desk", help="Pair id to read.")
+    status_parser.add_argument("--timeout", type=float, default=2.0, help="Status wait timeout in seconds.")
+    status_parser.set_defaults(func=read_status)
+
+    status_health_parser = subcommands.add_parser("status-health", help="Validate the retained StackChan status shape.")
+    status_health_parser.add_argument("--pair", default="desk", help="Pair id to read.")
+    status_health_parser.add_argument("--timeout", type=float, default=2.0, help="Status wait timeout in seconds.")
+    status_health_parser.add_argument("--show-status", action="store_true", help="Print the retained status after validation.")
+    status_health_parser.set_defaults(func=status_health)
+
+    hermes_health_parser = subcommands.add_parser("hermes-health", help="Check the configured Hermes HTTP health endpoint.")
+    hermes_health_parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds.")
+    hermes_health_parser.set_defaults(func=hermes_health)
+
+    ask = subcommands.add_parser("ask-hermes", help="Ask Hermes over HTTP and dispatch returned actions over MQTT.")
+    ask.add_argument("--pair", default="desk", help="Pair id to address.")
+    ask.add_argument("--text", required=True, help="User text to send to Hermes.")
+    ask.add_argument("--timeout", type=float, default=8.0, help="MQTT ACK wait timeout in seconds.")
+    ask.add_argument("--status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
+    ask.add_argument("--no-status", action="store_true", help="Do not include retained StackChan status in the Hermes prompt.")
+    ask.add_argument("--no-wait-ack", action="store_true", help="Do not wait for StackChan ACK/Error messages.")
+    ask.add_argument("--dry-run", action="store_true", help="Print Hermes actions and MQTT payloads without publishing.")
+    ask.add_argument("--show-response", action="store_true", help="Print parsed Hermes response before dispatch.")
+    ask.set_defaults(func=ask_hermes)
+
     watch_parser = subcommands.add_parser("watch", help="Print all MQTT messages for a pair.")
     watch_parser.add_argument("--pair", default="desk", help="Pair id to watch.")
     watch_parser.set_defaults(func=watch)
+
+    power = subcommands.add_parser("watch-power", help="React to StackChan battery charge/discharge status changes.")
+    power.add_argument("--pair", default="desk", help="Pair id to watch.")
+    power.add_argument("--debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
+    power.add_argument("--announce-initial", action="store_true", help="Also show the current power state immediately.")
+    power.add_argument("--once", action="store_true", help="Exit after the first emitted reaction.")
+    power.add_argument("--no-restore-face", action="store_true", help="Do not run the delayed face/motion reaction after the short battery overlay.")
+    power.set_defaults(func=watch_power)
+
+    life = subcommands.add_parser("animate-life", help="Send small idle face and motion impulses so StackChan feels alive.")
+    life.add_argument("--pair", default="desk", help="Pair id to animate.")
+    life.add_argument("--min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
+    life.add_argument("--max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
+    life.add_argument("--status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
+    life.add_argument("--seed", type=int, default=None, help="Optional random seed for repeatable tests.")
+    life.add_argument("--once", action="store_true", help="Emit one life sequence and exit.")
+    life.add_argument("--no-motion", action="store_true", help="Only animate the face, without servo head motion.")
+    life.set_defaults(func=animate_life)
     return parser
 
 

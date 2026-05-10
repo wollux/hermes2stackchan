@@ -53,13 +53,13 @@ python3 -m pip install -e .
 Watch all messages for the `desk` pair:
 
 ```sh
-python3 -m bridge.hermes2stackchan_bridge --env .env watch --pair desk
+scripts/h2s_bridge.sh watch --pair desk
 ```
 
 Send the first display command:
 
 ```sh
-python3 -m bridge.hermes2stackchan_bridge --env .env send-display \
+scripts/h2s_bridge.sh send-display \
   --pair desk \
   --text "Hello from Hermes2StackChan" \
   --request-id test-001 \
@@ -69,17 +69,75 @@ python3 -m bridge.hermes2stackchan_bridge --env .env send-display \
 Try hardware commands:
 
 ```sh
-python3 -m bridge.hermes2stackchan_bridge --env .env send-face --pair desk --emotion happy --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-move --pair desk --direction left --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-move --pair desk --direction center --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-motion --pair desk --profile circle --curve spline --speed-pct 35 --steps 40 --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-motion --pair desk --curve linear --points '[[0,0,0,25],[0,28,0,25],[0,-18,0,25],[0,0,0,25]]' --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-led --pair desk --mode party --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-device --pair desk --volume-pct 80 --brightness-pct 70 --wait-ack
-python3 -m bridge.hermes2stackchan_bridge --env .env send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
+scripts/h2s_bridge.sh read-status --pair desk
+scripts/h2s_bridge.sh status-health --pair desk
+scripts/h2s_bridge.sh send-face --pair desk --emotion happy --wait-ack
+scripts/h2s_bridge.sh send-move --pair desk --direction left --wait-ack
+scripts/h2s_bridge.sh send-move --pair desk --direction center --wait-ack
+scripts/h2s_bridge.sh send-motion --pair desk --profile circle --curve spline --speed-pct 35 --steps 40 --wait-ack
+scripts/h2s_bridge.sh send-motion --pair desk --curve linear --points '[[0,0,0,25],[0,28,0,25],[0,-18,0,25],[0,0,0,25]]' --wait-ack
+scripts/h2s_bridge.sh send-led --pair desk --mode party --wait-ack
+scripts/h2s_bridge.sh send-device --pair desk --volume-pct 80 --brightness-pct 70 --wait-ack
+scripts/h2s_bridge.sh send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
 ```
 
 `send-motion --profile ...` is only a bridge-side test helper. The MQTT payload sent to StackChan always contains concrete `points`; the firmware does not keep named motion profiles. For Hermes integration, let Hermes compute the waypoint sequence and publish `points` directly.
+
+React to USB/battery power changes:
+
+```sh
+scripts/h2s_bridge.sh watch-power --pair desk
+```
+
+`watch-power` listens to `hermes-stackchan/desk/status`. When the AXP2101 reports a transition from battery to external power or back, the bridge displays the battery percentage and charge state for about five seconds and starts the matching head motion immediately. After the overlay, it switches to the matching face: external power becomes happy; unplugging becomes neutral. It does not change LEDs or sound, so Hermes can keep using those channels.
+
+For normal local use, start it as a background process:
+
+```sh
+scripts/start_power_watcher.sh desk
+scripts/status_power_watcher.sh
+scripts/stop_power_watcher.sh
+```
+
+Run the idle life animator:
+
+```sh
+scripts/start_life_animator.sh desk
+scripts/status_life_animator.sh desk
+scripts/stop_life_animator.sh desk
+```
+
+`animate-life` only sends small face and mostly subtle head impulses while the retained status reports `ui.mode: face`, the display is awake, and StackChan is not recording or speaking. The firmware renders blink, normal breathing, occasional deep breathing, tiny `Z` micro-sleeps, small mouth impulses, and pupil-glance impulses as short smooth frame animations and returns to the current default face. Sometimes StackChan first glances with the pupils, then gently turns the head in that direction, and finally centers the pupils again. Upward glances are slightly favored so he does not feel stuck looking down. Rarely, StackChan performs a bigger look-up/back motion and returns to center. Firmware also glances in the detected movement direction for direct `move` and `motion` commands. Servo life motions are bounded and can be disabled with `--no-motion`. It never sends LED or sound commands.
+
+## Hermes HTTP Adapter
+
+The bridge can now ask a configured Hermes HTTP server and dispatch the returned JSON actions to StackChan over MQTT.
+
+Add these local values to `.env`:
+
+```sh
+H2S_HERMES_BASE_URL=http://192.168.99.58:8642
+H2S_HERMES_MODEL=default
+H2S_HERMES_API_KEY=
+H2S_HERMES_TIMEOUT_S=30
+```
+
+Check the Hermes server:
+
+```sh
+scripts/h2s_bridge.sh hermes-health
+```
+
+Ask Hermes and publish the resulting StackChan actions:
+
+```sh
+scripts/h2s_bridge.sh ask-hermes \
+  --pair desk \
+  --text "Sag kurz Hallo und lächle." \
+  --show-response
+```
+
+Hermes is instructed to return JSON only. If it still returns plain text, the bridge falls back to a `say` action so StackChan can show the answer instead of doing nothing.
 
 ## Firmware Setup
 
@@ -119,4 +177,4 @@ idf.py -p /dev/cu.usbmodem21301 flash monitor
 3. StackChan publishes retained status.
 4. The bridge sends a `cmd/display` message.
 5. StackChan shows the text and publishes an ACK with the same `request_id`.
-6. Hardware commands publish ACK/Error and the retained `status` reflects the new state.
+6. Hardware commands publish ACK/Error and the retained `status` reflects the new state, including `battery_pct`, `battery_charging`, `battery_discharging`, `temperature.soc_c`, `temperature.servo_yaw_c`, and `temperature.servo_pitch_c`.

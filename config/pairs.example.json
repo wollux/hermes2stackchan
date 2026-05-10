@@ -7,6 +7,12 @@
     "password": null,
     "tls": false
   },
+  "hermes": {
+    "base_url": "http://127.0.0.1:8642",
+    "model": "default",
+    "api_key": null,
+    "timeout_s": 30
+  },
   "pairs": [
     {
       "pair_id": "desk",
