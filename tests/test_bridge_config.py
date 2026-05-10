@@ -325,6 +325,24 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertNotIn("led", action_names)
             self.assertNotIn("sound", action_names)
 
+    def test_life_sequence_blinks_often(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        sequences = [build_life_sequence(status, random.Random(seed)) for seed in range(120)]
+        blink_sequences = [
+            sequence
+            for sequence in sequences
+            if any(action["action"] == "face" and action["emotion"] == "blink" for _delay, action in sequence)
+        ]
+
+        self.assertGreaterEqual(len(blink_sequences), 48)
+
     def test_life_sequence_uses_pupil_glances(self) -> None:
         status = {
             "display_sleeping": False,
@@ -411,7 +429,7 @@ class BridgeConfigTests(unittest.TestCase):
                 self.assertLessEqual(abs(point["pitch_pct"]), 4)
                 self.assertGreaterEqual(point["duration_ms"], 1400)
 
-    def test_life_sequence_has_rare_big_look_up_motion(self) -> None:
+    def test_life_sequence_has_rare_big_desk_sweep_motion(self) -> None:
         status = {
             "display_sleeping": False,
             "recording": False,
@@ -429,17 +447,24 @@ class BridgeConfigTests(unittest.TestCase):
         big = [
             (delay, motion)
             for delay, motion in motions
-            if any(point["pitch_pct"] >= 12 for point in motion["points"])
+            if any(abs(point["yaw_pct"]) >= 60 for point in motion["points"])
+        ]
+        big_faces = [
+            (delay, action)
+            for seed in range(300)
+            for delay, action in build_life_sequence(status, random.Random(seed))
+            if action["action"] == "face" and action["emotion"] in {"glance_left", "glance_right"}
         ]
 
         self.assertTrue(big)
+        self.assertGreaterEqual(len(big_faces), len(big) * 2)
         self.assertLess(len(big), len(motions) // 2)
         for delay, motion in big:
-            self.assertGreaterEqual(delay, 600)
-            self.assertLessEqual(motion["speed_pct"], 18)
+            self.assertGreaterEqual(delay, 0)
+            self.assertLessEqual(motion["speed_pct"], 34)
             for point in motion["points"]:
-                self.assertLessEqual(abs(point["yaw_pct"]), 8)
-                self.assertLessEqual(abs(point["pitch_pct"]), 18)
+                self.assertLessEqual(abs(point["yaw_pct"]), 75)
+                self.assertLessEqual(abs(point["pitch_pct"]), 6)
 
     def test_life_sequence_can_disable_motion(self) -> None:
         status = {

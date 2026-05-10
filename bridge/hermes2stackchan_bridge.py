@@ -1024,17 +1024,48 @@ def build_subtle_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
     }
 
 
-def build_big_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
-    yaw = rng.choice([-8, 0, 8])
-    return "glance_up", {
-        "action": "motion",
-        "curve": "spline",
-        "speed_pct": 18,
-        "points": [
-            {"yaw_pct": yaw, "pitch_pct": 18, "duration_ms": 1200, "speed_pct": 18, "hold_ms": 520},
-            {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 1700, "speed_pct": 12},
-        ],
-    }
+def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) -> list[tuple[int, dict[str, Any]]]:
+    left_first = rng.choice([True, False])
+    first = -75 if left_first else 75
+    second = 75 if left_first else -75
+    first_glance = "glance_left" if left_first else "glance_right"
+    second_glance = "glance_right" if left_first else "glance_left"
+    center_glance = first_glance
+    return [
+        (0, {"action": "face", "emotion": first_glance, "intensity_pct": base_intensity}),
+        (
+            160,
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 34,
+                "points": [{"yaw_pct": first, "pitch_pct": 4, "duration_ms": 900, "speed_pct": 34, "hold_ms": 300}],
+            },
+        ),
+        (650, {"action": "face", "emotion": first_glance, "intensity_pct": base_intensity}),
+        (600, {"action": "face", "emotion": second_glance, "intensity_pct": base_intensity}),
+        (
+            0,
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 32,
+                "points": [{"yaw_pct": second, "pitch_pct": 6, "duration_ms": 1600, "speed_pct": 32, "hold_ms": 260}],
+            },
+        ),
+        (850, {"action": "face", "emotion": second_glance, "intensity_pct": base_intensity}),
+        (900, {"action": "face", "emotion": center_glance, "intensity_pct": base_intensity}),
+        (
+            0,
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 22,
+                "points": [{"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 1200, "speed_pct": 22}],
+            },
+        ),
+        (1500, {"action": "face", "emotion": mood, "intensity_pct": base_intensity}),
+    ]
 
 
 def build_life_sequence(
@@ -1050,38 +1081,33 @@ def build_life_sequence(
     base_intensity = int(restore["intensity_pct"])
     choice = rng.random()
 
-    if choice < 0.24:
+    if choice < 0.34:
         return [(0, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity})]
 
-    if choice < 0.38:
+    if choice < 0.50:
         return [
             (0, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity}),
             (360, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity}),
         ]
 
-    if choice < 0.60:
+    if choice < 0.66:
         glance = rng.choice(["glance_left", "glance_right", "glance_up", "glance_up", "glance_down"])
         return [(0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity})]
 
-    if choice < 0.76:
+    if choice < 0.80:
         mouth = rng.choice(["mouth_smile", "mouth_tiny", "mouth_wiggle"])
         return [(0, {"action": "face", "emotion": mouth, "intensity_pct": base_intensity})]
 
-    if choice < 0.84:
+    if choice < 0.86:
         return [(0, {"action": "face", "emotion": "deep_breathe", "intensity_pct": base_intensity})]
 
-    if choice < 0.88:
+    if choice < 0.89:
         return [(0, {"action": "face", "emotion": "micro_sleep", "intensity_pct": base_intensity})]
 
     if include_motion and choice >= 0.97:
-        glance, motion = build_big_life_motion(rng)
-        return [
-            (0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity}),
-            (640, motion),
-            (2600, {"action": "face", "emotion": mood, "intensity_pct": base_intensity}),
-        ]
+        return build_big_life_sequence(rng, base_intensity, mood)
 
-    if include_motion and choice >= 0.88:
+    if include_motion and choice >= 0.89:
         glance, motion = build_subtle_life_motion(rng)
         return [
             (0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity}),
