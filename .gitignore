@@ -1,0 +1,38 @@
+/Ressourcen/
+/MEGAPLAN_EN.MD
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Build and cache output
+build/
+dist/
+*.egg-info/
+.cache/
+
+# ESP-IDF / firmware output
+managed_components/
+dependencies.lock
+sdkconfig.old
+firmware/build/
+firmware/managed_components/
+firmware_clock/build/
+firmware_clock/managed_components/
+
+# Logs and local runtime files
+*.log
+*.pid
+*.tmp
+*.wav
+*.mp3
+*.ogg
+
