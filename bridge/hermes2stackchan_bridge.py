@@ -3603,6 +3603,17 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 skip_actions={"say"},
             )
             action_errors.extend(reminder_errors)
+            if display_text and not any(
+                optional_string(action.get("action")).lower() in {"display", "display_image", "image"}
+                for action in actions
+            ):
+                action_messages.insert(
+                    0,
+                    (
+                        self.server.pair.display_topic,
+                        build_display_payload(display_text, 9000, f"photo-display-{request_id}"),
+                    ),
+                )
             tts_started = time.monotonic()
             tts_path = make_tts_wav(display_text, self.server.config.speech, f"photo-{request_id}") if display_text else ""
             tts_ms = round((time.monotonic() - tts_started) * 1000) if tts_path else 0
