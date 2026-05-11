@@ -3415,6 +3415,11 @@ void handle_audio_command(const char* data, int len)
             cJSON_Delete(root);
             return;
         }
+        if (g_tts_playing) {
+            publish_error(request_id, "audio", "tts already playing");
+            cJSON_Delete(root);
+            return;
+        }
         char* task_url = static_cast<char*>(std::malloc(std::strlen(url) + 1));
         if (!task_url) {
             publish_error(request_id, "audio", "url allocation failed");
@@ -3422,7 +3427,7 @@ void handle_audio_command(const char* data, int len)
             return;
         }
         std::strcpy(task_url, url);
-        const BaseType_t ok = xTaskCreate(play_wav_url_task, "tts_url", 6144, task_url, 3, nullptr);
+        const BaseType_t ok = xTaskCreate(play_wav_url_task, "tts_url", 8192, task_url, 3, nullptr);
         if (ok != pdPASS) {
             std::free(task_url);
             publish_error(request_id, "audio", "tts task failed");

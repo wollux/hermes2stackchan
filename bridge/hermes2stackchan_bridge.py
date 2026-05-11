@@ -35,6 +35,8 @@ EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 REMINDER_STORE_LOCK = RLock()
+LIFE_PAUSE_LOCK = RLock()
+LIFE_PAUSED_UNTIL: dict[str, float] = {}
 
 
 class ConfigError(ValueError):
@@ -1514,6 +1516,26 @@ def status_allows_life_animation(status: dict[str, Any] | None) -> bool:
     return True
 
 
+def pause_life_animation(pair_id: str, seconds: float, reason: str) -> None:
+    until = time.monotonic() + max(0.0, seconds)
+    with LIFE_PAUSE_LOCK:
+        LIFE_PAUSED_UNTIL[pair_id] = max(LIFE_PAUSED_UNTIL.get(pair_id, 0.0), until)
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge] life animation paused for {pair_id} "
+        f"{seconds:.1f}s: {reason}",
+        flush=True,
+    )
+
+
+def life_animation_paused(pair_id: str) -> bool:
+    with LIFE_PAUSE_LOCK:
+        until = LIFE_PAUSED_UNTIL.get(pair_id, 0.0)
+        if until <= time.monotonic():
+            LIFE_PAUSED_UNTIL.pop(pair_id, None)
+            return False
+        return True
+
+
 def current_face_action(status: dict[str, Any] | None, default_intensity: int = 60) -> dict[str, Any]:
     if not isinstance(status, dict):
         return {"action": "face", "emotion": "neutral", "intensity_pct": default_intensity}
@@ -2297,12 +2319,20 @@ def animate_life(args: argparse.Namespace) -> int:
         connect_and_start(client, config.mqtt)
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] life animation active for {pair.pair_id}", flush=True)
         while True:
+            if life_animation_paused(pair.pair_id):
+                if args.once:
+                    print("[bridge] life animation skipped: paused by speech or reminder", file=sys.stderr)
+                    return 2
+                time.sleep(min(1.0, max(0.1, args.min_interval_s)))
+                continue
             status = read_latest_status(config, pair, args.status_timeout)
             sequence = build_life_sequence(status, rng, include_motion=not args.no_motion)
             if sequence:
                 for delay_ms, action in sequence:
                     if delay_ms > 0:
                         time.sleep(delay_ms / 1000.0)
+                    if life_animation_paused(pair.pair_id):
+                        break
                     publish_action_messages(
                         client,
                         [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
@@ -3098,6 +3128,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if archive_path:
             print(f"[bridge-http] archived wav: {archive_path}", flush=True)
         print(f"[bridge-http] received {len(audio)} bytes in {read_ms}ms request_id={request_id}", flush=True)
+        pause_life_animation(self.server.pair.pair_id, 75.0, f"speech request {request_id}")
 
         try:
             stt_started = time.monotonic()
@@ -3265,6 +3296,8 @@ def list_reminders_cli(args: argparse.Namespace) -> int:
 
 
 def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder: dict[str, Any]) -> None:
+    duration_s = config.reminders.display_duration_ms / 1000.0
+    pause_life_animation(pair.pair_id, max(12.0, duration_s + 8.0), f"reminder {reminder.get('id')}")
     messages = [
         action_to_topic_payload(pair, action, f"reminder-{reminder.get('id', uuid.uuid4().hex[:8])}-{index:02d}")
         for index, action in enumerate(reminder_actions_with_tts(config, reminder))
