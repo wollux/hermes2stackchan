@@ -1019,30 +1019,43 @@ void push_voice_level(int level_pct, int avg, int peak, bool active)
 
 void draw_voice_waveform_overlay()
 {
-    const int panel_x = 20;
-    const int panel_y = 198;
-    const int panel_w = 280;
-    const int panel_h = 34;
+    const int panel_x = 28;
+    const int panel_y = 194;
+    const int panel_w = 264;
+    const int panel_h = 38;
     const int mid_y = panel_y + panel_h / 2;
-    const uint16_t background = rgb565(0, 4, 8);
-    const uint16_t dim = rgb565(10, 55, 70);
-    const uint16_t idle = rgb565(40, 130, 180);
-    const uint16_t active = rgb565(80, 255, 130);
+    const uint16_t background = rgb565(0, 7, 12);
+    const uint16_t edge = rgb565(8, 42, 54);
+    const uint16_t dim = rgb565(16, 58, 68);
+    const uint16_t idle = rgb565(42, 145, 170);
+    const uint16_t active = rgb565(120, 245, 210);
+    const uint16_t glow = rgb565(26, 100, 112);
     const uint16_t color = g_voice_active ? active : idle;
 
     draw_rect(panel_x, panel_y, panel_w, panel_h, background);
-    draw_line(panel_x + 8, mid_y, panel_x + panel_w - 8, mid_y, dim, 1);
+    draw_line(panel_x + 12, panel_y, panel_x + panel_w - 12, panel_y, edge, 2);
+    draw_line(panel_x + 12, panel_y + panel_h, panel_x + panel_w - 12, panel_y + panel_h, edge, 2);
+    draw_line(panel_x, panel_y + 10, panel_x, panel_y + panel_h - 10, edge, 2);
+    draw_line(panel_x + panel_w, panel_y + 10, panel_x + panel_w, panel_y + panel_h - 10, edge, 2);
+    draw_line(panel_x + 14, mid_y, panel_x + panel_w - 14, mid_y, dim, 1);
 
-    const int bars = std::min<int>(static_cast<int>(g_voice_waveform.size()), (panel_w - 16) / 4);
+    const int bars = std::min<int>(static_cast<int>(g_voice_waveform.size()), (panel_w - 24) / 5);
     const int latest = static_cast<int>(g_voice_waveform_head);
     for (int i = 0; i < bars; ++i) {
         const int history_index =
             (latest - (bars - 1 - i) + static_cast<int>(g_voice_waveform.size()) * 2) %
             static_cast<int>(g_voice_waveform.size());
         const int level = clamp_int(static_cast<int>(g_voice_waveform[history_index]), 0, 100);
-        const int bar_h = std::max(2, level * (panel_h - 8) / 100);
-        const int x = panel_x + 8 + i * 4;
-        draw_line(x, mid_y - bar_h / 2, x, mid_y + bar_h / 2, color, 2);
+        const int bar_h = std::max(2, level * (panel_h - 12) / 100);
+        const int x = panel_x + 14 + i * 5;
+        const uint16_t bar_color = level > 8 ? color : glow;
+        draw_line(x, mid_y - bar_h / 2, x, mid_y + bar_h / 2, bar_color, 3);
+    }
+
+    const int meter_w = clamp_int((panel_w - 32) * g_voice_level_pct / 100, 4, panel_w - 32);
+    draw_rect(panel_x + 16, panel_y + panel_h - 7, panel_w - 32, 2, rgb565(6, 32, 40));
+    if (g_voice_active) {
+        draw_rect(panel_x + 16, panel_y + panel_h - 7, meter_w, 2, active);
     }
 }
 
@@ -1197,84 +1210,26 @@ int count_words(const char* text)
     return count;
 }
 
-void draw_response_panel(int pulse)
-{
-    const uint16_t panel = rgb565(2, 12, 20);
-    const uint16_t border = rgb565(12, 62, 82);
-    const uint16_t glow = rgb565(8, 95, 120);
-    const int x = 16;
-    const int y = 56;
-    const int w = 288;
-    const int h = 118;
-
-    draw_rect(x + 2, y + 2, w - 4, h - 4, panel);
-    draw_line(x + 10, y, x + w - 10, y, border, 2);
-    draw_line(x + 10, y + h, x + w - 10, y + h, border, 2);
-    draw_line(x, y + 10, x, y + h - 10, border, 2);
-    draw_line(x + w, y + 10, x + w, y + h - 10, border, 2);
-    draw_ellipse(x + 10, y + 10, 10, 10, border);
-    draw_ellipse(x + w - 10, y + 10, 10, 10, border);
-    draw_ellipse(x + 10, y + h - 10, 10, 10, border);
-    draw_ellipse(x + w - 10, y + h - 10, 10, 10, border);
-
-    if (pulse > 0) {
-        draw_line(x + 32, y + 8, x + 92 + pulse * 12, y + 8, glow, 1);
-        draw_line(x + w - 92 - pulse * 12, y + h - 8, x + w - 32, y + h - 8, glow, 1);
-    }
-}
-
-void draw_response_mini_face(int index, uint16_t color)
-{
-    const int cx = 160;
-    const int y = 204;
-    const int look = (index % 5) - 2;
-    const int blink = index % 11 == 0 ? 1 : 0;
-
-    if (blink) {
-        draw_line(cx - 52, y - 12, cx - 28, y - 12, color, 3);
-        draw_line(cx + 28, y - 12, cx + 52, y - 12, color, 3);
-    } else {
-        draw_ellipse(cx - 42 + look, y - 14, 9, 16, color);
-        draw_ellipse(cx + 42 + look, y - 14, 9, 16, color);
-    }
-    draw_mouth_curve(cx + look, y + 6, 48, 14, true, color);
-}
-
-void draw_response_progress(int index, int total, uint16_t accent)
-{
-    if (total <= 1) {
-        return;
-    }
-    const int dots = std::min(total, 12);
-    const int start_x = 160 - (dots * 14) / 2;
-    const int active = clamp_int((index * dots + total - 1) / total, 1, dots);
-    for (int i = 0; i < dots; ++i) {
-        const uint16_t color = i < active ? accent : rgb565(12, 45, 58);
-        draw_ellipse(start_x + i * 14, 184, i < active ? 3 : 2, i < active ? 3 : 2, color);
-    }
-}
-
-void draw_word_message(const char* title, const char* word, int index, int total, uint16_t accent, int phase)
+void draw_word_message(const char* title, const char* word, int index, int total, uint16_t accent)
 {
     wake_display_if_needed();
     copy_ui_mode("display");
     FrameGuard frame;
-    clear(rgb565(0, 3, 7));
-    const uint16_t label = rgb565(90, 150, 170);
-    const uint16_t text = rgb565(246, 252, 255);
-    const uint16_t soft = rgb565(150, 225, 235);
-
-    draw_text(22, 18, title, 1, label);
-    draw_text(244, 18, "RX", 1, label);
-    draw_response_panel(phase);
+    clear(kBlack);
+    draw_centered_text(16, title, 2, accent);
+    draw_rect(24, 45, 272, 2, accent);
 
     const int len = static_cast<int>(std::strlen(word));
-    const int scale = len <= 6 ? 6 : len <= 9 ? 5 : len <= 13 ? 4 : len <= 18 ? 3 : 2;
+    const int scale = len <= 6 ? 7 : len <= 9 ? 6 : len <= 12 ? 5 : len <= 18 ? 4 : 3;
     const int text_height = 7 * scale;
-    draw_centered_text(108 - text_height / 2 + phase, word, scale, text);
+    draw_centered_text((kHeight - text_height) / 2 + 8, word, scale, rgb565(245, 250, 255));
 
-    draw_response_progress(index, total, accent);
-    draw_response_mini_face(index + phase, soft);
+    if (total > 1) {
+        const int bar_w = 240;
+        const int filled = clamp_int((bar_w * index) / total, 1, bar_w);
+        draw_rect((kWidth - bar_w) / 2, 218, bar_w, 4, rgb565(24, 45, 60));
+        draw_rect((kWidth - bar_w) / 2, 218, filled, 4, accent);
+    }
 }
 
 void draw_word_sequence(const char* title, const char* text, int duration_ms, uint16_t accent)
@@ -1301,13 +1256,8 @@ void draw_word_sequence(const char* title, const char* text, int duration_ms, ui
             ++cursor;
         }
         ++index;
-        const int frame_ms = std::max(70, per_word_ms / 3);
-        draw_word_message(title, word, index, total, accent, 0);
-        vTaskDelay(pdMS_TO_TICKS(frame_ms));
-        draw_word_message(title, word, index, total, accent, 1);
-        vTaskDelay(pdMS_TO_TICKS(frame_ms));
-        draw_word_message(title, word, index, total, accent, 0);
-        vTaskDelay(pdMS_TO_TICKS(std::max(70, per_word_ms - frame_ms * 2)));
+        draw_word_message(title, word, index, total, accent);
+        vTaskDelay(pdMS_TO_TICKS(per_word_ms));
     }
 }
 
@@ -3655,13 +3605,14 @@ void ui_task(void*)
                 draw_face(command.emotion, command.intensity_pct);
             }
         } else if (command.type == UiCommandType::Say) {
+            draw_wrapped_message("STACKCHAN", command.text, command.accent);
             copy_face_emotion(command.emotion, command.intensity_pct);
             if (command.beep && g_audio_output_ready && g_sound_queue) {
                 SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1};
                 xQueueSend(g_sound_queue, &sound, 0);
             }
             publish_status();
-            draw_word_sequence("HERMES", command.text, command.duration_ms, command.accent);
+            vTaskDelay(pdMS_TO_TICKS(command.duration_ms));
             draw_face(g_face_emotion, g_face_intensity_pct);
         }
         publish_status();
