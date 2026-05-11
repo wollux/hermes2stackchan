@@ -831,10 +831,16 @@ def actions_to_topic_payloads(
     pair: PairConfig,
     actions: list[dict[str, Any]],
     request_id_prefix: str,
+    skip_actions: set[str] | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
     messages: list[tuple[str, dict[str, Any]]] = []
     errors: list[str] = []
+    skip_actions = skip_actions or set()
     for index, action in enumerate(actions):
+        if isinstance(action, dict):
+            name = str(action.get("action") or action.get("type") or action.get("name") or "").strip().lower().replace("-", "_")
+            if name in skip_actions:
+                continue
         try:
             messages.append(action_to_topic_payload(pair, action, f"{request_id_prefix}-{index:02d}"))
         except ConfigError as exc:
@@ -2651,6 +2657,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.server.pair,
                     actions,
                     f"speech-{request_id}",
+                    skip_actions={"say"},
                 )
                 publish_started = time.monotonic()
                 publish_action_messages(self.server.mqtt_client, action_messages)
@@ -2680,23 +2687,14 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 {
                     "ok": bool(display_text),
                     "request_id": request_id,
-                    "transcript": transcript,
-                    "stt_backend": backend,
-                    "reply": display_text,
-                    "hermes": hermes_response,
-                    "action_errors": action_errors,
-                    "audio_bytes": len(audio),
-                    "request_read_ms": read_ms,
-                    "stt_ms": stt_ms,
-                    "status_ms": status_ms,
-                    "hermes_ms": hermes_ms,
-                    "tts_ms": tts_ms,
                     "tts_path": tts_path,
                     "tts_url": tts_url,
-                    "mqtt_ms": mqtt_ms,
+                    "reply": display_text[:240],
+                    "stt_ms": stt_ms,
+                    "hermes_ms": hermes_ms,
+                    "tts_ms": tts_ms,
                     "total_ms": total_ms,
                     "actions_published": action_count,
-                    "mqtt_prefix": self.server.pair.mqtt_prefix,
                 },
             )
         except Exception as exc:

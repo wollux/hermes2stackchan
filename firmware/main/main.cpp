@@ -135,6 +135,7 @@ int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
 volatile bool g_audio_input_ready = false;
+volatile bool g_tts_playing = false;
 volatile bool g_wakeword_enabled = true;
 volatile bool g_recording = false;
 volatile bool g_head_touch_ready = false;
@@ -203,7 +204,7 @@ struct MotionCommand {
 };
 
 struct HttpResponseBuffer {
-    char data[2048] = {};
+    char data[4096] = {};
     int len = 0;
     bool truncated = false;
 };
@@ -2677,8 +2678,8 @@ void publish_status()
                   "\"battery_current_direction\":%d,"
                   "\"volume_pct\":%d,\"brightness_pct\":%u,\"display_sleeping\":%s,"
                   "\"temperature\":{\"soc_c\":%d,\"servo_yaw_c\":%d,\"servo_pitch_c\":%d},"
-                  "\"wakeword_enabled\":%s,\"recording\":%s,\"speaking\":false,"
-                  "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\","
+                  "\"wakeword_enabled\":%s,\"recording\":%s,\"speaking\":%s,"
+                  "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\",\"speaking\":%s,"
                   "\"recording\":%s,\"recording_source\":\"%s\",\"recording_started_ms\":%lld,"
                   "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d,"
                   "\"voice_active\":%s,\"voice_level_pct\":%d,\"voice_avg_level\":%d,\"voice_peak_level\":%d},"
@@ -2713,9 +2714,11 @@ void publish_status()
                   static_cast<int>(g_temperature_servo_pitch_c),
                   g_wakeword_enabled ? "true" : "false",
                   g_recording ? "true" : "false",
+                  g_tts_playing ? "true" : "false",
                   g_audio_input_ready ? "true" : "false",
                   g_wakeword_enabled ? "true" : "false",
                   g_wakeword,
+                  g_tts_playing ? "true" : "false",
                   g_recording ? "true" : "false",
                   g_recording_source,
                   static_cast<long long>(g_recording_started_ms),
@@ -3468,10 +3471,15 @@ bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request
     }
 
     ESP_LOGI(kTag, "voice upload done: status=%d elapsed=%dms response=%s", status, elapsed_ms, response->data);
+    if (response->truncated) {
+        ESP_LOGW(kTag, "voice upload response was truncated at %d bytes", response->len);
+    }
     publish_event("audio_upload_done", source, request_id, "bridge accepted wav");
     char tts_url[256] = {};
     if (extract_json_string(response->data, "tts_url", tts_url, sizeof(tts_url))) {
         play_wav_url(tts_url);
+    } else {
+        ESP_LOGW(kTag, "voice upload response has no tts_url");
     }
     return true;
 }
@@ -3558,6 +3566,9 @@ bool play_wav_url(const char* url)
         return false;
     }
     ESP_LOGI(kTag, "tts playback start: %s", url);
+    g_tts_playing = true;
+    copy_ui_mode("speaking");
+    publish_status();
     const esp_err_t err = esp_http_client_perform(client);
     const int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
@@ -3565,6 +3576,9 @@ bool play_wav_url(const char* url)
         uint8_t sample[2] = {playback.pending_byte, 0};
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, sample, sizeof(sample)));
     }
+    g_tts_playing = false;
+    copy_ui_mode("face");
+    publish_status();
     ESP_LOGI(kTag, "tts playback done: status=%d err=%s", status, esp_err_to_name(err));
     return err == ESP_OK && status >= 200 && status < 300;
 }
@@ -3961,7 +3975,7 @@ void wakeword_task(void*)
     int log_divider = 0;
 
     while (true) {
-        if (!g_wakeword_enabled || g_recording) {
+        if (!g_wakeword_enabled || g_recording || g_tts_playing) {
             vTaskDelay(pdMS_TO_TICKS(40));
             continue;
         }
