@@ -28,10 +28,12 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_wn_models.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "model_path.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "es7210_adc.h"
@@ -53,6 +55,7 @@ constexpr uint8_t kAw88298Addr = AW88298_CODEC_DEFAULT_ADDR;
 constexpr uint8_t kEs7210Addr = ES7210_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
 constexpr size_t kFrameBufferBytes = kWidth * kHeight * sizeof(uint16_t);
+constexpr int kLcdDmaTargetLines = 8;
 constexpr int kAudioSampleRate = 16000;
 constexpr size_t kWavHeaderBytes = 44;
 constexpr int kDefaultIdleYawPct = 0;
@@ -78,8 +81,11 @@ constexpr gpio_num_t kAudioDout = GPIO_NUM_13;
 esp_lcd_panel_handle_t g_panel = nullptr;
 esp_lcd_panel_io_handle_t g_panel_io = nullptr;
 uint16_t* g_framebuffer = nullptr;
+uint16_t* g_lcd_dma_buffer = nullptr;
+int g_lcd_dma_lines = 0;
 bool g_framebuffer_active = false;
 SemaphoreHandle_t g_display_mutex = nullptr;
+SemaphoreHandle_t g_lcd_transfer_done = nullptr;
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
 SemaphoreHandle_t g_i2c_mutex = nullptr;
 EventGroupHandle_t g_wifi_events = nullptr;
@@ -129,7 +135,7 @@ int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
 volatile bool g_audio_input_ready = false;
-volatile bool g_wakeword_enabled = false;
+volatile bool g_wakeword_enabled = true;
 volatile bool g_recording = false;
 volatile bool g_head_touch_ready = false;
 volatile bool g_display_touch_ready = false;
@@ -149,6 +155,12 @@ std::array<uint8_t, 64> g_voice_waveform = {};
 volatile int g_voice_waveform_head = 0;
 char g_wakeword[32] = "Computer";
 char g_recording_source[24] = "none";
+srmodel_list_t* g_sr_models = nullptr;
+const esp_wn_iface_t* g_wakenet_iface = nullptr;
+model_iface_data_t* g_wakenet_model = nullptr;
+int g_wakenet_chunk_samples = 0;
+int g_wakenet_channel_count = 1;
+bool g_wakenet_ready = false;
 
 char g_topic_display[96] = {};
 char g_topic_system[96] = {};
@@ -764,6 +776,18 @@ void init_power_and_reset_panel()
     init_robot_body_power();
 }
 
+bool lcd_color_transfer_done(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void* user_ctx)
+{
+    auto semaphore = static_cast<SemaphoreHandle_t>(user_ctx);
+    if (!semaphore) {
+        return false;
+    }
+
+    BaseType_t high_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(semaphore, &high_task_woken);
+    return high_task_woken == pdTRUE;
+}
+
 void init_display()
 {
     spi_bus_config_t bus_config = {};
@@ -772,7 +796,7 @@ void init_display()
     bus_config.sclk_io_num = GPIO_NUM_36;
     bus_config.quadwp_io_num = GPIO_NUM_NC;
     bus_config.quadhd_io_num = GPIO_NUM_NC;
-    bus_config.max_transfer_sz = kWidth * kHeight * sizeof(uint16_t);
+    bus_config.max_transfer_sz = kWidth * kLcdDmaTargetLines * sizeof(uint16_t);
     ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus_config, SPI_DMA_CH_AUTO));
 
     esp_lcd_panel_io_spi_config_t io_config = {};
@@ -780,10 +804,19 @@ void init_display()
     io_config.dc_gpio_num = GPIO_NUM_35;
     io_config.spi_mode = 2;
     io_config.pclk_hz = 40 * 1000 * 1000;
-    io_config.trans_queue_depth = 10;
+    io_config.trans_queue_depth = 1;
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &g_panel_io));
+
+    g_lcd_transfer_done = xSemaphoreCreateBinary();
+    if (g_lcd_transfer_done) {
+        esp_lcd_panel_io_callbacks_t callbacks = {};
+        callbacks.on_color_trans_done = lcd_color_transfer_done;
+        ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(g_panel_io, &callbacks, g_lcd_transfer_done));
+    } else {
+        ESP_LOGW(kTag, "LCD transfer semaphore unavailable; DMA buffers cannot be synchronized");
+    }
 
     esp_lcd_panel_dev_config_t panel_config = {};
     panel_config.reset_gpio_num = GPIO_NUM_NC;
@@ -816,6 +849,54 @@ void init_framebuffer()
     } else {
         ESP_LOGW(kTag, "display framebuffer unavailable; using direct drawing");
     }
+
+    for (int lines = kLcdDmaTargetLines; lines >= 1; lines /= 2) {
+        g_lcd_dma_buffer = static_cast<uint16_t*>(
+            heap_caps_malloc(kWidth * lines * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        if (g_lcd_dma_buffer) {
+            g_lcd_dma_lines = lines;
+            ESP_LOGI(kTag, "display DMA line buffer ready: %d lines, %u bytes",
+                     g_lcd_dma_lines,
+                     static_cast<unsigned>(kWidth * lines * sizeof(uint16_t)));
+            break;
+        }
+    }
+    if (!g_lcd_dma_buffer) {
+        ESP_LOGW(kTag, "display DMA line buffer unavailable; LCD driver may allocate DMA memory");
+    }
+}
+
+void draw_bitmap_dma(int x, int y, int w, int h, const uint16_t* pixels)
+{
+    if (!g_panel || !pixels || w <= 0 || h <= 0) {
+        return;
+    }
+
+    if (!g_lcd_dma_buffer || g_lcd_dma_lines <= 0 || w > kWidth) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_draw_bitmap(g_panel, x, y, x + w, y + h, pixels));
+        return;
+    }
+
+    const int lines_per_chunk = std::max(1, std::min(g_lcd_dma_lines, h));
+    for (int yy = 0; yy < h; yy += lines_per_chunk) {
+        const int chunk_lines = std::min(lines_per_chunk, h - yy);
+        for (int line = 0; line < chunk_lines; ++line) {
+            std::memcpy(g_lcd_dma_buffer + line * w,
+                        pixels + (yy + line) * w,
+                        w * sizeof(uint16_t));
+        }
+        if (g_lcd_transfer_done) {
+            while (xSemaphoreTake(g_lcd_transfer_done, 0) == pdTRUE) {
+            }
+        }
+        const esp_err_t err =
+            esp_lcd_panel_draw_bitmap(g_panel, x, y + yy, x + w, y + yy + chunk_lines, g_lcd_dma_buffer);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(err);
+        if (err == ESP_OK && g_lcd_transfer_done &&
+            xSemaphoreTake(g_lcd_transfer_done, pdMS_TO_TICKS(250)) != pdTRUE) {
+            ESP_LOGW(kTag, "LCD transfer timeout");
+        }
+    }
 }
 
 bool begin_frame()
@@ -838,8 +919,7 @@ void flush_frame()
     }
     g_framebuffer_active = false;
     if (g_panel) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_lcd_panel_draw_bitmap(g_panel, 0, 0, kWidth, kHeight, g_framebuffer));
+        draw_bitmap_dma(0, 0, kWidth, kHeight, g_framebuffer);
     }
     if (g_display_mutex) {
         xSemaphoreGive(g_display_mutex);
@@ -935,8 +1015,7 @@ void draw_rect(int x, int y, int w, int h, uint16_t color)
     static uint16_t row[kWidth];
     std::fill_n(row, w, color);
     for (int yy = 0; yy < h; ++yy) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(
-            esp_lcd_panel_draw_bitmap(g_panel, x, y + yy, x + w, y + yy + 1, row));
+        draw_bitmap_dma(x, y + yy, w, 1, row);
     }
 }
 
@@ -3809,6 +3888,143 @@ void audio_state_task(void*)
     }
 }
 
+bool init_wakenet()
+{
+    g_sr_models = esp_srmodel_init("model");
+    if (!g_sr_models || g_sr_models->num <= 0) {
+        ESP_LOGW(kTag, "WakeNet disabled: no models found in model partition");
+        return false;
+    }
+
+    char* model_name = esp_srmodel_filter(g_sr_models, ESP_WN_PREFIX, "computer");
+    if (!model_name) {
+        model_name = esp_srmodel_filter(g_sr_models, ESP_WN_PREFIX, nullptr);
+    }
+    if (!model_name) {
+        ESP_LOGW(kTag, "WakeNet disabled: no wakenet model found");
+        return false;
+    }
+
+    g_wakenet_iface = esp_wn_handle_from_name(model_name);
+    if (!g_wakenet_iface) {
+        ESP_LOGW(kTag, "WakeNet disabled: no iface for %s", model_name);
+        return false;
+    }
+
+    g_wakenet_model = g_wakenet_iface->create(model_name, DET_MODE_95);
+    if (!g_wakenet_model) {
+        ESP_LOGW(kTag, "WakeNet disabled: create failed for %s", model_name);
+        return false;
+    }
+
+    g_wakenet_chunk_samples = g_wakenet_iface->get_samp_chunksize(g_wakenet_model);
+    g_wakenet_channel_count = std::max(1, g_wakenet_iface->get_channel_num(g_wakenet_model));
+    const int sample_rate = g_wakenet_iface->get_samp_rate(g_wakenet_model);
+    const int word_num = std::max(1, g_wakenet_iface->get_word_num(g_wakenet_model));
+    for (int word = 1; word <= word_num; ++word) {
+        const float threshold = g_wakenet_iface->get_det_threshold(g_wakenet_model, word);
+        ESP_LOGI(kTag, "WakeNet threshold word=%d %.3f", word, threshold);
+    }
+    char* words = esp_srmodel_get_wake_words(g_sr_models, model_name);
+    ESP_LOGI(kTag,
+             "WakeNet ready: model=%s words=%s sample_rate=%d chunk=%d channels=%d",
+             model_name,
+             words ? words : "?",
+             sample_rate,
+             g_wakenet_chunk_samples,
+             g_wakenet_channel_count);
+    std::free(words);
+
+    if (sample_rate != kAudioSampleRate) {
+        ESP_LOGW(kTag, "WakeNet sample rate mismatch: model=%d audio=%d", sample_rate, kAudioSampleRate);
+    }
+    g_wakenet_ready = true;
+    return true;
+}
+
+void wakeword_task(void*)
+{
+    while (!g_audio_input_ready || !g_audio_input) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!init_wakenet()) {
+        ESP_LOGW(kTag, "wakeword listener disabled");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    static constexpr int kMaxWakeSamples = 2048;
+    static std::array<int16_t, kMaxWakeSamples> samples = {};
+    int cooldown_chunks = 0;
+    int boot_calibration_chunks = 30;
+    int log_divider = 0;
+
+    while (true) {
+        if (!g_wakeword_enabled || g_recording) {
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
+
+        const int samples_to_read = g_wakenet_chunk_samples * g_wakenet_channel_count;
+        if (samples_to_read <= 0 || samples_to_read > kMaxWakeSamples) {
+            ESP_LOGE(kTag, "invalid wake sample chunk: %d", samples_to_read);
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        const esp_err_t err = esp_codec_dev_read(g_audio_input,
+                                                 samples.data(),
+                                                 samples_to_read * sizeof(int16_t));
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "WakeNet microphone read failed: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        int64_t sum = 0;
+        int peak = 0;
+        for (int i = 0; i < samples_to_read; ++i) {
+            const int value = samples[i] == INT16_MIN ? INT16_MAX : std::abs(static_cast<int>(samples[i]));
+            sum += value;
+            peak = std::max(peak, value);
+        }
+        const int avg = static_cast<int>(sum / samples_to_read);
+
+        if (boot_calibration_chunks > 0) {
+            --boot_calibration_chunks;
+            continue;
+        }
+        if (cooldown_chunks > 0) {
+            --cooldown_chunks;
+            continue;
+        }
+
+        const wakenet_state_t state = g_wakenet_iface->detect(g_wakenet_model, samples.data());
+        if (state == WAKENET_DETECTED) {
+            const int triggered_channel = g_wakenet_iface->get_triggered_channel(g_wakenet_model);
+            ESP_LOGI(kTag,
+                     "WakeNet '%s' detected: channel=%d avg=%d peak=%d",
+                     g_wakeword,
+                     triggered_channel,
+                     avg,
+                     peak);
+            publish_event("wakeword_detected", g_wakeword, "", "wakenet");
+            set_recording_state(true, "wakeword", "", "wakeword detected");
+            cooldown_chunks = 100;
+            continue;
+        }
+
+        if (++log_divider >= 80) {
+            ESP_LOGI(kTag, "wakenet level avg=%d peak=%d enabled=%s",
+                     avg,
+                     peak,
+                     g_wakeword_enabled ? "true" : "false");
+            log_divider = 0;
+        }
+    }
+}
+
 void touch_event_task(void*)
 {
     bool last_pressed = false;
@@ -4279,15 +4495,15 @@ extern "C" void app_main()
     g_motion_queue = xQueueCreate(3, sizeof(MotionCommand));
     g_ui_queue = xQueueCreate(6, sizeof(UiCommand));
     if (g_sound_queue) {
-        xTaskCreate(sound_task, "sound", 8192, nullptr, 3, nullptr);
+        xTaskCreate(sound_task, "sound", 4096, nullptr, 3, nullptr);
     }
     if (g_ui_queue) {
-        xTaskCreate(ui_task, "ui", 8192, nullptr, 3, nullptr);
+        xTaskCreate(ui_task, "ui", 6144, nullptr, 3, nullptr);
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
-    xTaskCreate(audio_state_task, "audio_state", 12288, nullptr, 2, nullptr);
-    xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
+    xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
+    xTaskCreate(touch_event_task, "touch_event", 4096, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;
@@ -4304,4 +4520,9 @@ extern "C" void app_main()
         return;
     }
     xTaskCreate(status_task, "mqtt_status", 6144, nullptr, 3, nullptr);
+    const BaseType_t wake_task_ok = xTaskCreate(wakeword_task, "wakeword", 6144, nullptr, 4, nullptr);
+    if (wake_task_ok != pdPASS) {
+        ESP_LOGE(kTag, "wakeword task start failed: %ld", static_cast<long>(wake_task_ok));
+        publish_event("wakeword_error", "task", "", "task start failed");
+    }
 }

@@ -769,7 +769,10 @@ def build_hermes_messages(
         f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
         "Return JSON only. Do not wrap it in Markdown.",
         "Schema: {\"reply\":\"short German text\",\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system\",...}]}",
-        "Use action say for the spoken/displayed answer. Keep answers concise unless the user asks for detail.",
+        "This request came from StackChan speech input. Answer in German unless the user explicitly asks for another language.",
+        "Use action say for the spoken/displayed answer. The bridge will synthesize this text as audio for StackChan.",
+        "You may add hardware actions when useful, but never invent unsupported parameters. The bridge and firmware enforce limits.",
+        "Keep answers concise for spoken interaction unless the user asks for detail.",
         "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
         f"Current StackChan status JSON: {status_text}",
     ]
@@ -803,6 +806,40 @@ def ask_hermes_http(
         config.hermes.timeout_s,
     )
     return parse_hermes_action_response(extract_hermes_message_content(response))
+
+
+def speech_text_from_hermes_response(response: dict[str, Any], fallback: str) -> str:
+    reply = optional_string(response.get("reply"))
+    if reply:
+        return reply
+    actions = response.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if isinstance(action, dict) and str(action.get("action", "")).lower().replace("-", "_") == "say":
+                text = optional_string(action.get("text"))
+                if text:
+                    return text
+        for action in actions:
+            if isinstance(action, dict) and str(action.get("action", "")).lower().replace("-", "_") == "display":
+                text = optional_string(action.get("text"))
+                if text:
+                    return text
+    return fallback
+
+
+def actions_to_topic_payloads(
+    pair: PairConfig,
+    actions: list[dict[str, Any]],
+    request_id_prefix: str,
+) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    messages: list[tuple[str, dict[str, Any]]] = []
+    errors: list[str] = []
+    for index, action in enumerate(actions):
+        try:
+            messages.append(action_to_topic_payload(pair, action, f"{request_id_prefix}-{index:02d}"))
+        except ConfigError as exc:
+            errors.append(str(exc))
+    return messages, errors
 
 
 def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -2437,7 +2474,7 @@ def make_tts_wav(text: str, speech: SpeechConfig, request_id: str) -> str:
 
     engine = speech.tts_engine.strip().lower()
     if engine in {"edge", "katja", "edge-tts", "edge_tts"}:
-        python_bin = speech.edge_tts_python or str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python")
+        python_bin = speech.edge_tts_python or sys.executable
         subprocess.run(
             [
                 python_bin,
@@ -2500,6 +2537,7 @@ def make_tts_wav(text: str, speech: SpeechConfig, request_id: str) -> str:
 
 class SpeechHttpServer(http.server.ThreadingHTTPServer):
     config: BridgeConfig
+    config_path: Path
     pair: PairConfig
     mqtt_client: Any
 
@@ -2578,47 +2616,94 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             stt_started = time.monotonic()
             transcript, backend = transcribe_audio_bytes(audio, self.server.config.speech)
             stt_ms = round((time.monotonic() - stt_started) * 1000)
-            display_text = transcript or "NICHTS VERSTANDEN"
+            if not transcript:
+                display_text = "NICHTS VERSTANDEN"
+                hermes_response: dict[str, Any] = {"reply": display_text, "actions": [{"action": "say", "text": display_text, "emotion": "question"}]}
+                hermes_ms = 0
+                status_ms = 0
+                action_errors: list[str] = []
+                mqtt_ms = 0
+                action_count = 0
+            else:
+                status_started = time.monotonic()
+                status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
+                status_ms = round((time.monotonic() - status_started) * 1000)
+                capabilities = read_optional_text(
+                    self.server.pair.capabilities_file,
+                    self.server.config_path,
+                )
+                personality = read_optional_text(
+                    self.server.pair.personality_file,
+                    self.server.config_path,
+                )
+                hermes_started = time.monotonic()
+                hermes_response = ask_hermes_http(
+                    self.server.config,
+                    self.server.pair,
+                    capabilities,
+                    personality,
+                    status,
+                    transcript,
+                )
+                hermes_ms = round((time.monotonic() - hermes_started) * 1000)
+                actions = ensure_reply_action(hermes_response)
+                action_messages, action_errors = actions_to_topic_payloads(
+                    self.server.pair,
+                    actions,
+                    f"speech-{request_id}",
+                )
+                publish_started = time.monotonic()
+                publish_action_messages(self.server.mqtt_client, action_messages)
+                mqtt_ms = round((time.monotonic() - publish_started) * 1000)
+                action_count = len(action_messages)
+                display_text = speech_text_from_hermes_response(hermes_response, transcript)
+
             tts_started = time.monotonic()
-            tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if transcript else ""
+            tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if display_text else ""
             tts_ms = round((time.monotonic() - tts_started) * 1000) if tts_path else 0
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             tts_url = f"http://{host}{tts_path}" if tts_path else ""
-            payload = build_display_payload(display_text, self.server.config.speech.display_duration_ms, request_id)
-            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            publish_started = time.monotonic()
-            result = self.server.mqtt_client.publish(self.server.pair.display_topic, body, qos=1, retain=False)
-            result.wait_for_publish(timeout=5)
-            mqtt_ms = round((time.monotonic() - publish_started) * 1000)
             total_ms = round((time.monotonic() - started) * 1000)
             print(
                 f"[bridge-http] transcript after {stt_ms}ms via {backend}: {transcript!r}; "
-                f"display published in {mqtt_ms}ms tts={tts_ms}ms",
+                f"hermes={hermes_ms}ms status={status_ms}ms actions={action_count} mqtt={mqtt_ms}ms tts={tts_ms}ms "
+                f"reply={display_text!r}",
                 flush=True,
             )
+            if action_errors:
+                print(
+                    f"[bridge-http] ignored invalid Hermes actions request_id={request_id}: {action_errors}",
+                    flush=True,
+                )
             self.send_json(
                 200,
                 {
-                    "ok": bool(transcript),
+                    "ok": bool(display_text),
                     "request_id": request_id,
                     "transcript": transcript,
                     "stt_backend": backend,
+                    "reply": display_text,
+                    "hermes": hermes_response,
+                    "action_errors": action_errors,
                     "audio_bytes": len(audio),
                     "request_read_ms": read_ms,
                     "stt_ms": stt_ms,
+                    "status_ms": status_ms,
+                    "hermes_ms": hermes_ms,
                     "tts_ms": tts_ms,
                     "tts_path": tts_path,
                     "tts_url": tts_url,
                     "mqtt_ms": mqtt_ms,
                     "total_ms": total_ms,
-                    "display_topic": self.server.pair.display_topic,
+                    "actions_published": action_count,
+                    "mqtt_prefix": self.server.pair.mqtt_prefix,
                 },
             )
         except Exception as exc:
-            error_text = f"STT FEHLER: {exc}"
+            error_text = f"SPRACHBRIDGE FEHLER: {exc}"
             print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
             try:
-                payload = build_display_payload("STT FEHLER", 5000, request_id)
+                payload = build_display_payload("BRIDGE FEHLER", 5000, request_id)
                 self.server.mqtt_client.publish(
                     self.server.pair.display_topic,
                     json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
@@ -2631,17 +2716,20 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 def serve_audio(args: argparse.Namespace) -> int:
-    config = load_config(Path(args.config), Path(args.env))
+    config_path = Path(args.config)
+    config = load_config(config_path, Path(args.env))
     pair = get_pair(config, args.pair)
     client = create_mqtt_client(config.mqtt)
     connect_and_start(client, config.mqtt)
     server = SpeechHttpServer((args.host, args.port), SpeechRequestHandler)
     server.config = config
+    server.config_path = config_path
     server.pair = pair
     server.mqtt_client = client
     print(f"[bridge-http] listening on http://{args.host}:{args.port}", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/audio (audio/wav)", flush=True)
-    print(f"[bridge-http] mirror transcript to {pair.display_topic}", flush=True)
+    print(f"[bridge-http] Hermes API: {hermes_chat_url(config.hermes.base_url)}", flush=True)
+    print(f"[bridge-http] dispatch Hermes actions to {pair.mqtt_prefix}/cmd/*", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
         return 0

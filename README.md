@@ -223,6 +223,14 @@ scripts/h2s_bridge.sh ask-hermes \
   --show-response
 ```
 
+Run the unified speech bridge. This receives StackChan audio, transcribes it, asks Hermes with the current StackChan status and capabilities, publishes Hermes hardware actions, creates TTS, and returns the audio URL to StackChan:
+
+```sh
+scripts/h2s_bridge.sh run --pair desk
+```
+
+The reproducible service setup is documented in [docs/hermes-integration.md](docs/hermes-integration.md).
+
 ## Background Helpers
 
 Start the power watcher:
@@ -297,10 +305,12 @@ The v1.0 backlog lives in GitHub:
 Current #6 slice status:
 
 - ES7210 microphone initializes in firmware.
+- WakeNet listens for the built-in wakeword `Computer`.
 - Touch starts recording immediately.
 - Recording stops from local voice activity detection: after speech plus about 500 ms silence, or after a no-voice timeout.
 - The face remains the default display while recording, with a small waveform overlay rendered below it from the face framebuffer.
 - Retained MQTT status exposes `audio.voice_active`, `audio.voice_level_pct`, `audio.voice_avg_level`, and `audio.voice_peak_level`.
+- The unified bridge can run the full STT -> Hermes -> MQTT actions -> TTS response path.
 
 Suggested order:
 

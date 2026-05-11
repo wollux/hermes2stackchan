@@ -148,7 +148,7 @@ Currently supports simple local tones through the speaker.
 
 Publishes to `hermes-stackchan/desk/cmd/audio`.
 
-This is the V1.0 control contract for wakeword and push-to-talk state. It currently controls and reports speech mode over MQTT; microphone PCM upload and real wakeword detection are the next implementation layer.
+This is the V1.0 control contract for wakeword and push-to-talk state. StackChan can detect the built-in WakeNet wakeword `Computer` locally and can also start recording from touch/push-to-talk. Recorded WAV audio is uploaded to the bridge over HTTP, not MQTT.
 
 Supported actions: `set_wakeword`, `simulate_wakeword`, `start_recording`, `stop_recording`.
 
@@ -187,7 +187,40 @@ Push-to-talk start and stop:
 }
 ```
 
-Wakeword recording uses `min_ms` plus `silence_timeout_ms` as the first auto-stop rule until real microphone level detection is implemented.
+Wakeword and touch recording use local voice activity detection and stop after silence or the configured maximum duration.
+
+### speech conversation
+
+StackChan sends recorded WAV audio to the bridge endpoint:
+
+```text
+POST /stackchan/audio
+Content-Type: audio/wav
+X-H2S-Pair-Id: desk
+X-H2S-Request-Id: optional-request-id
+```
+
+Bridge processing:
+
+1. Transcribe the WAV with the configured STT provider.
+2. Read retained StackChan status from MQTT.
+3. Send the transcript, status, this capabilities file, and personality notes to Hermes.
+4. Validate Hermes JSON actions.
+5. Publish valid actions to `hermes-stackchan/desk/cmd/*`.
+6. Generate TTS for the final reply and return `tts_url` to StackChan.
+
+Hermes must return JSON only:
+
+```json
+{
+  "reply": "Mache ich.",
+  "actions": [
+    {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
+    {"action": "face", "emotion": "happy", "intensity_pct": 65},
+    {"action": "move", "pitch_target_pct": 55}
+  ]
+}
+```
 
 ### system
 
@@ -267,8 +300,8 @@ Hermes HTTP responses consumed by the bridge must be JSON:
 
 ## Forbidden In This Slice
 
-- Microphone PCM streaming
-- Real wake word detection
 - Camera commands
 - Multi-device routing
-- Cloud TTS playback
+- Radio playback
+- Binary audio over MQTT
+- Direct control of another pair namespace
