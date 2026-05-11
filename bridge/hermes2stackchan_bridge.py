@@ -25,6 +25,7 @@ from typing import Any, Callable
 SCHEMA_VERSION = "1.0"
 POWER_DISPLAY_DURATION_MS = 5000
 MAX_STACKCHAN_TEXT_CHARS = 700
+MAX_STACKCHAN_TTS_CHARS = 2500
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
 YAW_TARGET_MIN_PCT = -100
@@ -2187,6 +2188,20 @@ def ask_hermes(args: argparse.Namespace) -> int:
         action_to_topic_payload(pair, action, f"hermes-{uuid.uuid4().hex[:12]}")
         for action in actions
     ]
+    spoken_text = speech_text_from_hermes_response(response, user_text)
+    if spoken_text and config.speech.bridge_public_url:
+        try:
+            tts_request_id = f"hermes-tts-{uuid.uuid4().hex[:12]}"
+            tts_path = make_tts_wav(safe_tts_text(spoken_text), config.speech, tts_request_id)
+            action_messages.append(
+                action_to_topic_payload(
+                    pair,
+                    {"action": "audio", "audio_action": "play_tts_url", "url": tts_public_url(config, tts_path)},
+                    tts_request_id,
+                )
+            )
+        except Exception as exc:
+            print(f"[bridge] TTS skipped for Hermes reply: {exc}", file=sys.stderr, flush=True)
     if args.dry_run:
         print(json.dumps(
             [{"topic": topic, "payload": payload} for topic, payload in action_messages],
@@ -2591,6 +2606,14 @@ def safe_stackchan_text(text: str, max_chars: int = MAX_STACKCHAN_TEXT_CHARS) ->
         return value
     clipped = value[: max(0, max_chars - 4)].rstrip()
     return f"{clipped} ..."
+
+
+def safe_tts_text(text: str, max_chars: int = MAX_STACKCHAN_TTS_CHARS) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= max_chars:
+        return value
+    clipped = value[: max(0, max_chars - 60)].rstrip()
+    return f"{clipped}. Ich habe den Rest gekuerzt, damit StackChan stabil bleibt."
 
 
 def restore_device_settings(args: argparse.Namespace) -> int:
