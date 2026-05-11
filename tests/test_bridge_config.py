@@ -20,6 +20,7 @@ from bridge.hermes2stackchan_bridge import (
     build_motion_profile_points,
     build_power_change_actions,
     build_power_followup_actions,
+    build_touch_lamp_payload,
     face_snapshot,
     load_config,
     missing_status_paths,
@@ -346,6 +347,15 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["action"], "set_wakeword")
         self.assertEqual(payload["wakeword"], "Computer")
         self.assertTrue(payload["enabled"])
+
+    def test_touch_lamp_payload_tracks_touch_down_and_up(self) -> None:
+        down = build_touch_lamp_payload({"event": "touch_down"}, "touch-1")
+        up = build_touch_lamp_payload({"event": "touch_up"}, "touch-2")
+        ignored = build_touch_lamp_payload({"event": "recording_started"}, "touch-3")
+
+        self.assertEqual(down, {"mode": "solid", "r": 0, "g": 255, "b": 0, "schema_version": "1.0", "request_id": "touch-1"})
+        self.assertEqual(up, {"mode": "off", "r": 0, "g": 0, "b": 0, "schema_version": "1.0", "request_id": "touch-2"})
+        self.assertIsNone(ignored)
 
     def test_life_animation_only_runs_on_idle_face(self) -> None:
         status = {

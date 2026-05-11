@@ -43,6 +43,7 @@ constexpr gpio_num_t kI2cScl = GPIO_NUM_11;
 constexpr uint8_t kPmicAddr = 0x34;
 constexpr uint8_t kAw9523Addr = 0x58;
 constexpr uint8_t kPy32Addr = 0x6F;
+constexpr uint8_t kHeadTouchAddr = 0x68;
 constexpr uint8_t kAw88298Addr = AW88298_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
 constexpr size_t kFrameBufferBytes = kWidth * kHeight * sizeof(uint16_t);
@@ -103,6 +104,9 @@ int g_face_intensity_pct = 60;
 volatile bool g_audio_input_ready = false;
 volatile bool g_wakeword_enabled = false;
 volatile bool g_recording = false;
+volatile bool g_head_touch_ready = false;
+volatile bool g_touch_pressed = false;
+volatile int g_touch_raw = 0;
 volatile int64_t g_recording_started_ms = 0;
 volatile int g_recording_min_ms = 5000;
 volatile int g_recording_silence_timeout_ms = 1000;
@@ -261,6 +265,64 @@ private:
 
 std::unique_ptr<I2cDevice> g_pmic;
 std::unique_ptr<I2cDevice> g_py32;
+std::unique_ptr<I2cDevice> g_head_touch;
+
+bool init_head_touch()
+{
+    if (!g_i2c_bus) {
+        return false;
+    }
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, kHeadTouchAddr, 120);
+    if (probe != ESP_OK) {
+        ESP_LOGW(kTag, "SI12T head touch not found at 0x68: %s", esp_err_to_name(probe));
+        g_head_touch_ready = false;
+        return false;
+    }
+
+    g_head_touch = std::make_unique<I2cDevice>(g_i2c_bus, kHeadTouchAddr, 100 * 1000);
+    I2cDevice& dev = *g_head_touch;
+
+    bool ok = true;
+    for (uint8_t reg = 0x0A; reg <= 0x0F; ++reg) {
+        ok = (dev.try_write_reg(reg, 0x00) == ESP_OK) && ok;
+    }
+    for (uint8_t reg = 0x02; reg <= 0x06; ++reg) {
+        ok = (dev.try_write_reg(reg, 0x33) == ESP_OK) && ok;
+    }
+    ok = (dev.try_write_reg(0x09, 0x0F) == ESP_OK) && ok;
+    ok = (dev.try_write_reg(0x09, 0x07) == ESP_OK) && ok;
+    ok = (dev.try_write_reg(0x08, 0x22) == ESP_OK) && ok;
+    if (!ok) {
+        ESP_LOGW(kTag, "SI12T head touch setup failed");
+        g_head_touch.reset();
+        g_head_touch_ready = false;
+        return false;
+    }
+
+    g_head_touch_ready = true;
+    ESP_LOGI(kTag, "SI12T head touch ready");
+    return true;
+}
+
+bool read_head_touch_pressed(uint8_t* raw_out = nullptr)
+{
+    if (!g_head_touch_ready || !g_head_touch) {
+        return false;
+    }
+    uint8_t raw = 0;
+    if (g_head_touch->try_read_reg(0x10, raw) != ESP_OK) {
+        return false;
+    }
+    if (raw_out) {
+        *raw_out = raw;
+    }
+    for (int zone = 0; zone < 3; ++zone) {
+        if (((raw >> (zone * 2)) & 0x03) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool set_i2c_bit(I2cDevice& device, uint8_t reg, uint8_t bit, bool enabled)
 {
@@ -525,6 +587,7 @@ void init_power_and_reset_panel()
     io.write_reg(0x03, 0b10000011);
     vTaskDelay(pdMS_TO_TICKS(10));
 
+    init_head_touch();
     init_robot_body_power();
 }
 
@@ -1957,6 +2020,7 @@ void publish_status()
                   "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\","
                   "\"recording\":%s,\"recording_source\":\"%s\",\"recording_started_ms\":%lld,"
                   "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d},"
+                  "\"touch\":{\"ready\":%s,\"pressed\":%s,\"raw\":%d},"
                   "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
                   "\"led\":{\"mode\":\"%s\",\"mode_id\":%d,\"r\":%d,\"g\":%d,\"b\":%d,\"ready\":%s},"
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
@@ -1995,6 +2059,9 @@ void publish_status()
                   static_cast<int>(g_recording_min_ms),
                   static_cast<int>(g_recording_silence_timeout_ms),
                   static_cast<int>(g_recording_max_ms),
+                  g_head_touch_ready ? "true" : "false",
+                  g_touch_pressed ? "true" : "false",
+                  static_cast<int>(g_touch_raw),
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
@@ -2667,6 +2734,35 @@ void audio_state_task(void*)
     }
 }
 
+void touch_event_task(void*)
+{
+    bool last_pressed = false;
+    int stable_count = 0;
+    bool stable_pressed = false;
+    while (true) {
+        uint8_t raw = 0;
+        const bool pressed = read_head_touch_pressed(&raw);
+        g_touch_raw = raw;
+        if (pressed == last_pressed) {
+            stable_count++;
+        } else {
+            stable_count = 0;
+            last_pressed = pressed;
+        }
+
+        if (stable_count >= 2 && pressed != stable_pressed) {
+            stable_pressed = pressed;
+            g_touch_pressed = pressed;
+            publish_event(pressed ? "touch_down" : "touch_up",
+                          "head_touch",
+                          "",
+                          pressed ? "head touch pressed" : "head touch released");
+            publish_status();
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
 void led_effect_task(void*)
 {
     int tick = 0;
@@ -3036,6 +3132,7 @@ extern "C" void app_main()
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 4096, nullptr, 2, nullptr);
+    xTaskCreate(touch_event_task, "touch_event", 4096, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;

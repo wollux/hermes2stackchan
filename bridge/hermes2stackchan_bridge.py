@@ -419,6 +419,15 @@ def send_payload(
         client.disconnect()
 
 
+def build_touch_lamp_payload(event_payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any] | None:
+    event = optional_string(event_payload.get("event"))
+    if event == "touch_down":
+        return with_request_id({"mode": "solid", "r": 0, "g": 255, "b": 0}, request_id)
+    if event == "touch_up":
+        return with_request_id({"mode": "off", "r": 0, "g": 0, "b": 0}, request_id)
+    return None
+
+
 def read_latest_status(config: BridgeConfig, pair: PairConfig, timeout_s: float = 2.0) -> dict[str, Any] | None:
     client = create_mqtt_client(config.mqtt)
     status_seen = Event()
@@ -1712,6 +1721,41 @@ def watch(args: argparse.Namespace) -> int:
         client.disconnect()
 
 
+def watch_touch_lamp(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+
+    def publish_led(payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        result = client.publish(pair.led_topic, body, qos=1, retain=False)
+        result.wait_for_publish(timeout=2)
+        print(f"[bridge] touch lamp -> {body}", flush=True)
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        try:
+            data = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        request_id = f"touch-led-{uuid.uuid4().hex[:8]}"
+        payload = build_touch_lamp_payload(data, request_id)
+        if payload is not None:
+            publish_led(payload)
+
+    client.on_message = on_message
+    connect_and_start(client, config.mqtt)
+    client.subscribe(pair.events_topic, qos=1)
+    print(f"[bridge] watching touch events on {pair.events_topic}; touch=green, release=off", flush=True)
+    try:
+        while True:
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
 def get_pair(config: BridgeConfig, pair_id: str) -> PairConfig:
     try:
         return config.pairs[pair_id]
@@ -1856,6 +1900,10 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser = subcommands.add_parser("watch", help="Print all MQTT messages for a pair.")
     watch_parser.add_argument("--pair", default="desk", help="Pair id to watch.")
     watch_parser.set_defaults(func=watch)
+
+    touch_lamp = subcommands.add_parser("watch-touch-lamp", help="Turn LEDs green while StackChan head touch is held.")
+    touch_lamp.add_argument("--pair", default="desk", help="Pair id to watch.")
+    touch_lamp.set_defaults(func=watch_touch_lamp)
 
     power = subcommands.add_parser("watch-power", help="React to StackChan battery charge/discharge status changes.")
     power.add_argument("--pair", default="desk", help="Pair id to watch.")

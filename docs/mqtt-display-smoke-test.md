@@ -147,6 +147,14 @@ scripts/h2s_bridge.sh send-audio --pair desk --action stop_recording --source pu
 
 The retained status includes top-level `wakeword_enabled` and `recording`, plus an `audio` object with `input_ready`, `wakeword`, `recording_source`, and timing fields. The firmware also publishes realtime state changes to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
 
+For a quick head-touch hardware test, run the bridge touch lamp watcher:
+
+```sh
+scripts/h2s_bridge.sh watch-touch-lamp --pair desk
+```
+
+StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. While touch is held, the bridge sets the LEDs to solid green. On release, it turns them off again. This is intentionally bridge-driven so the MQTT event path is visible.
+
 ## Hermes HTTP Adapter
 
 The bridge can now ask a configured Hermes HTTP server and dispatch the returned JSON actions to StackChan over MQTT.
