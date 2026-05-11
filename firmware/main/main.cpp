@@ -3973,7 +3973,7 @@ void audio_state_task(void*)
             }
             set_recording_state(false, g_recording_source, "", "voice silence");
             if (wav && actual_pcm_bytes > kAudioSampleRate / 2) {
-                draw_wrapped_message("SPRACHE", "SENDE ZUR BRIDGE", rgb565(0, 220, 230));
+                draw_face(g_face_emotion, g_face_intensity_pct);
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
@@ -4000,7 +4000,7 @@ void audio_state_task(void*)
             }
             set_recording_state(false, g_recording_source, "", "max duration");
             if (speech_seen && wav && actual_pcm_bytes > kAudioSampleRate / 2) {
-                draw_wrapped_message("SPRACHE", "SENDE ZUR BRIDGE", rgb565(0, 220, 230));
+                draw_face(g_face_emotion, g_face_intensity_pct);
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
