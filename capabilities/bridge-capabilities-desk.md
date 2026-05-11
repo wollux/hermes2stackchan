@@ -214,6 +214,7 @@ Hermes must return JSON only:
 ```json
 {
   "reply": "Mache ich.",
+  "follow_up_listen": false,
   "actions": [
     {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 65},
@@ -221,6 +222,8 @@ Hermes must return JSON only:
   ]
 }
 ```
+
+Use `follow_up_listen: true` only when the reply is a real question and Hermes expects the user to answer immediately. StackChan will play the TTS answer first and then start a short follow-up recording.
 
 ### system
 
