@@ -22,6 +22,28 @@ Do not use `say` for normal replies. The bridge handles `reply` by showing text
 and generating TTS when TTS is enabled. Use `display` only for extra visible text
 that should appear in addition to the spoken `reply`.
 
+For messages that originate outside StackChan, for example Telegram asking Hermes
+to notify the device, call the bridge notify endpoint instead of publishing MQTT
+directly:
+
+```http
+POST http://127.0.0.1:8788/stackchan/notify
+Content-Type: application/json
+```
+
+```json
+{
+  "reply": "Ich lese diese Nachricht auf StackChan vor.",
+  "actions": [
+    {"action": "face", "emotion": "happy", "intensity_pct": 70}
+  ]
+}
+```
+
+The notify endpoint creates TTS, publishes `cmd/display`, publishes `cmd/audio`,
+and returns a `tts_url`. Do not use legacy `say` for proactive speech; `say` is
+treated as display-only compatibility.
+
 ### display
 
 Publishes to `hermes-stackchan/desk/cmd/display`.
