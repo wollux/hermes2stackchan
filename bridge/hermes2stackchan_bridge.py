@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import http.server
 import json
 import math
@@ -17,7 +18,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, Thread, Timer
+from threading import Event, RLock, Thread, Timer
 from typing import Any, Callable
 
 
@@ -32,6 +33,8 @@ PITCH_TARGET_MAX_PCT = 100
 DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
+DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
+REMINDER_STORE_LOCK = RLock()
 
 
 class ConfigError(ValueError):
@@ -142,11 +145,19 @@ class SpeechConfig:
 
 
 @dataclass(frozen=True)
+class ReminderConfig:
+    store_path: str = DEFAULT_REMINDER_STORE
+    poll_interval_s: float = 1.0
+    display_duration_ms: int = 9000
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     mqtt: MqttConfig
     pairs: dict[str, PairConfig]
     hermes: HermesConfig = field(default_factory=HermesConfig)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
+    reminders: ReminderConfig = field(default_factory=ReminderConfig)
 
 
 LifeSequence = list[tuple[int, dict[str, Any]]]
@@ -228,6 +239,22 @@ def load_config(
             "H2S_TRANSCRIPT_DISPLAY_MS",
         ),
     )
+    reminder_raw = raw.get("reminders") or {}
+    if not isinstance(reminder_raw, dict):
+        raise ConfigError("reminders must be an object when present")
+    reminders = ReminderConfig(
+        store_path=env.get("H2S_REMINDER_STORE") or str(reminder_raw.get("store_path") or DEFAULT_REMINDER_STORE),
+        poll_interval_s=parse_float(
+            env.get("H2S_REMINDER_POLL_S"),
+            float(reminder_raw.get("poll_interval_s", 1.0)),
+            "H2S_REMINDER_POLL_S",
+        ),
+        display_duration_ms=parse_int(
+            env.get("H2S_REMINDER_DISPLAY_MS"),
+            int(reminder_raw.get("display_duration_ms", 9000)),
+            "H2S_REMINDER_DISPLAY_MS",
+        ),
+    )
 
     pairs_raw = raw.get("pairs")
     if not isinstance(pairs_raw, list) or not pairs_raw:
@@ -269,7 +296,7 @@ def load_config(
             )
         }
 
-    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech)
+    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech, reminders=reminders)
 
 
 def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -827,13 +854,15 @@ def build_hermes_messages(
         f"You are {pair.hermes_id}. You control exactly one StackChan: {pair.stackchan_id}.",
         f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
         "Return JSON only. Do not wrap it in Markdown.",
-        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system\",...}]}",
+        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system|reminder\",...}]}",
         "This request came from StackChan speech input. Answer in German unless the user explicitly asks for another language.",
         "Use action say for the spoken/displayed answer. The bridge will synthesize this text as audio for StackChan.",
         "You may add hardware actions when useful, but never invent unsupported parameters. The bridge and firmware enforce limits.",
         "Keep answers concise for spoken interaction unless the user asks for detail.",
         "If your reply asks the user a real follow-up question and you expect an immediate answer, set follow_up_listen to true.",
         "If your reply is only a statement, command confirmation, or rhetorical question, set follow_up_listen to false.",
+        "For reminders or notifications, use action reminder with text and delay_s or due_at. Example: {\"action\":\"reminder\",\"text\":\"Wasser trinken\",\"delay_s\":120}.",
+        "If the user only says 'erinnere mich' without enough time or content, ask what/when and set follow_up_listen to true; do not invent reminder details.",
         "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
         f"Current StackChan status JSON: {status_text}",
     ]
@@ -913,9 +942,9 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
     if not isinstance(action, dict):
         raise ConfigError("Hermes action must be an object")
     raw_name = action.get("action") or action.get("type") or action.get("name")
-    if not isinstance(raw_name, str) or not raw_name.strip():
+    name = action_name(action)
+    if not name:
         raise ConfigError("Hermes action needs an action name")
-    name = raw_name.strip().lower().replace("-", "_")
     action_request_id = optional_string(action.get("request_id")) or request_id
 
     if name == "display":
@@ -1077,6 +1106,172 @@ def parse_bool_value(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         return parse_bool(value, default, "boolean value")
     raise ConfigError("boolean value must be true or false")
+
+
+REMINDER_ACTIONS = {"reminder", "notify", "notification", "remind"}
+
+
+def action_name(action: dict[str, Any]) -> str:
+    raw_name = action.get("action") or action.get("type") or action.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return ""
+    return raw_name.strip().lower().replace("-", "_")
+
+
+def reminder_store_path(config: BridgeConfig) -> Path:
+    return Path(config.reminders.store_path).expanduser()
+
+
+def read_reminder_store(config: BridgeConfig) -> dict[str, Any]:
+    path = reminder_store_path(config)
+    if not path.exists():
+        return {"schema_version": SCHEMA_VERSION, "reminders": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"reminder store is invalid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"reminder store must be a JSON object: {path}")
+    reminders = data.get("reminders")
+    if not isinstance(reminders, list):
+        data["reminders"] = []
+    return data
+
+
+def write_reminder_store(config: BridgeConfig, store: dict[str, Any]) -> None:
+    path = reminder_store_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def parse_due_at(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = optional_string(value)
+    if not text:
+        raise ConfigError("reminder due_at must be an ISO timestamp or epoch seconds")
+    normalized = text.replace("Z", "+00:00")
+    try:
+        due = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ConfigError("reminder due_at must be an ISO timestamp") from exc
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=dt.timezone.utc)
+    return due.timestamp()
+
+
+def reminder_due_ts(action: dict[str, Any], now_ts: float | None = None) -> float:
+    now = time.time() if now_ts is None else now_ts
+    for key, scale in (("delay_s", 1.0), ("delay_seconds", 1.0), ("in_s", 1.0), ("delay_ms", 0.001)):
+        if action.get(key) is not None:
+            delay = float(parse_int_value(action.get(key), 0, f"reminder.{key}")) * scale
+            if delay < 0:
+                raise ConfigError("reminder delay must be >= 0")
+            return now + delay
+    if action.get("due_at") is not None:
+        return parse_due_at(action.get("due_at"))
+    if action.get("at") is not None:
+        return parse_due_at(action.get("at"))
+    raise ConfigError("reminder action needs delay_s, delay_ms, or due_at")
+
+
+def build_reminder(action: dict[str, Any], pair: PairConfig, request_id: str, now_ts: float | None = None) -> dict[str, Any]:
+    text = optional_string(action.get("text") or action.get("message") or action.get("title"))
+    if not text:
+        raise ConfigError("reminder action needs text")
+    due_ts = reminder_due_ts(action, now_ts)
+    created_ts = time.time() if now_ts is None else now_ts
+    reminder_id = optional_string(action.get("reminder_id") or action.get("id")) or f"rem-{uuid.uuid4().hex[:12]}"
+    return {
+        "id": reminder_id,
+        "pair_id": pair.pair_id,
+        "stackchan_id": pair.stackchan_id,
+        "request_id": request_id,
+        "text": text[:500],
+        "due_ts": round(due_ts, 3),
+        "created_ts": round(created_ts, 3),
+        "source": optional_string(action.get("source")) or "hermes",
+        "status": "pending",
+    }
+
+
+def add_reminder(config: BridgeConfig, reminder: dict[str, Any]) -> dict[str, Any]:
+    with REMINDER_STORE_LOCK:
+        store = read_reminder_store(config)
+        reminders = [item for item in store.get("reminders", []) if isinstance(item, dict)]
+        reminders.append(reminder)
+        store = {"schema_version": SCHEMA_VERSION, "updated_at": time.time(), "reminders": reminders}
+        write_reminder_store(config, store)
+    return reminder
+
+
+def schedule_reminders_from_actions(
+    config: BridgeConfig,
+    pair: PairConfig,
+    actions: list[dict[str, Any]],
+    request_id_prefix: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    dispatch_actions: list[dict[str, Any]] = []
+    scheduled: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            dispatch_actions.append(action)
+            continue
+        if action_name(action) not in REMINDER_ACTIONS:
+            dispatch_actions.append(action)
+            continue
+        try:
+            scheduled.append(add_reminder(config, build_reminder(action, pair, f"{request_id_prefix}-{index:02d}")))
+        except ConfigError as exc:
+            errors.append(str(exc))
+    return dispatch_actions, scheduled, errors
+
+
+def due_reminders(config: BridgeConfig, pair: PairConfig, now_ts: float | None = None) -> list[dict[str, Any]]:
+    now = time.time() if now_ts is None else now_ts
+    fired: list[dict[str, Any]] = []
+    with REMINDER_STORE_LOCK:
+        store = read_reminder_store(config)
+        reminders = [item for item in store.get("reminders", []) if isinstance(item, dict)]
+        for reminder in reminders:
+            if reminder.get("pair_id") != pair.pair_id or reminder.get("status", "pending") != "pending":
+                continue
+            try:
+                due_ts = float(reminder.get("due_ts", 0))
+            except (TypeError, ValueError):
+                continue
+            if due_ts <= now:
+                reminder["status"] = "fired"
+                reminder["fired_ts"] = round(now, 3)
+                fired.append(dict(reminder))
+        if fired:
+            store["updated_at"] = now
+            store["reminders"] = reminders
+            write_reminder_store(config, store)
+    return fired
+
+
+def pending_reminders(config: BridgeConfig, pair_id: str | None = None) -> list[dict[str, Any]]:
+    with REMINDER_STORE_LOCK:
+        reminders = [item for item in read_reminder_store(config).get("reminders", []) if isinstance(item, dict)]
+    result = [item for item in reminders if item.get("status", "pending") == "pending"]
+    if pair_id:
+        result = [item for item in result if item.get("pair_id") == pair_id]
+    return sorted(result, key=lambda item: float(item.get("due_ts", 0)))
+
+
+def reminder_actions(reminder: dict[str, Any], display_duration_ms: int) -> list[dict[str, Any]]:
+    text = optional_string(reminder.get("text")) or "Erinnerung."
+    return [
+        {"action": "system", "system_action": "display_wake"},
+        {"action": "face", "emotion": "question", "intensity_pct": 70},
+        {"action": "sound", "frequency_hz": 988, "duration_ms": 120, "volume_pct": 80},
+        {"action": "say", "text": f"Erinnerung: {text}", "emotion": "speaking", "beep": True},
+        {"action": "display", "text": f"ERINNERUNG: {text}", "duration_ms": display_duration_ms},
+    ]
 
 
 def status_bool(value: Any) -> bool | None:
@@ -1849,8 +2044,21 @@ def ask_hermes(args: argparse.Namespace) -> int:
     personality = read_optional_text(pair.personality_file, config_path)
     response = ask_hermes_http(config, pair, capabilities, personality, status, user_text)
     actions = ensure_reply_action(response)
+    scheduled_reminders: list[dict[str, Any]] = []
+    reminder_errors: list[str] = []
+    if not args.dry_run:
+        actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+            config,
+            pair,
+            actions,
+            f"hermes-reminder-{uuid.uuid4().hex[:8]}",
+        )
     if args.show_response or args.dry_run:
-        print(json.dumps({"hermes": response, "actions": actions}, ensure_ascii=False, indent=2))
+        print(json.dumps(
+            {"hermes": response, "actions": actions, "scheduled_reminders": scheduled_reminders, "reminder_errors": reminder_errors},
+            ensure_ascii=False,
+            indent=2,
+        ))
     action_messages = [
         action_to_topic_payload(pair, action, f"hermes-{uuid.uuid4().hex[:12]}")
         for action in actions
@@ -1862,6 +2070,13 @@ def ask_hermes(args: argparse.Namespace) -> int:
             indent=2,
         ))
         return 0
+    for reminder in scheduled_reminders:
+        print(
+            f"[bridge] scheduled reminder {reminder['id']} for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(reminder['due_ts'])))}: {reminder['text']}",
+            flush=True,
+        )
+    for error in reminder_errors:
+        print(f"[bridge] reminder ignored: {error}", file=sys.stderr, flush=True)
     return dispatch_mqtt_actions(config, pair, action_messages, not args.no_wait_ack, args.timeout)
 
 
@@ -2714,16 +2929,29 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 )
                 hermes_ms = round((time.monotonic() - hermes_started) * 1000)
                 actions = ensure_reply_action(hermes_response)
+                actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+                    self.server.config,
+                    self.server.pair,
+                    actions,
+                    f"speech-reminder-{request_id}",
+                )
                 action_messages, action_errors = actions_to_topic_payloads(
                     self.server.pair,
                     actions,
                     f"speech-{request_id}",
                     skip_actions={"say"},
                 )
+                action_errors.extend(reminder_errors)
                 publish_started = time.monotonic()
                 publish_action_messages(self.server.mqtt_client, action_messages)
                 mqtt_ms = round((time.monotonic() - publish_started) * 1000)
                 action_count = len(action_messages)
+                for reminder in scheduled_reminders:
+                    print(
+                        f"[bridge-http] scheduled reminder {reminder['id']} "
+                        f"for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(reminder['due_ts'])))}: {reminder['text']}",
+                        flush=True,
+                    )
                 display_text = speech_text_from_hermes_response(hermes_response, transcript)
             follow_up_listen = should_listen_for_followup(hermes_response, display_text)
 
@@ -2803,6 +3031,71 @@ def serve_audio(args: argparse.Namespace) -> int:
         client.disconnect()
 
 
+def add_reminder_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    action: dict[str, Any] = {"action": "reminder", "text": args.text}
+    if args.delay_s is not None:
+        action["delay_s"] = args.delay_s
+    if args.due_at:
+        action["due_at"] = args.due_at
+    reminder = add_reminder(config, build_reminder(action, pair, args.request_id or f"cli-{uuid.uuid4().hex[:10]}"))
+    print(json.dumps(reminder, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def list_reminders_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    reminders = pending_reminders(config, args.pair)
+    if args.json:
+        print(json.dumps(reminders, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if not reminders:
+        print("[bridge] no pending reminders")
+        return 0
+    for reminder in reminders:
+        due_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(reminder.get("due_ts", 0))))
+        print(f"{reminder.get('id')} {due_text} {reminder.get('pair_id')}: {reminder.get('text')}")
+    return 0
+
+
+def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder: dict[str, Any]) -> None:
+    messages = [
+        action_to_topic_payload(pair, action, f"reminder-{reminder.get('id', uuid.uuid4().hex[:8])}-{index:02d}")
+        for index, action in enumerate(reminder_actions(reminder, config.reminders.display_duration_ms))
+    ]
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge] firing reminder {reminder.get('id')}: {reminder.get('text')}",
+        flush=True,
+    )
+    publish_action_messages(client, messages)
+
+
+def watch_reminders(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    poll_s = max(0.2, float(args.poll_s if args.poll_s is not None else config.reminders.poll_interval_s))
+    try:
+        connect_and_start(client, config.mqtt)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [bridge] watching reminders "
+            f"store={reminder_store_path(config)} pair={pair.pair_id} poll={poll_s:.1f}s",
+            flush=True,
+        )
+        while True:
+            for reminder in due_reminders(config, pair):
+                fire_reminder(client, pair, config, reminder)
+                if args.once:
+                    return 0
+            if args.once:
+                return 0
+            time.sleep(poll_s)
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
 def bridge_worker(
     name: str,
     target: Any,
@@ -2859,6 +3152,18 @@ def run_bridge(args: argparse.Namespace) -> int:
                 announce_initial=args.power_announce_initial,
                 once=False,
                 no_restore_face=args.power_no_restore_face,
+            ),
+        ))
+    if not args.no_reminders:
+        workers.append((
+            "reminders",
+            watch_reminders,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                poll_s=args.reminder_poll_s,
+                once=False,
             ),
         ))
     if not args.no_life:
@@ -3081,6 +3386,25 @@ def build_parser() -> argparse.ArgumentParser:
     power.add_argument("--no-restore-face", action="store_true", help="Do not run the delayed face/motion reaction after the short battery overlay.")
     power.set_defaults(func=watch_power)
 
+    add_reminder_parser = subcommands.add_parser("add-reminder", help="Persist a reminder that StackChan will fire later.")
+    add_reminder_parser.add_argument("--pair", default="desk", help="Pair id to notify.")
+    add_reminder_parser.add_argument("--text", required=True, help="Reminder text.")
+    add_reminder_parser.add_argument("--delay-s", type=int, default=None, help="Delay in seconds.")
+    add_reminder_parser.add_argument("--due-at", default=None, help="ISO timestamp or epoch seconds.")
+    add_reminder_parser.add_argument("--request-id", default=None, help="Optional request id.")
+    add_reminder_parser.set_defaults(func=add_reminder_cli)
+
+    list_reminders_parser = subcommands.add_parser("list-reminders", help="List pending reminders.")
+    list_reminders_parser.add_argument("--pair", default=None, help="Optional pair id filter.")
+    list_reminders_parser.add_argument("--json", action="store_true", help="Print JSON.")
+    list_reminders_parser.set_defaults(func=list_reminders_cli)
+
+    reminders = subcommands.add_parser("watch-reminders", help="Fire due persistent reminders.")
+    reminders.add_argument("--pair", default="desk", help="Pair id to notify.")
+    reminders.add_argument("--poll-s", type=float, default=None, help="Poll interval in seconds.")
+    reminders.add_argument("--once", action="store_true", help="Check once and exit.")
+    reminders.set_defaults(func=watch_reminders)
+
     life = subcommands.add_parser("animate-life", help="Send small idle face and motion impulses so StackChan feels alive.")
     life.add_argument("--pair", default="desk", help="Pair id to animate.")
     life.add_argument("--min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
@@ -3099,12 +3423,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-audio", action="store_true", help="Disable the HTTP audio/STT/TTS worker.")
     run.add_argument("--no-touch-lamp", action="store_true", help="Disable the fast touch/recording LED worker.")
     run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
+    run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
     run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
     run.add_argument("--touch-off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     run.add_argument("--power-debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
     run.add_argument("--power-announce-initial", action="store_true", help="Also show the current power state immediately.")
     run.add_argument("--power-no-restore-face", action="store_true", help="Do not run delayed face/motion reaction after battery overlay.")
+    run.add_argument("--reminder-poll-s", type=float, default=None, help="Reminder worker poll interval in seconds.")
     run.add_argument("--life-min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
     run.add_argument("--life-max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
     run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")

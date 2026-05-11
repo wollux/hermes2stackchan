@@ -21,14 +21,20 @@ from bridge.hermes2stackchan_bridge import (
     build_motion_profile_points,
     build_power_change_actions,
     build_power_followup_actions,
+    build_reminder,
     build_touch_lamp_payload,
+    due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
     DEFAULT_IDLE_YAW_PCT,
     face_snapshot,
+    add_reminder,
     LIFE_VARIANT_NAMES,
     load_config,
     missing_status_paths,
     normalize_motion_points,
+    pending_reminders,
+    reminder_actions,
+    schedule_reminders_from_actions,
     parse_hermes_action_response,
     parse_env_file,
     should_listen_for_followup,
@@ -379,6 +385,58 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["source"], "push_to_talk")
         self.assertEqual(payload["request_id"], "audio-001")
         self.assertEqual(payload["min_ms"], 5000)
+
+    def test_reminder_builds_from_delay_and_fires_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_REMINDER_STORE": str(Path(tmpdir) / "reminders.json")},
+            )
+            pair = config.pairs["desk"]
+            reminder = build_reminder(
+                {"action": "reminder", "text": "Test trinken", "delay_s": 2},
+                pair,
+                "reminder-001",
+                now_ts=1000,
+            )
+            self.assertEqual(reminder["due_ts"], 1002)
+
+            add_reminder(config, reminder)
+            self.assertEqual(len(pending_reminders(config, "desk")), 1)
+            self.assertEqual(due_reminders(config, pair, now_ts=1001), [])
+            fired = due_reminders(config, pair, now_ts=1003)
+            self.assertEqual(fired[0]["text"], "Test trinken")
+            self.assertEqual(pending_reminders(config, "desk"), [])
+
+    def test_reminder_actions_wake_display_and_say_text(self) -> None:
+        actions = reminder_actions({"id": "rem-1", "text": "Wasser trinken"}, 7000)
+
+        self.assertEqual(actions[0], {"action": "system", "system_action": "display_wake"})
+        self.assertIn({"action": "sound", "frequency_hz": 988, "duration_ms": 120, "volume_pct": 80}, actions)
+        self.assertTrue(any(action["action"] == "say" and "Wasser trinken" in action["text"] for action in actions))
+
+    def test_schedule_reminders_filters_action_from_mqtt_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_REMINDER_STORE": str(Path(tmpdir) / "reminders.json")},
+            )
+            pair = config.pairs["desk"]
+            dispatch, scheduled, errors = schedule_reminders_from_actions(
+                config,
+                pair,
+                [
+                    {"action": "say", "text": "Mache ich."},
+                    {"action": "reminder", "text": "Kaffee", "delay_s": 120},
+                ],
+                "speech-reminder-test",
+            )
+
+            self.assertEqual(errors, [])
+            self.assertEqual([action["action"] for action in dispatch], ["say"])
+            self.assertEqual(scheduled[0]["text"], "Kaffee")
 
     def test_audio_action_to_topic_payload_set_wakeword(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]

@@ -225,6 +225,10 @@ H2S_HERMES_BASE_URL=http://127.0.0.1:8642
 H2S_HERMES_MODEL=default
 H2S_HERMES_API_KEY=put-your-hermes-key-here-if-needed
 H2S_HERMES_TIMEOUT_S=30
+
+H2S_REMINDER_STORE=~/.hermes/hermes2stackchan/reminders.json
+H2S_REMINDER_POLL_S=1
+H2S_REMINDER_DISPLAY_MS=9000
 ```
 
 Install Python package:
@@ -263,6 +267,7 @@ The service runs one multithreaded bridge process:
 - HTTP audio endpoint.
 - Fast touch/recording LED worker.
 - Power watcher.
+- Persistent reminder worker.
 - Idle life animator.
 
 Disable individual workers for debugging:
@@ -433,6 +438,32 @@ When Hermes asks a real follow-up question, it should set:
 ```
 
 StackChan will speak the question first and then automatically start a follow-up recording.
+
+Hermes can also schedule reminders:
+
+```json
+{
+  "reply": "Mache ich. Ich melde mich in zwei Minuten.",
+  "follow_up_listen": false,
+  "actions": [
+    {"action": "reminder", "text": "Bei Wolfgang melden", "delay_s": 120}
+  ]
+}
+```
+
+The bridge stores pending reminders persistently in `H2S_REMINDER_STORE`. When a
+reminder is due, the unified bridge wakes StackChan, plays a short tone, shows
+the reminder, and sends a `say` command. If the user only says "erinnere mich"
+without time or content, Hermes should ask what/when and set
+`follow_up_listen: true`.
+
+Reminder CLI:
+
+```bash
+scripts/h2s_bridge.sh add-reminder --pair desk --text "Test" --delay-s 120
+scripts/h2s_bridge.sh list-reminders --pair desk
+scripts/h2s_bridge.sh watch-reminders --pair desk
+```
 
 ## 8: Test Speech End To End
 

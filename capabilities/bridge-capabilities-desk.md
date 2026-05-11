@@ -225,6 +225,32 @@ Hermes must return JSON only:
 
 Use `follow_up_listen: true` only when the reply is a real question and Hermes expects the user to answer immediately. StackChan will play the TTS answer first and then start a short follow-up recording.
 
+### reminder / notify
+
+Schedules a persistent reminder on the bridge host. Use this when the user says
+things like "erinnere mich in zwei Minuten" or "benachrichtige mich morgen".
+The bridge stores the reminder outside git and later wakes StackChan via MQTT.
+
+Parameters:
+
+- `text`: required reminder text.
+- `delay_s`: seconds from now, or
+- `due_at`: ISO timestamp with timezone.
+
+Example:
+
+```json
+{
+  "action": "reminder",
+  "text": "Wasser trinken",
+  "delay_s": 120
+}
+```
+
+When the user only says "erinnere mich" without time or content, do not create
+a reminder. Ask what and when, set `follow_up_listen: true`, and wait for the
+answer.
+
 ### system
 
 Publishes to `hermes-stackchan/desk/cmd/system`.
