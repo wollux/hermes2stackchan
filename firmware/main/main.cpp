@@ -82,6 +82,9 @@ constexpr int kInteractionEventCooldownMs = 1500;
 constexpr int kImuIgnoreAfterHeadMotionMs = 4500;
 constexpr int kLtr553NearRawThreshold = 120;
 constexpr int kLtr553NearDeltaThreshold = 55;
+constexpr int kServoMoveStepRaw = 12;
+constexpr int kMotionMaxSpeedPct = 24;
+constexpr int kMotionMinSegmentMs = 180;
 constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
@@ -395,6 +398,7 @@ void update_soc_temperature()
 class I2cDevice {
 public:
     I2cDevice(i2c_master_bus_handle_t bus, uint8_t address, uint32_t speed_hz = 400 * 1000)
+        : address_(address)
     {
         i2c_device_config_t config = {};
         config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
@@ -405,7 +409,17 @@ public:
 
     void write_reg(uint8_t reg, uint8_t value)
     {
-        ESP_ERROR_CHECK(try_write_reg(reg, value));
+        esp_err_t err = ESP_FAIL;
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            err = try_write_reg(reg, value);
+            if (err == ESP_OK) {
+                return;
+            }
+            ESP_LOGW(kTag, "i2c write retry addr=0x%02x reg=0x%02x attempt=%d err=%s",
+                     address_, reg, attempt, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(10 * attempt));
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(err);
     }
 
     esp_err_t try_write_reg(uint8_t reg, uint8_t value)
@@ -459,6 +473,7 @@ private:
     }
 
     i2c_master_dev_handle_t device_ = nullptr;
+    uint8_t address_ = 0;
 };
 
 std::unique_ptr<I2cDevice> g_pmic;
@@ -2740,12 +2755,12 @@ void move_axes_toward(const ServoAxis& yaw, const ServoAxis& pitch,
     while (yaw_current != yaw_target || pitch_current != pitch_target) {
         if (yaw_current != yaw_target) {
             const int direction = yaw_target > yaw_current ? 1 : -1;
-            yaw_current += direction * std::min(18, std::abs(yaw_target - yaw_current));
+            yaw_current += direction * std::min(kServoMoveStepRaw, std::abs(yaw_target - yaw_current));
             write_safe_servo_position(yaw, yaw_current);
         }
         if (pitch_current != pitch_target) {
             const int direction = pitch_target > pitch_current ? 1 : -1;
-            pitch_current += direction * std::min(18, std::abs(pitch_target - pitch_current));
+            pitch_current += direction * std::min(kServoMoveStepRaw, std::abs(pitch_target - pitch_current));
             write_safe_servo_position(pitch, pitch_current);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -2774,9 +2789,12 @@ int motion_segment_duration_ms(const ServoAxis& yaw, const ServoAxis& pitch,
     const int pitch_start_pct = raw_position_to_target_pct(pitch, pitch_start_raw);
     const int pct_distance = std::max(std::abs(target.yaw_pct - yaw_start_pct),
                                       std::abs(target.pitch_pct - pitch_start_pct));
-    const int speed_pct = clamp_int(target.speed_pct, 1, 100);
+    const int speed_pct = clamp_int(target.speed_pct, 1, kMotionMaxSpeedPct);
     const float ms_per_pct = 5.0f + (100 - speed_pct) * 0.30f;
-    return clamp_int(static_cast<int>(std::lround(std::max(1, pct_distance) * ms_per_pct)), 40, 4000);
+    return clamp_int(
+        static_cast<int>(std::lround(std::max(1, pct_distance) * ms_per_pct)),
+        kMotionMinSegmentMs,
+        4000);
 }
 
 int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
@@ -2785,7 +2803,7 @@ int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
 {
     const int raw_distance = std::max(std::abs(yaw_target_raw - yaw_start_raw),
                                       std::abs(pitch_target_raw - pitch_start_raw));
-    const int min_safe_steps = std::max(1, (raw_distance + 17) / 18);
+    const int min_safe_steps = std::max(1, (raw_distance + kServoMoveStepRaw - 1) / kServoMoveStepRaw);
     const int requested_steps = std::max(1, duration_ms / 20);
     return std::max(min_safe_steps, requested_steps);
 }
@@ -3222,8 +3240,8 @@ bool append_motion_point(MotionCommand& command, int yaw_pct, int pitch_pct,
     MotionPoint& point = command.points[command.point_count++];
     point.yaw_pct = clamp_int(yaw_pct, kYawTargetMinPct, kYawTargetMaxPct);
     point.pitch_pct = clamp_int(pitch_pct, kPitchTargetMinPct, kPitchTargetMaxPct);
-    point.duration_ms = duration_ms > 0 ? clamp_int(duration_ms, 40, 4000) : 0;
-    point.speed_pct = clamp_int(speed_pct, 1, 100);
+    point.duration_ms = duration_ms > 0 ? clamp_int(duration_ms, kMotionMinSegmentMs, 4000) : 0;
+    point.speed_pct = clamp_int(speed_pct, 1, kMotionMaxSpeedPct);
     point.hold_ms = clamp_int(hold_ms, 0, 4000);
     return true;
 }
@@ -3236,7 +3254,10 @@ bool build_path_motion(cJSON* root, MotionCommand& command)
     }
 
     const int default_segment_ms = clamp_int(json_int(root, "segment_ms", 0), 0, 4000);
-    const int default_speed_pct = clamp_int(json_int(root, "speed_pct", json_int(root, "default_speed_pct", 45)), 1, 100);
+    const int default_speed_pct = clamp_int(
+        json_int(root, "speed_pct", json_int(root, "default_speed_pct", 45)),
+        1,
+        kMotionMaxSpeedPct);
     const char* curve = json_string(root, "curve", "linear");
     command.curve = (std::strcmp(curve, "spline") == 0 ||
                      std::strcmp(curve, "smooth") == 0 ||
@@ -3292,6 +3313,18 @@ bool build_path_motion(cJSON* root, MotionCommand& command)
 bool enqueue_motion_command(const MotionCommand& command)
 {
     return g_motion_queue && xQueueSend(g_motion_queue, &command, pdMS_TO_TICKS(50)) == pdTRUE;
+}
+
+void begin_head_motion_ignore()
+{
+    g_head_motion_active = true;
+    g_last_head_motion_ms = esp_timer_get_time() / 1000;
+}
+
+void end_head_motion_ignore()
+{
+    g_head_motion_active = false;
+    g_last_head_motion_ms = esp_timer_get_time() / 1000;
 }
 
 void copy_cstr(char* destination, size_t destination_len, const char* source)
@@ -5464,9 +5497,12 @@ void hardware_servo_task(void*)
             g_pending_pitch_target_pct = 101;
         }
 
+        begin_head_motion_ignore();
+
         if (!servo_powered) {
             if (!set_servo_vm_power(true)) {
                 ESP_LOGW(kTag, "servo power unavailable; movement skipped");
+                end_head_motion_ignore();
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
@@ -5477,6 +5513,7 @@ void hardware_servo_task(void*)
             bus_started = g_servo_bus.begin(UART_NUM_1, 1000000, 6, 7);
             if (!bus_started) {
                 ESP_LOGE(kTag, "servo UART init failed");
+                end_head_motion_ignore();
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
@@ -5486,6 +5523,7 @@ void hardware_servo_task(void*)
             ESP_LOGW(kTag, "servo bus not answering");
             set_servo_vm_power(false);
             servo_powered = false;
+            end_head_motion_ignore();
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -5497,6 +5535,7 @@ void hardware_servo_task(void*)
             servo_powered = false;
             g_temperature_servo_yaw_c = -1;
             g_temperature_servo_pitch_c = -1;
+            end_head_motion_ignore();
             continue;
         }
         update_servo_temperatures(yaw, pitch);
@@ -5504,10 +5543,8 @@ void hardware_servo_task(void*)
         g_servo_bus.EnableTorque(yaw.id, 1);
         g_servo_bus.EnableTorque(pitch.id, 1);
         if (has_motion) {
-            g_head_motion_active = true;
             execute_motion_command(yaw, pitch, yaw_pos, pitch_pos, motion);
-            g_head_motion_active = false;
-            g_last_head_motion_ms = esp_timer_get_time() / 1000;
+            end_head_motion_ignore();
             update_servo_temperatures(yaw, pitch);
             g_servo_bus.EnableTorque(yaw.id, 0);
             g_servo_bus.EnableTorque(pitch.id, 0);
@@ -5518,10 +5555,8 @@ void hardware_servo_task(void*)
         const int yaw_target = has_yaw_target ? target_pct_to_raw_position(yaw, yaw_target_pct) : yaw_pos + yaw_delta;
         const int pitch_target = has_pitch_target ? target_pct_to_raw_position(pitch, pitch_target_pct) : pitch_pos + pitch_delta;
         ESP_LOGI(kTag, "servo target raw yaw=%d pitch=%d", yaw_target, pitch_target);
-        g_head_motion_active = true;
         move_axes_toward(yaw, pitch, yaw_pos, pitch_pos, yaw_target, pitch_target);
-        g_head_motion_active = false;
-        g_last_head_motion_ms = esp_timer_get_time() / 1000;
+        end_head_motion_ignore();
         update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
         update_servo_temperatures(yaw, pitch);
         g_servo_bus.EnableTorque(yaw.id, 0);
