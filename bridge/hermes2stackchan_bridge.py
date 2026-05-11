@@ -2131,12 +2131,12 @@ def sensor_shake_motion_action() -> dict[str, Any]:
     return {
         "action": "motion",
         "curve": "spline",
-        "speed_pct": 60,
+        "speed_pct": 28,
         "points": [
-            {"yaw_pct": -16, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 2, "duration_ms": 120},
-            {"yaw_pct": 16, "pitch_pct": DEFAULT_IDLE_PITCH_PCT - 2, "duration_ms": 130},
-            {"yaw_pct": -10, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 120},
-            {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 160},
+            {"yaw_pct": -8, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 220},
+            {"yaw_pct": 8, "pitch_pct": DEFAULT_IDLE_PITCH_PCT - 1, "duration_ms": 240},
+            {"yaw_pct": -5, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 220},
+            {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 280},
         ],
     }
 

@@ -803,6 +803,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(reasons, ["shake"])
         self.assertEqual([action["action"] for action in actions], ["face", "motion"])
         self.assertEqual(actions[0], {"action": "face", "emotion": "surprise_pop", "intensity_pct": 90})
+        self.assertLessEqual(actions[1]["speed_pct"], 30)
         self.assertEqual(immediate_actions, [])
         self.assertEqual(later_reasons, ["shake"])
         self.assertEqual(later_actions[0]["emotion"], "surprise_pop")
