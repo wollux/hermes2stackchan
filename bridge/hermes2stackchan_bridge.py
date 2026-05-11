@@ -1725,44 +1725,49 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
     client = create_mqtt_client(config.mqtt)
+    green_body = b'{"mode":"solid","r":0,"g":255,"b":0,"schema_version":"1.0"}'
+    off_body = b'{"mode":"off","r":0,"g":0,"b":0,"schema_version":"1.0"}'
+    last_event = ""
 
-    def publish_led(payload: dict[str, Any], event_received_ms: float, event_payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        before_publish_ms = time.monotonic() * 1000
-        result = client.publish(pair.led_topic, body, qos=1, retain=False)
-        result.wait_for_publish(timeout=2)
-        after_publish_ms = time.monotonic() * 1000
-        firmware_uptime = event_payload.get("uptime_ms")
-        touch = event_payload.get("touch") if isinstance(event_payload.get("touch"), dict) else {}
-        raw = touch.get("raw") if isinstance(touch, dict) else None
-        pressed = touch.get("pressed") if isinstance(touch, dict) else None
-        print(
-            "[bridge] touch event="
-            f"{event_payload.get('event')} raw={raw} pressed={pressed} "
-            f"fw_uptime_ms={firmware_uptime} "
-            f"rx_to_publish_ms={before_publish_ms - event_received_ms:.1f} "
-            f"publish_wait_ms={after_publish_ms - before_publish_ms:.1f} "
-            f"led={body}",
-            flush=True,
-        )
+    def publish_led(body: bytes, event_received_ms: float, event: str) -> None:
+        client.publish(pair.led_topic, body, qos=0, retain=False)
+        elapsed_ms = (time.monotonic() * 1000) - event_received_ms
+        if args.verbose:
+            print(f"[bridge] fast-touch {event} -> led in {elapsed_ms:.2f}ms", flush=True)
 
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        nonlocal last_event
         event_received_ms = time.monotonic() * 1000
-        try:
-            data = json.loads(message.payload.decode("utf-8"))
-        except json.JSONDecodeError:
-            print(f"[bridge] touch event invalid json topic={message.topic}", flush=True)
+        raw_payload = message.payload
+        if b'"event":"touch_down"' in raw_payload:
+            event = "touch_down"
+            body = green_body
+        elif b'"event":"touch_up"' in raw_payload:
+            event = "touch_up"
+            body = off_body
+        else:
+            try:
+                data = json.loads(raw_payload.decode("utf-8"))
+            except json.JSONDecodeError:
+                if args.verbose:
+                    print(f"[bridge] touch event invalid json topic={message.topic}", flush=True)
+                return
+            event = optional_string(data.get("event"))
+            if event == "touch_down":
+                body = green_body
+            elif event == "touch_up":
+                body = off_body
+            else:
+                return
+        if event == last_event:
             return
-        print(f"[bridge] rx {message.topic}: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}", flush=True)
-        request_id = f"touch-led-{uuid.uuid4().hex[:8]}"
-        payload = build_touch_lamp_payload(data, request_id)
-        if payload is not None:
-            publish_led(payload, event_received_ms, data)
+        last_event = event
+        publish_led(body, event_received_ms, event)
 
     client.on_message = on_message
     connect_and_start(client, config.mqtt)
-    client.subscribe(pair.events_topic, qos=1)
-    print(f"[bridge] watching touch events on {pair.events_topic}; touch=green, release=off", flush=True)
+    client.subscribe(pair.events_topic, qos=0)
+    print(f"[bridge] fast touch lamp on {pair.events_topic}; target <25ms, touch=green, release=off", flush=True)
     try:
         while True:
             time.sleep(0.25)
@@ -1920,6 +1925,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     touch_lamp = subcommands.add_parser("watch-touch-lamp", help="Turn LEDs green while StackChan head touch is held.")
     touch_lamp.add_argument("--pair", default="desk", help="Pair id to watch.")
+    touch_lamp.add_argument("--verbose", action="store_true", help="Log per-event touch-to-publish timing.")
     touch_lamp.set_defaults(func=watch_touch_lamp)
 
     power = subcommands.add_parser("watch-power", help="React to StackChan battery charge/discharge status changes.")

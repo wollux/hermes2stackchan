@@ -3296,7 +3296,7 @@ extern "C" void app_main()
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 4096, nullptr, 2, nullptr);
-    xTaskCreate(touch_event_task, "touch_event", 4096, nullptr, 2, nullptr);
+    xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;
