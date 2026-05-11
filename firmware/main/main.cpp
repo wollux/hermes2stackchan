@@ -1019,43 +1019,33 @@ void push_voice_level(int level_pct, int avg, int peak, bool active)
 
 void draw_voice_waveform_overlay()
 {
-    const int panel_x = 28;
-    const int panel_y = 194;
-    const int panel_w = 264;
-    const int panel_h = 38;
-    const int mid_y = panel_y + panel_h / 2;
-    const uint16_t background = rgb565(0, 7, 12);
-    const uint16_t edge = rgb565(8, 42, 54);
-    const uint16_t dim = rgb565(16, 58, 68);
-    const uint16_t idle = rgb565(42, 145, 170);
-    const uint16_t active = rgb565(120, 245, 210);
-    const uint16_t glow = rgb565(26, 100, 112);
-    const uint16_t color = g_voice_active ? active : idle;
-
-    draw_rect(panel_x, panel_y, panel_w, panel_h, background);
-    draw_line(panel_x + 12, panel_y, panel_x + panel_w - 12, panel_y, edge, 2);
-    draw_line(panel_x + 12, panel_y + panel_h, panel_x + panel_w - 12, panel_y + panel_h, edge, 2);
-    draw_line(panel_x, panel_y + 10, panel_x, panel_y + panel_h - 10, edge, 2);
-    draw_line(panel_x + panel_w, panel_y + 10, panel_x + panel_w, panel_y + panel_h - 10, edge, 2);
-    draw_line(panel_x + 14, mid_y, panel_x + panel_w - 14, mid_y, dim, 1);
-
-    const int bars = std::min<int>(static_cast<int>(g_voice_waveform.size()), (panel_w - 24) / 5);
+    const int start_x = 68;
+    const int width = 184;
+    const int mid_y = 216;
+    const int step = 4;
+    const int samples = width / step;
+    const uint16_t color = g_voice_active ? rgb565(120, 245, 210) : rgb565(44, 130, 150);
+    const uint16_t dim = rgb565(14, 48, 58);
     const int latest = static_cast<int>(g_voice_waveform_head);
-    for (int i = 0; i < bars; ++i) {
+    int prev_x = start_x;
+    int prev_y = mid_y;
+
+    draw_line(start_x, mid_y, start_x + width, mid_y, dim, 1);
+
+    for (int i = 0; i <= samples; ++i) {
         const int history_index =
-            (latest - (bars - 1 - i) + static_cast<int>(g_voice_waveform.size()) * 2) %
+            (latest - (samples - i) + static_cast<int>(g_voice_waveform.size()) * 2) %
             static_cast<int>(g_voice_waveform.size());
         const int level = clamp_int(static_cast<int>(g_voice_waveform[history_index]), 0, 100);
-        const int bar_h = std::max(2, level * (panel_h - 12) / 100);
-        const int x = panel_x + 14 + i * 5;
-        const uint16_t bar_color = level > 8 ? color : glow;
-        draw_line(x, mid_y - bar_h / 2, x, mid_y + bar_h / 2, bar_color, 3);
-    }
-
-    const int meter_w = clamp_int((panel_w - 32) * g_voice_level_pct / 100, 4, panel_w - 32);
-    draw_rect(panel_x + 16, panel_y + panel_h - 7, panel_w - 32, 2, rgb565(6, 32, 40));
-    if (g_voice_active) {
-        draw_rect(panel_x + 16, panel_y + panel_h - 7, meter_w, 2, active);
+        const int amplitude = 2 + level * 16 / 100;
+        const float phase = static_cast<float>(i) * 0.75f;
+        const int x = start_x + i * step;
+        const int y = mid_y + static_cast<int>(std::lround(std::sin(phase) * amplitude));
+        if (i > 0) {
+            draw_line(prev_x, prev_y, x, y, color, 2);
+        }
+        prev_x = x;
+        prev_y = y;
     }
 }
 
