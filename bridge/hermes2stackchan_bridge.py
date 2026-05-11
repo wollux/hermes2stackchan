@@ -1331,8 +1331,6 @@ def reminder_actions(reminder: dict[str, Any], display_duration_ms: int) -> list
     return [
         {"action": "system", "system_action": "display_wake"},
         {"action": "face", "emotion": "question", "intensity_pct": 70},
-        {"action": "sound", "frequency_hz": 988, "duration_ms": 120, "volume_pct": 80},
-        {"action": "say", "text": f"Erinnerung: {text}", "emotion": "speaking", "beep": True},
         {"action": "display", "text": f"ERINNERUNG: {text}", "duration_ms": display_duration_ms},
     ]
 

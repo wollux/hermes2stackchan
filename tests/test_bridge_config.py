@@ -438,12 +438,13 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertEqual(fired[0]["text"], "Test trinken")
             self.assertEqual(pending_reminders(config, "desk"), [])
 
-    def test_reminder_actions_wake_display_and_say_text(self) -> None:
+    def test_reminder_actions_wake_display_without_audio_path(self) -> None:
         actions = reminder_actions({"id": "rem-1", "text": "Wasser trinken"}, 7000)
 
         self.assertEqual(actions[0], {"action": "system", "system_action": "display_wake"})
-        self.assertIn({"action": "sound", "frequency_hz": 988, "duration_ms": 120, "volume_pct": 80}, actions)
-        self.assertTrue(any(action["action"] == "say" and "Wasser trinken" in action["text"] for action in actions))
+        self.assertTrue(any(action["action"] == "display" and "Wasser trinken" in action["text"] for action in actions))
+        self.assertNotIn("sound", {action["action"] for action in actions})
+        self.assertNotIn("say", {action["action"] for action in actions})
 
     def test_schedule_reminders_filters_action_from_mqtt_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
