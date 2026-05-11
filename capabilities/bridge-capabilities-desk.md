@@ -61,6 +61,7 @@ Safe firmware limits are enforced locally.
 Allowed directions: `left`, `right`, `up`, `down`, `center`, `straight`.
 
 Also supported: `yaw_delta`, `pitch_delta`, `yaw_target_pct`, `pitch_target_pct`.
+Use `yaw_target_pct` as -100..100. Use `pitch_target_pct` as 0..100, matching the original StackChan pitch range.
 
 ### motion
 
@@ -73,7 +74,7 @@ Rules:
 - `points` is required.
 - Maximum `points`: 48.
 - `yaw_pct`: -100..100, where 0 is the center/start position.
-- `pitch_pct`: -100..100, where 0 is the center/start position.
+- `pitch_pct`: 0..100, matching the original StackChan pitch range. 0 is down, 45 is the normal idle height, 100 is up.
 - `speed_pct`: 1..100. Used when a point has no `duration_ms`.
 - `duration_ms`: 0 or omitted means derive timing from `speed_pct`; otherwise 40..4000 per segment.
 - `hold_ms`: optional pause after a point, 0..4000.
@@ -88,11 +89,11 @@ Path command with per-point speed:
   "curve": "spline",
   "speed_pct": 35,
   "points": [
-    {"yaw_pct": 0, "pitch_pct": 0},
-    {"yaw_pct": 20, "pitch_pct": 15, "speed_pct": 35},
-    {"yaw_pct": 0, "pitch_pct": 30, "speed_pct": 35},
-    {"yaw_pct": -20, "pitch_pct": 15, "speed_pct": 35},
-    {"yaw_pct": 0, "pitch_pct": 0, "speed_pct": 35}
+    {"yaw_pct": 0, "pitch_pct": 45},
+    {"yaw_pct": 20, "pitch_pct": 60, "speed_pct": 35},
+    {"yaw_pct": 0, "pitch_pct": 75, "speed_pct": 35},
+    {"yaw_pct": -20, "pitch_pct": 60, "speed_pct": 35},
+    {"yaw_pct": 0, "pitch_pct": 45, "speed_pct": 35}
   ],
   "request_id": "motion-001"
 }
@@ -143,6 +144,87 @@ Publishes to `hermes-stackchan/desk/cmd/sound`.
 
 Currently supports simple local tones through the speaker.
 
+### audio
+
+Publishes to `hermes-stackchan/desk/cmd/audio`.
+
+This is the V1.0 control contract for wakeword and push-to-talk state. StackChan can detect the built-in WakeNet wakeword `Computer` locally and can also start recording from touch/push-to-talk. Recorded WAV audio is uploaded to the bridge over HTTP, not MQTT.
+
+Supported actions: `set_wakeword`, `simulate_wakeword`, `start_recording`, `stop_recording`.
+
+Enable wakeword listening:
+
+```json
+{
+  "schema_version": "1.0",
+  "action": "set_wakeword",
+  "wakeword": "Computer",
+  "enabled": true,
+  "request_id": "audio-001"
+}
+```
+
+Push-to-talk start and stop:
+
+```json
+{
+  "schema_version": "1.0",
+  "action": "start_recording",
+  "source": "push_to_talk",
+  "min_ms": 5000,
+  "max_ms": 20000,
+  "request_id": "ptt-001"
+}
+```
+
+```json
+{
+  "schema_version": "1.0",
+  "action": "stop_recording",
+  "source": "push_to_talk",
+  "reason": "touch_release",
+  "request_id": "ptt-002"
+}
+```
+
+Wakeword and touch recording use local voice activity detection and stop after silence or the configured maximum duration.
+
+### speech conversation
+
+StackChan sends recorded WAV audio to the bridge endpoint:
+
+```text
+POST /stackchan/audio
+Content-Type: audio/wav
+X-H2S-Pair-Id: desk
+X-H2S-Request-Id: optional-request-id
+```
+
+Bridge processing:
+
+1. Transcribe the WAV with the configured STT provider.
+2. Read retained StackChan status from MQTT.
+3. Send the transcript, status, this capabilities file, and personality notes to Hermes.
+4. Validate Hermes JSON actions.
+5. Publish valid actions to `hermes-stackchan/desk/cmd/*`.
+6. Generate TTS for the final reply and return `tts_url` to StackChan.
+
+Hermes must return JSON only:
+
+```json
+{
+  "reply": "Mache ich.",
+  "follow_up_listen": false,
+  "actions": [
+    {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
+    {"action": "face", "emotion": "happy", "intensity_pct": 65},
+    {"action": "move", "pitch_target_pct": 55}
+  ]
+}
+```
+
+Use `follow_up_listen: true` only when the reply is a real question and Hermes expects the user to answer immediately. StackChan will play the TTS answer first and then start a short follow-up recording.
+
 ### system
 
 Publishes to `hermes-stackchan/desk/cmd/system`.
@@ -151,7 +233,7 @@ Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`.
 
 ## Status
 
-StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, temperatures, `firmware`, and `firmware_version`.
+StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, temperatures, `firmware`, and `firmware_version`.
 
 Battery fields:
 
@@ -185,6 +267,30 @@ Temperature fields:
 
 Temperature value `-1` means unavailable. Servo temperatures are only known while the servo bus is powered and answering.
 
+Audio-control fields:
+
+```json
+{
+  "wakeword_enabled": true,
+  "recording": false,
+  "audio": {
+    "input_ready": false,
+    "wakeword_enabled": true,
+    "wakeword": "Computer",
+    "wakenet_model": "wn9_computer_tts",
+    "wakenet_words": "Computer",
+    "recording": false,
+    "recording_source": "none",
+    "recording_started_ms": 0,
+    "recording_min_ms": 5000,
+    "recording_silence_timeout_ms": 1000,
+    "recording_max_ms": 15000
+  }
+}
+```
+
+StackChan also publishes realtime audio events to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
+
 Hermes HTTP responses consumed by the bridge must be JSON:
 
 ```json
@@ -199,8 +305,8 @@ Hermes HTTP responses consumed by the bridge must be JSON:
 
 ## Forbidden In This Slice
 
-- Audio capture
-- Wake word handling
 - Camera commands
 - Multi-device routing
-- Cloud TTS playback
+- Radio playback
+- Binary audio over MQTT
+- Direct control of another pair namespace

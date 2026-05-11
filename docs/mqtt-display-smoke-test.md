@@ -10,12 +10,14 @@ This is the first Hermes2StackChan V1.0 hardware slice: the bridge sends MQTT co
 - Move command: `hermes-stackchan/desk/cmd/move`
 - Motion command: `hermes-stackchan/desk/cmd/motion`
 - Sound command: `hermes-stackchan/desk/cmd/sound`
+- Audio command: `hermes-stackchan/desk/cmd/audio`
 - LED command: `hermes-stackchan/desk/cmd/led`
 - Device command: `hermes-stackchan/desk/cmd/device`
 - Say command: `hermes-stackchan/desk/cmd/say`
 - Status: `hermes-stackchan/desk/status`
 - ACK: `hermes-stackchan/desk/ack`
 - Error: `hermes-stackchan/desk/error`
+- Events: `hermes-stackchan/desk/events`
 
 ## Bridge Setup
 
@@ -107,7 +109,72 @@ scripts/status_life_animator.sh desk
 scripts/stop_life_animator.sh desk
 ```
 
-`animate-life` only sends small face and mostly subtle head impulses while the retained status reports `ui.mode: face`, the display is awake, and StackChan is not recording or speaking. The firmware renders blink, normal breathing, occasional deep breathing, tiny `Z` micro-sleeps, small mouth impulses, and pupil-glance impulses as short smooth frame animations and returns to the current default face. Sometimes StackChan first glances with the pupils, then gently turns the head in that direction, and finally centers the pupils again. Upward glances are slightly favored so he does not feel stuck looking down. Rarely, StackChan performs a bigger desk-scan sweep left/right and returns to center; the Bridge sends matching pupil glances for each sweep segment so the eyes track the head direction. Pitch stays small in those action moves. Firmware also glances in the detected movement direction for direct `move` and `motion` commands. Servo life motions are bounded and can be disabled with `--no-motion`. It never sends LED or sound commands.
+`animate-life` only sends small face and mostly subtle head impulses while the retained status reports `ui.mode: face`, the display is awake, and StackChan is not recording or speaking. The firmware renders blink, normal breathing, occasional deep breathing, tiny `Z` micro-sleeps, small mouth impulses, and pupil-glance impulses as short smooth frame animations and returns to the current default face. Sometimes StackChan first glances with the pupils, then gently turns the head in that direction, and finally centers the pupils again. Upward glances are slightly favored so he does not feel stuck looking down. Rarely, StackChan performs a bigger desk-scan sweep left/right, a cautious up/down scan, or a diagonal room glance and returns to center; the Bridge sends matching pupil glances for each sweep segment so the eyes track the head direction. Firmware also glances in the detected movement direction for direct `move` and `motion` commands. Servo life motions are bounded and can be disabled with `--no-motion`. It never sends LED or sound commands.
+
+## Audio Control Slice
+
+Issue #6 starts with the control contract for wakeword and push-to-talk. Firmware now initializes the ES7210 microphone and runs a local voice-activity detector. This slice still does not upload PCM audio to the bridge, but it gives firmware, bridge, MQTTX, and later Hermes one stable way to set and observe speech mode.
+
+Enable the configured wakeword:
+
+```sh
+scripts/h2s_bridge.sh send-audio \
+  --pair desk \
+  --action set_wakeword \
+  --wakeword Computer \
+  --enabled \
+  --wait-ack
+```
+
+Simulate a wakeword trigger and let the firmware auto-stop when speech has been heard and then falls below the silence threshold:
+
+```sh
+scripts/h2s_bridge.sh send-audio \
+  --pair desk \
+  --action simulate_wakeword \
+  --wakeword Computer \
+  --silence-timeout-ms 500 \
+  --wait-ack
+```
+
+Start and stop recording manually:
+
+```sh
+scripts/h2s_bridge.sh send-audio --pair desk --action start_recording --source push_to_talk --wait-ack
+scripts/h2s_bridge.sh send-audio --pair desk --action stop_recording --source push_to_talk --reason manual_stop --wait-ack
+```
+
+The retained status includes top-level `wakeword_enabled` and `recording`, plus an `audio` object with `input_ready`, `wakeword`, `recording_source`, timing fields, `voice_active`, `voice_level_pct`, `voice_avg_level`, and `voice_peak_level`. The firmware also publishes realtime state changes to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
+
+While recording, the face remains visible and the face renderer adds a small waveform overlay below the mouth from the same framebuffer before the frame is flushed. The overlay is the first `FaceExtraMode`; later extras can use the same hook without replacing the face screen.
+
+For a quick head-touch hardware test, run the bridge touch lamp watcher:
+
+```sh
+scripts/h2s_bridge.sh watch-touch-lamp --pair desk
+```
+
+StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. A touch starts recording immediately in firmware. Releasing touch does not stop recording; recording stops when the microphone has heard speech and then sees about 500 ms of silence, or after a no-voice timeout. A touch turns the LEDs solid green immediately through the bridge watcher. They stay green while recording is active and turn off about 500 ms after `recording_stopped` or a retained status update reports `recording:false` after an active recording. This is intentionally bridge-driven so the MQTT event path is visible. The watcher logs the bridge-side publish timing in verbose mode.
+
+To watch both bridge and firmware logs during a touch test:
+
+```sh
+tail -f touch-lamp.log
+```
+
+For serial firmware logs:
+
+```sh
+cd firmware
+source /Users/wolfgangvieregg/development/esp-idf-v5.5.4/export.sh
+idf.py -p /dev/cu.usbmodem21301 monitor | rg --line-buffered 'touch|SI12T|MQTT|led'
+```
+
+For voice/VAD debugging, include microphone lines too:
+
+```sh
+idf.py -p /dev/cu.usbmodem21301 monitor | rg --line-buffered 'touch|voice|microphone|recording|led'
+```
 
 ## Hermes HTTP Adapter
 

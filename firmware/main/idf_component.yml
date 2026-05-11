@@ -1,3 +1,4 @@
 dependencies:
   espressif/esp_lcd_ili9341: "==1.2.0"
   espressif/esp_codec_dev: "~1.5.4"
+  espressif/esp-sr: "==2.3.1"
