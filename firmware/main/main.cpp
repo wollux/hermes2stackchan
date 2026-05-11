@@ -155,7 +155,9 @@ volatile int g_voice_peak_level = 0;
 volatile bool g_voice_active = false;
 std::array<uint8_t, 64> g_voice_waveform = {};
 volatile int g_voice_waveform_head = 0;
-char g_wakeword[32] = "Computer";
+char g_wakeword[32] = CONFIG_STACKCHAN_WAKEWORD_LABEL;
+char g_wakenet_model_name[64] = "";
+char g_wakenet_words[96] = "";
 char g_recording_source[24] = "none";
 srmodel_list_t* g_sr_models = nullptr;
 const esp_wn_iface_t* g_wakenet_iface = nullptr;
@@ -2680,7 +2682,8 @@ void publish_status()
                   "\"volume_pct\":%d,\"brightness_pct\":%u,\"display_sleeping\":%s,"
                   "\"temperature\":{\"soc_c\":%d,\"servo_yaw_c\":%d,\"servo_pitch_c\":%d},"
                   "\"wakeword_enabled\":%s,\"recording\":%s,\"speaking\":%s,"
-                  "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\",\"speaking\":%s,"
+                  "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\","
+                  "\"wakenet_model\":\"%s\",\"wakenet_words\":\"%s\",\"speaking\":%s,"
                   "\"recording\":%s,\"recording_source\":\"%s\",\"recording_started_ms\":%lld,"
                   "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d,"
                   "\"voice_active\":%s,\"voice_level_pct\":%d,\"voice_avg_level\":%d,\"voice_peak_level\":%d},"
@@ -2719,6 +2722,8 @@ void publish_status()
                   g_audio_input_ready ? "true" : "false",
                   g_wakeword_enabled ? "true" : "false",
                   g_wakeword,
+                  g_wakenet_model_name,
+                  g_wakenet_words,
                   g_tts_playing ? "true" : "false",
                   g_recording ? "true" : "false",
                   g_recording_source,
@@ -3971,8 +3976,17 @@ bool init_wakenet()
         return false;
     }
 
-    char* model_name = esp_srmodel_filter(g_sr_models, ESP_WN_PREFIX, "computer");
+    const char* model_hint = CONFIG_STACKCHAN_WAKEWORD_MODEL_HINT;
+    char* model_name = nullptr;
+    if (model_hint && *model_hint) {
+        model_name = esp_srmodel_filter(g_sr_models, ESP_WN_PREFIX, model_hint);
+    }
     if (!model_name) {
+        ESP_LOGW(kTag,
+                 "WakeNet model hint '%s' not found; falling back to first available model. "
+                 "Add a matching model to use wakeword '%s'.",
+                 model_hint && *model_hint ? model_hint : "<empty>",
+                 g_wakeword);
         model_name = esp_srmodel_filter(g_sr_models, ESP_WN_PREFIX, nullptr);
     }
     if (!model_name) {
@@ -4001,8 +4015,11 @@ bool init_wakenet()
         ESP_LOGI(kTag, "WakeNet threshold word=%d %.3f", word, threshold);
     }
     char* words = esp_srmodel_get_wake_words(g_sr_models, model_name);
+    copy_cstr(g_wakenet_model_name, sizeof(g_wakenet_model_name), model_name);
+    copy_cstr(g_wakenet_words, sizeof(g_wakenet_words), words ? words : "");
     ESP_LOGI(kTag,
-             "WakeNet ready: model=%s words=%s sample_rate=%d chunk=%d channels=%d",
+             "WakeNet ready: label=%s model=%s words=%s sample_rate=%d chunk=%d channels=%d",
+             g_wakeword,
              model_name,
              words ? words : "?",
              sample_rate,

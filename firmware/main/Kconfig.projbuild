@@ -24,6 +24,23 @@ config STACKCHAN_BRIDGE_AUDIO_URL
     help
         HTTP endpoint for recorded WAV uploads, for example http://192.168.99.58:8788/stackchan/audio.
 
+config STACKCHAN_WAKEWORD_LABEL
+    string "Wakeword label"
+    default "Computer"
+    help
+        Human-readable wakeword label reported in MQTT status and events.
+        This does not train a wakeword by itself; the selected WakeNet model
+        must still contain the matching wakeword.
+
+config STACKCHAN_WAKEWORD_MODEL_HINT
+    string "WakeNet model hint"
+    default "computer"
+    help
+        Substring used to select the WakeNet model from the ESP-SR model
+        partition. Use "hermes" once a Hermes WakeNet model has been added
+        to the firmware image. If no matching model exists, firmware falls
+        back to the first available WakeNet model and logs a warning.
+
 config STACKCHAN_PAIR_ID
     string "Pair ID"
     default "desk"

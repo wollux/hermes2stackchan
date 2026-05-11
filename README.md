@@ -292,9 +292,21 @@ H2S_MQTT_URI=mqtt://192.168.99.58:1883
 H2S_PAIR_ID=desk
 H2S_STACKCHAN_ID=stackchan-desk
 H2S_BRIDGE_AUDIO_URL=http://192.168.99.58:8788/stackchan/audio
+H2S_WAKEWORD_LABEL=Computer
+H2S_WAKEWORD_MODEL_HINT=computer
 H2S_DISPLAY_BRIGHTNESS=80
 H2S_STATUS_INTERVAL_MS=5000
 ```
+
+`H2S_WAKEWORD_LABEL` is the label shown in MQTT status and events.
+`H2S_WAKEWORD_MODEL_HINT` selects the WakeNet model from the ESP-SR model partition. The current checked build contains `wn9_computer_tts`, so the reliable built-in wakeword is still `Computer`. To use `Hermes` as a real wakeword, add or generate a WakeNet model whose name/words match Hermes, then set:
+
+```env
+H2S_WAKEWORD_LABEL=Hermes
+H2S_WAKEWORD_MODEL_HINT=hermes
+```
+
+If no matching model exists, firmware falls back to the first available WakeNet model and logs a warning.
 
 Sync `.env` into the ignored ESP-IDF `sdkconfig` values:
 

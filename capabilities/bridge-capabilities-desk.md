@@ -277,6 +277,8 @@ Audio-control fields:
     "input_ready": false,
     "wakeword_enabled": true,
     "wakeword": "Computer",
+    "wakenet_model": "wn9_computer_tts",
+    "wakenet_words": "Computer",
     "recording": false,
     "recording_source": "none",
     "recording_started_ms": 0,
