@@ -1197,26 +1197,84 @@ int count_words(const char* text)
     return count;
 }
 
-void draw_word_message(const char* title, const char* word, int index, int total, uint16_t accent)
+void draw_response_panel(int pulse)
+{
+    const uint16_t panel = rgb565(2, 12, 20);
+    const uint16_t border = rgb565(12, 62, 82);
+    const uint16_t glow = rgb565(8, 95, 120);
+    const int x = 16;
+    const int y = 56;
+    const int w = 288;
+    const int h = 118;
+
+    draw_rect(x + 2, y + 2, w - 4, h - 4, panel);
+    draw_line(x + 10, y, x + w - 10, y, border, 2);
+    draw_line(x + 10, y + h, x + w - 10, y + h, border, 2);
+    draw_line(x, y + 10, x, y + h - 10, border, 2);
+    draw_line(x + w, y + 10, x + w, y + h - 10, border, 2);
+    draw_ellipse(x + 10, y + 10, 10, 10, border);
+    draw_ellipse(x + w - 10, y + 10, 10, 10, border);
+    draw_ellipse(x + 10, y + h - 10, 10, 10, border);
+    draw_ellipse(x + w - 10, y + h - 10, 10, 10, border);
+
+    if (pulse > 0) {
+        draw_line(x + 32, y + 8, x + 92 + pulse * 12, y + 8, glow, 1);
+        draw_line(x + w - 92 - pulse * 12, y + h - 8, x + w - 32, y + h - 8, glow, 1);
+    }
+}
+
+void draw_response_mini_face(int index, uint16_t color)
+{
+    const int cx = 160;
+    const int y = 204;
+    const int look = (index % 5) - 2;
+    const int blink = index % 11 == 0 ? 1 : 0;
+
+    if (blink) {
+        draw_line(cx - 52, y - 12, cx - 28, y - 12, color, 3);
+        draw_line(cx + 28, y - 12, cx + 52, y - 12, color, 3);
+    } else {
+        draw_ellipse(cx - 42 + look, y - 14, 9, 16, color);
+        draw_ellipse(cx + 42 + look, y - 14, 9, 16, color);
+    }
+    draw_mouth_curve(cx + look, y + 6, 48, 14, true, color);
+}
+
+void draw_response_progress(int index, int total, uint16_t accent)
+{
+    if (total <= 1) {
+        return;
+    }
+    const int dots = std::min(total, 12);
+    const int start_x = 160 - (dots * 14) / 2;
+    const int active = clamp_int((index * dots + total - 1) / total, 1, dots);
+    for (int i = 0; i < dots; ++i) {
+        const uint16_t color = i < active ? accent : rgb565(12, 45, 58);
+        draw_ellipse(start_x + i * 14, 184, i < active ? 3 : 2, i < active ? 3 : 2, color);
+    }
+}
+
+void draw_word_message(const char* title, const char* word, int index, int total, uint16_t accent, int phase)
 {
     wake_display_if_needed();
     copy_ui_mode("display");
     FrameGuard frame;
-    clear(kBlack);
-    draw_centered_text(16, title, 2, accent);
-    draw_rect(24, 45, 272, 2, accent);
+    clear(rgb565(0, 3, 7));
+    const uint16_t label = rgb565(90, 150, 170);
+    const uint16_t text = rgb565(246, 252, 255);
+    const uint16_t soft = rgb565(150, 225, 235);
+
+    draw_text(22, 18, title, 1, label);
+    draw_text(244, 18, "RX", 1, label);
+    draw_response_panel(phase);
 
     const int len = static_cast<int>(std::strlen(word));
-    const int scale = len <= 6 ? 7 : len <= 9 ? 6 : len <= 12 ? 5 : len <= 18 ? 4 : 3;
+    const int scale = len <= 6 ? 6 : len <= 9 ? 5 : len <= 13 ? 4 : len <= 18 ? 3 : 2;
     const int text_height = 7 * scale;
-    draw_centered_text((kHeight - text_height) / 2 + 8, word, scale, rgb565(245, 250, 255));
+    draw_centered_text(108 - text_height / 2 + phase, word, scale, text);
 
-    if (total > 1) {
-        const int bar_w = 240;
-        const int filled = clamp_int((bar_w * index) / total, 1, bar_w);
-        draw_rect((kWidth - bar_w) / 2, 218, bar_w, 4, rgb565(24, 45, 60));
-        draw_rect((kWidth - bar_w) / 2, 218, filled, 4, accent);
-    }
+    draw_response_progress(index, total, accent);
+    draw_response_mini_face(index + phase, soft);
 }
 
 void draw_word_sequence(const char* title, const char* text, int duration_ms, uint16_t accent)
@@ -1243,8 +1301,13 @@ void draw_word_sequence(const char* title, const char* text, int duration_ms, ui
             ++cursor;
         }
         ++index;
-        draw_word_message(title, word, index, total, accent);
-        vTaskDelay(pdMS_TO_TICKS(per_word_ms));
+        const int frame_ms = std::max(70, per_word_ms / 3);
+        draw_word_message(title, word, index, total, accent, 0);
+        vTaskDelay(pdMS_TO_TICKS(frame_ms));
+        draw_word_message(title, word, index, total, accent, 1);
+        vTaskDelay(pdMS_TO_TICKS(frame_ms));
+        draw_word_message(title, word, index, total, accent, 0);
+        vTaskDelay(pdMS_TO_TICKS(std::max(70, per_word_ms - frame_ms * 2)));
     }
 }
 
@@ -3592,14 +3655,13 @@ void ui_task(void*)
                 draw_face(command.emotion, command.intensity_pct);
             }
         } else if (command.type == UiCommandType::Say) {
-            draw_wrapped_message("STACKCHAN", command.text, command.accent);
             copy_face_emotion(command.emotion, command.intensity_pct);
             if (command.beep && g_audio_output_ready && g_sound_queue) {
                 SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1};
                 xQueueSend(g_sound_queue, &sound, 0);
             }
             publish_status();
-            vTaskDelay(pdMS_TO_TICKS(command.duration_ms));
+            draw_word_sequence("HERMES", command.text, command.duration_ms, command.accent);
             draw_face(g_face_emotion, g_face_intensity_pct);
         }
         publish_status();
