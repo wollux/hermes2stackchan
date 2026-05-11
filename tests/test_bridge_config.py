@@ -31,6 +31,7 @@ from bridge.hermes2stackchan_bridge import (
     normalize_motion_points,
     parse_hermes_action_response,
     parse_env_file,
+    should_listen_for_followup,
     status_allows_life_animation,
 )
 
@@ -211,6 +212,15 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(parsed["actions"][0]["action"], "say")
         self.assertEqual(parsed["actions"][0]["text"], "Hallo Wolfgang.")
+
+    def test_followup_listen_detects_explicit_flag(self) -> None:
+        self.assertTrue(should_listen_for_followup({"follow_up_listen": True, "actions": []}, "Alles klar."))
+
+    def test_followup_listen_detects_question_reply(self) -> None:
+        self.assertTrue(should_listen_for_followup({"actions": []}, "Moechtest du noch etwas wissen?"))
+
+    def test_followup_listen_ignores_statement(self) -> None:
+        self.assertFalse(should_listen_for_followup({"actions": []}, "Mache ich."))
 
     def test_hermes_action_to_topic_payload(self) -> None:
         config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})

@@ -148,6 +148,7 @@ volatile int64_t g_recording_started_ms = 0;
 volatile int g_recording_min_ms = 5000;
 volatile int g_recording_silence_timeout_ms = 500;
 volatile int g_recording_max_ms = 15000;
+volatile bool g_pending_followup_recording = false;
 volatile int g_voice_level_pct = 0;
 volatile int g_voice_avg_level = 0;
 volatile int g_voice_peak_level = 0;
@@ -2932,6 +2933,40 @@ bool extract_json_string(const char* json, const char* key, char* out, size_t ou
     return n > 0;
 }
 
+bool extract_json_bool(const char* json, const char* key, bool default_value = false)
+{
+    if (!json || !key) {
+        return default_value;
+    }
+    char pattern[64] = {};
+    std::snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char* p = std::strstr(json, pattern);
+    if (!p) {
+        return default_value;
+    }
+    p = std::strchr(p + std::strlen(pattern), ':');
+    if (!p) {
+        return default_value;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (std::strncmp(p, "true", 4) == 0) {
+        return true;
+    }
+    if (std::strncmp(p, "false", 5) == 0) {
+        return false;
+    }
+    if (*p == '1') {
+        return true;
+    }
+    if (*p == '0') {
+        return false;
+    }
+    return default_value;
+}
+
 void enqueue_direction_glance(int yaw_change_pct, int pitch_change_pct)
 {
     const int deadband = 3;
@@ -3295,6 +3330,26 @@ void set_recording_state(bool enabled, const char* source, const char* request_i
     publish_status();
 }
 
+void start_followup_recording_if_pending()
+{
+    if (!g_pending_followup_recording) {
+        return;
+    }
+    g_pending_followup_recording = false;
+    if (!g_audio_input_ready || !g_audio_input || g_recording) {
+        ESP_LOGW(kTag, "follow-up recording skipped: mic_ready=%s recording=%s",
+                 (g_audio_input_ready && g_audio_input) ? "true" : "false",
+                 g_recording ? "true" : "false");
+        publish_status();
+        return;
+    }
+    g_recording_min_ms = 0;
+    g_recording_silence_timeout_ms = 700;
+    g_recording_max_ms = 15000;
+    ESP_LOGI(kTag, "follow-up recording start after Hermes question");
+    set_recording_state(true, "followup", "", "Hermes asked a question");
+}
+
 void handle_audio_command(const char* data, int len)
 {
     cJSON* root = cJSON_ParseWithLength(data, len);
@@ -3473,6 +3528,10 @@ bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request
     ESP_LOGI(kTag, "voice upload done: status=%d elapsed=%dms response=%s", status, elapsed_ms, response->data);
     if (response->truncated) {
         ESP_LOGW(kTag, "voice upload response was truncated at %d bytes", response->len);
+    }
+    if (extract_json_bool(response->data, "follow_up_listen", false)) {
+        g_pending_followup_recording = true;
+        ESP_LOGI(kTag, "voice upload response requests follow-up listening");
     }
     publish_event("audio_upload_done", source, request_id, "bridge accepted wav");
     char tts_url[256] = {};
@@ -3870,6 +3929,7 @@ void audio_state_task(void*)
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
+                start_followup_recording_if_pending();
             }
         } else if (!speech_seen && elapsed_ms >= kVoiceNoSpeechTimeoutMs) {
             ESP_LOGI(kTag,
@@ -3896,6 +3956,7 @@ void audio_state_task(void*)
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
+                start_followup_recording_if_pending();
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -4517,7 +4578,7 @@ extern "C" void app_main()
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
-    xTaskCreate(touch_event_task, "touch_event", 4096, nullptr, 2, nullptr);
+    xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;

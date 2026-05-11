@@ -741,6 +741,65 @@ def parse_hermes_action_response(content: str) -> dict[str, Any]:
     return parsed
 
 
+QUESTION_WORDS_DE = (
+    "was ",
+    "wie ",
+    "wo ",
+    "wann ",
+    "warum ",
+    "weshalb ",
+    "wieso ",
+    "welche ",
+    "welcher ",
+    "welches ",
+    "möchtest ",
+    "moechtest ",
+    "willst ",
+    "soll ",
+    "sollen ",
+    "kann ",
+    "können ",
+    "koennen ",
+    "darf ",
+    "brauchst ",
+)
+
+
+def boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "ja", "on"}
+    return False
+
+
+def should_listen_for_followup(response: dict[str, Any], reply: str) -> bool:
+    if boolish(response.get("follow_up_listen")) or boolish(response.get("followup_listen")):
+        return True
+    if boolish(response.get("expects_reply")) or boolish(response.get("expects_user_reply")):
+        return True
+
+    actions = response.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if boolish(action.get("follow_up_listen")) or boolish(action.get("expects_reply")):
+                return True
+            emotion = str(action.get("emotion") or "").strip().lower().replace("-", "_")
+            if emotion in {"question", "curious"}:
+                return True
+
+    normalized = " ".join(reply.strip().lower().split())
+    if "?" not in normalized:
+        return False
+    return normalized.startswith(QUESTION_WORDS_DE) or any(
+        f" {word}" in normalized for word in QUESTION_WORDS_DE
+    )
+
+
 def extract_hermes_message_content(response: dict[str, Any]) -> str:
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -768,11 +827,13 @@ def build_hermes_messages(
         f"You are {pair.hermes_id}. You control exactly one StackChan: {pair.stackchan_id}.",
         f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
         "Return JSON only. Do not wrap it in Markdown.",
-        "Schema: {\"reply\":\"short German text\",\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system\",...}]}",
+        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system\",...}]}",
         "This request came from StackChan speech input. Answer in German unless the user explicitly asks for another language.",
         "Use action say for the spoken/displayed answer. The bridge will synthesize this text as audio for StackChan.",
         "You may add hardware actions when useful, but never invent unsupported parameters. The bridge and firmware enforce limits.",
         "Keep answers concise for spoken interaction unless the user asks for detail.",
+        "If your reply asks the user a real follow-up question and you expect an immediate answer, set follow_up_listen to true.",
+        "If your reply is only a statement, command confirmation, or rhetorical question, set follow_up_listen to false.",
         "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
         f"Current StackChan status JSON: {status_text}",
     ]
@@ -2664,6 +2725,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 mqtt_ms = round((time.monotonic() - publish_started) * 1000)
                 action_count = len(action_messages)
                 display_text = speech_text_from_hermes_response(hermes_response, transcript)
+            follow_up_listen = should_listen_for_followup(hermes_response, display_text)
 
             tts_started = time.monotonic()
             tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if display_text else ""
@@ -2674,7 +2736,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             print(
                 f"[bridge-http] transcript after {stt_ms}ms via {backend}: {transcript!r}; "
                 f"hermes={hermes_ms}ms status={status_ms}ms actions={action_count} mqtt={mqtt_ms}ms tts={tts_ms}ms "
-                f"reply={display_text!r}",
+                f"follow_up={follow_up_listen} reply={display_text!r}",
                 flush=True,
             )
             if action_errors:
@@ -2690,6 +2752,8 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     "tts_path": tts_path,
                     "tts_url": tts_url,
                     "reply": display_text[:240],
+                    "follow_up_listen": follow_up_listen,
+                    "follow_up_source": "hermes_question" if follow_up_listen else "",
                     "stt_ms": stt_ms,
                     "hermes_ms": hermes_ms,
                     "tts_ms": tts_ms,
