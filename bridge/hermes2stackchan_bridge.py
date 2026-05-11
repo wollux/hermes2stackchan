@@ -102,6 +102,10 @@ class PairConfig:
         return f"{self.mqtt_prefix}/status"
 
     @property
+    def settings_topic(self) -> str:
+        return f"{self.mqtt_prefix}/state/device_settings"
+
+    @property
     def ack_topic(self) -> str:
         return f"{self.mqtt_prefix}/ack"
 
@@ -481,6 +485,8 @@ def send_payload(
         result = client.publish(topic, body, qos=1, retain=False)
         result.wait_for_publish(timeout=5)
         print(f"[bridge] sent {topic}: {body}")
+        if topic == pair.device_topic:
+            publish_device_settings_snapshot(client, pair, payload, "send-payload")
 
         if args.wait_ack:
             if ack_seen.wait(args.timeout):
@@ -505,29 +511,86 @@ def build_touch_lamp_payload(event_payload: dict[str, Any], request_id: str | No
 
 
 def read_latest_status(config: BridgeConfig, pair: PairConfig, timeout_s: float = 2.0) -> dict[str, Any] | None:
+    return read_retained_json(config, pair.status_topic, timeout_s)
+
+
+def read_retained_json(config: BridgeConfig, topic: str, timeout_s: float = 2.0) -> dict[str, Any] | None:
     client = create_mqtt_client(config.mqtt)
-    status_seen = Event()
-    status: dict[str, Any] = {}
+    payload_seen = Event()
+    payload: dict[str, Any] = {}
 
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
         try:
             data = json.loads(message.payload.decode("utf-8"))
         except json.JSONDecodeError:
             return
-        status.clear()
-        status.update(data)
-        status_seen.set()
+        if not isinstance(data, dict):
+            return
+        payload.clear()
+        payload.update(data)
+        payload_seen.set()
 
     client.on_message = on_message
     try:
         connect_and_start(client, config.mqtt)
-        client.subscribe(pair.status_topic, qos=0)
-        if status_seen.wait(timeout_s):
-            return status
+        client.subscribe(topic, qos=0)
+        if payload_seen.wait(timeout_s):
+            return payload
         return None
     finally:
         client.loop_stop()
         client.disconnect()
+
+
+def extract_device_settings(source: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    settings: dict[str, Any] = {}
+    for key in ("volume_pct", "brightness_pct"):
+        value = source.get(key)
+        if value is not None:
+            settings[key] = clamp_int(parse_int_value(value, 0, f"settings.{key}"), 0, 100)
+    speaker_volume = nested_status_value(source, "speaker.volume_pct")
+    if "volume_pct" not in settings and speaker_volume is not None:
+        settings["volume_pct"] = clamp_int(parse_int_value(speaker_volume, 0, "settings.speaker.volume_pct"), 0, 100)
+    return settings
+
+
+def build_device_settings_snapshot(
+    pair: PairConfig,
+    settings: dict[str, Any],
+    source: str,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    merged = dict(previous or {})
+    merged.update(extract_device_settings(settings))
+    if not merged:
+        return {}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "pair_id": pair.pair_id,
+        "stackchan_id": pair.stackchan_id,
+        "source": source,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **merged,
+    }
+
+
+def publish_device_settings_snapshot(
+    client: Any,
+    pair: PairConfig,
+    settings: dict[str, Any],
+    source: str,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    snapshot = build_device_settings_snapshot(pair, settings, source, previous)
+    if not snapshot:
+        return {}
+    body = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    result = client.publish(pair.settings_topic, body, qos=1, retain=True)
+    result.wait_for_publish(timeout=5)
+    print(f"[{time.strftime('%H:%M:%S')}] [bridge] retained {pair.settings_topic}: {body}", flush=True)
+    return snapshot
 
 
 def read_status(args: argparse.Namespace) -> int:
@@ -1813,6 +1876,8 @@ def dispatch_mqtt_actions(
             result = client.publish(topic, body, qos=1, retain=False)
             result.wait_for_publish(timeout=5)
             print(f"[bridge] sent {topic}: {body}")
+            if topic == pair.device_topic:
+                publish_device_settings_snapshot(client, pair, payload, "dispatch")
         if not wait_ack or not pending:
             return 0
         deadline = time.monotonic() + timeout_s
@@ -1865,12 +1930,18 @@ def ask_hermes(args: argparse.Namespace) -> int:
     return dispatch_mqtt_actions(config, pair, action_messages, not args.no_wait_ack, args.timeout)
 
 
-def publish_action_messages(client: Any, action_messages: list[tuple[str, dict[str, Any]]]) -> None:
+def publish_action_messages(
+    client: Any,
+    action_messages: list[tuple[str, dict[str, Any]]],
+    pair: PairConfig | None = None,
+) -> None:
     for topic, payload in action_messages:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         result = client.publish(topic, body, qos=1, retain=False)
         result.wait_for_publish(timeout=5)
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] sent {topic}: {body}", flush=True)
+        if pair is not None and topic == pair.device_topic:
+            publish_device_settings_snapshot(client, pair, payload, "action")
 
 
 def watch_power(args: argparse.Namespace) -> int:
@@ -1922,7 +1993,7 @@ def watch_power(args: argparse.Namespace) -> int:
             action_to_topic_payload(pair, action, f"power-{uuid.uuid4().hex[:12]}")
             for action in actions + immediate_followup_actions
         ]
-        publish_action_messages(client, action_messages)
+        publish_action_messages(client, action_messages, pair)
         if delayed_followup_actions and not args.no_restore_face:
             delay_ms = max(
                 (int(action.get("duration_ms", 0)) for action in actions if action.get("action") == "display"),
@@ -1938,6 +2009,7 @@ def watch_power(args: argparse.Namespace) -> int:
                         action_to_topic_payload(pair, action, f"power-followup-{uuid.uuid4().hex[:8]}")
                         for action in delayed_followup_actions
                     ],
+                    pair,
                 )
                 if args.once:
                     done.set()
@@ -1985,6 +2057,7 @@ def animate_life(args: argparse.Namespace) -> int:
                     publish_action_messages(
                         client,
                         [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
+                        pair,
                     )
                 emitted += 1
                 if args.once:
@@ -2221,6 +2294,104 @@ def send_device(args: argparse.Namespace) -> int:
     if not payload:
         raise ConfigError("send-device needs volume, brightness, display sleep, or display wake")
     return send_payload(args, pair.device_topic, with_request_id(payload, args.request_id))
+
+
+def build_restore_device_payload(settings: dict[str, Any] | None, display_wake: bool = False) -> dict[str, Any]:
+    payload = extract_device_settings(settings)
+    if display_wake:
+        payload["display_wake"] = True
+    return payload
+
+
+def restore_device_settings(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    settings = read_retained_json(config, pair.settings_topic, args.timeout)
+    source = "retained-settings"
+    if settings is None:
+        settings = read_latest_status(config, pair, args.timeout)
+        source = "retained-status"
+
+    payload = build_restore_device_payload(settings, args.display_wake)
+    if not payload:
+        print(f"[bridge] no retained device settings found on {pair.settings_topic} or {pair.status_topic}", file=sys.stderr)
+        return 3
+
+    request_id = args.request_id or f"restore-{uuid.uuid4().hex[:12]}"
+    command = with_request_id(payload, request_id)
+    print(f"[bridge] restoring device settings from {source}: {json.dumps(payload, ensure_ascii=False)}", flush=True)
+    return send_payload(
+        argparse.Namespace(
+            config=args.config,
+            env=args.env,
+            pair=args.pair,
+            request_id=request_id,
+            wait_ack=args.wait_ack,
+            timeout=args.ack_timeout,
+        ),
+        pair.device_topic,
+        command,
+    )
+
+
+def watch_device_settings(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    seen_status = False
+    last_uptime_ms: int | None = None
+    last_snapshot: dict[str, Any] | None = read_retained_json(config, pair.settings_topic, args.timeout)
+
+    def publish_restore(settings: dict[str, Any], reason: str) -> None:
+        payload = build_restore_device_payload(settings, args.display_wake)
+        if not payload:
+            return
+        command = with_request_id(payload, f"settings-{uuid.uuid4().hex[:10]}")
+        body = json.dumps(command, ensure_ascii=False, separators=(",", ":"))
+        result = client.publish(pair.device_topic, body, qos=1, retain=False)
+        result.wait_for_publish(timeout=5)
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] restored settings after {reason}: {body}", flush=True)
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        nonlocal seen_status, last_uptime_ms, last_snapshot
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(status, dict):
+            return
+
+        uptime_ms = parse_int_value(status.get("uptime_ms"), 0, "status.uptime_ms")
+        reboot_or_reconnect = (
+            not seen_status
+            or (last_uptime_ms is not None and uptime_ms + int(args.reboot_drop_ms) < last_uptime_ms)
+        )
+        if reboot_or_reconnect and last_snapshot:
+            publish_restore(last_snapshot, "boot/reconnect")
+        seen_status = True
+        last_uptime_ms = uptime_ms
+
+        current = extract_device_settings(status)
+        if current and current != extract_device_settings(last_snapshot):
+            last_snapshot = publish_device_settings_snapshot(client, pair, current, "status", last_snapshot)
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe(pair.status_topic, qos=0)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [bridge] watching device settings "
+            f"status={pair.status_topic} retained={pair.settings_topic}",
+            flush=True,
+        )
+        if args.once:
+            time.sleep(args.timeout)
+            return 0
+        while True:
+            time.sleep(1)
+    finally:
+        client.loop_stop()
+        client.disconnect()
 
 
 def send_sound(args: argparse.Namespace) -> int:
@@ -2721,7 +2892,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     skip_actions={"say"},
                 )
                 publish_started = time.monotonic()
-                publish_action_messages(self.server.mqtt_client, action_messages)
+                publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
                 mqtt_ms = round((time.monotonic() - publish_started) * 1000)
                 action_count = len(action_messages)
                 display_text = speech_text_from_hermes_response(hermes_response, transcript)
@@ -2861,6 +3032,20 @@ def run_bridge(args: argparse.Namespace) -> int:
                 no_restore_face=args.power_no_restore_face,
             ),
         ))
+    if not args.no_settings:
+        workers.append((
+            "device-settings",
+            watch_device_settings,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                timeout=args.settings_timeout,
+                display_wake=args.settings_display_wake,
+                reboot_drop_ms=args.settings_reboot_drop_ms,
+                once=False,
+            ),
+        ))
     if not args.no_life:
         workers.append((
             "life-animator",
@@ -2988,6 +3173,12 @@ def build_parser() -> argparse.ArgumentParser:
     device.add_argument("--display-wake", action="store_true", help="Wake display and restore configured brightness.")
     device.set_defaults(func=send_device)
 
+    restore_device = subcommands.add_parser("restore-device-settings", help="Restore retained volume and brightness to StackChan.")
+    add_common_send_options(restore_device)
+    restore_device.add_argument("--ack-timeout", type=float, default=5.0, help="ACK wait timeout in seconds.")
+    restore_device.add_argument("--display-wake", action="store_true", help="Also wake the display while restoring settings.")
+    restore_device.set_defaults(func=restore_device_settings)
+
     sound = subcommands.add_parser("send-sound", help="Play a simple speaker tone.")
     add_common_send_options(sound)
     sound.add_argument("--frequency-hz", type=int, default=880, help="Tone frequency.")
@@ -3081,6 +3272,14 @@ def build_parser() -> argparse.ArgumentParser:
     power.add_argument("--no-restore-face", action="store_true", help="Do not run the delayed face/motion reaction after the short battery overlay.")
     power.set_defaults(func=watch_power)
 
+    settings = subcommands.add_parser("watch-device-settings", help="Keep retained device settings and restore them on boot/reconnect.")
+    settings.add_argument("--pair", default="desk", help="Pair id to watch.")
+    settings.add_argument("--timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
+    settings.add_argument("--display-wake", action="store_true", help="Also wake the display when restoring settings.")
+    settings.add_argument("--reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
+    settings.add_argument("--once", action="store_true", help="Process retained status briefly and exit.")
+    settings.set_defaults(func=watch_device_settings)
+
     life = subcommands.add_parser("animate-life", help="Send small idle face and motion impulses so StackChan feels alive.")
     life.add_argument("--pair", default="desk", help="Pair id to animate.")
     life.add_argument("--min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
@@ -3099,12 +3298,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-audio", action="store_true", help="Disable the HTTP audio/STT/TTS worker.")
     run.add_argument("--no-touch-lamp", action="store_true", help="Disable the fast touch/recording LED worker.")
     run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
+    run.add_argument("--no-settings", action="store_true", help="Disable retained device settings restore worker.")
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
     run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
     run.add_argument("--touch-off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     run.add_argument("--power-debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
     run.add_argument("--power-announce-initial", action="store_true", help="Also show the current power state immediately.")
     run.add_argument("--power-no-restore-face", action="store_true", help="Do not run delayed face/motion reaction after battery overlay.")
+    run.add_argument("--settings-timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
+    run.add_argument("--settings-display-wake", action="store_true", help="Also wake display when restoring retained settings.")
+    run.add_argument("--settings-reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
     run.add_argument("--life-min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
     run.add_argument("--life-max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
     run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
