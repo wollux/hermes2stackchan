@@ -19,6 +19,8 @@ from bridge.hermes2stackchan_bridge import (
     build_life_sequence,
     build_multipart_form_data,
     build_motion_profile_points,
+    build_restore_device_payload,
+    build_device_settings_snapshot,
     build_power_change_actions,
     build_power_followup_actions,
     build_reminder,
@@ -364,6 +366,33 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(missing_status_paths(status), [])
         del status["firmware"]
         self.assertEqual(missing_status_paths(status), ["firmware"])
+
+    def test_device_settings_snapshot_extracts_safe_settings(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        snapshot = build_device_settings_snapshot(
+            pair,
+            {"volume_pct": 120, "brightness_pct": -5, "display_sleeping": True},
+            "test",
+        )
+
+        self.assertEqual(snapshot["pair_id"], "desk")
+        self.assertEqual(snapshot["stackchan_id"], "stackchan-desk")
+        self.assertEqual(snapshot["volume_pct"], 100)
+        self.assertEqual(snapshot["brightness_pct"], 0)
+        self.assertNotIn("display_sleeping", snapshot)
+
+    def test_restore_device_payload_uses_retained_status_shape(self) -> None:
+        payload = build_restore_device_payload(
+            {
+                "brightness_pct": 42,
+                "speaker": {"volume_pct": 77},
+                "display_sleeping": True,
+            },
+            display_wake=True,
+        )
+
+        self.assertEqual(payload, {"brightness_pct": 42, "volume_pct": 77, "display_wake": True})
 
     def test_audio_action_to_topic_payload_start_recording(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]

@@ -90,6 +90,7 @@ hermes-stackchan/desk/cmd/sound
 hermes-stackchan/desk/cmd/audio
 hermes-stackchan/desk/cmd/system
 hermes-stackchan/desk/status
+hermes-stackchan/desk/state/device_settings
 hermes-stackchan/desk/ack
 hermes-stackchan/desk/error
 hermes-stackchan/desk/events
@@ -394,6 +395,18 @@ scripts/h2s_bridge.sh send-device --pair desk --display-sleep --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --display-wake --wait-ack
 scripts/h2s_bridge.sh send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
 ```
+
+Retained device settings:
+
+```bash
+scripts/h2s_bridge.sh restore-device-settings --pair desk --wait-ack
+```
+
+The bridge keeps the latest useful device settings on
+`hermes-stackchan/desk/state/device_settings` as a retained MQTT message.
+Currently this restores speaker volume and display brightness. The unified
+bridge service also watches StackChan status and reapplies these settings after
+a reboot or reconnect.
 
 ## 7: Test Hermes Integration
 
