@@ -82,6 +82,8 @@ constexpr int kInteractionEventCooldownMs = 1500;
 constexpr int kImuIgnoreAfterHeadMotionMs = 4500;
 constexpr int kLtr553NearRawThreshold = 120;
 constexpr int kLtr553NearDeltaThreshold = 55;
+constexpr int kImuSideAxisMg = 760;
+constexpr int kImuSideUprightMaxMg = 560;
 constexpr int kServoMoveStepRaw = 12;
 constexpr int kMotionMaxSpeedPct = 24;
 constexpr int kMotionMinSegmentMs = 180;
@@ -3457,8 +3459,7 @@ bool imu_orientation_sideways()
     }
     const int ax = std::abs(static_cast<int>(g_imu_accel_x_mg));
     const int ay = std::abs(static_cast<int>(g_imu_accel_y_mg));
-    const int az = std::abs(static_cast<int>(g_imu_accel_z_mg));
-    return ax >= 650 || (ay <= 620 && az >= 650) || (ay <= 460 && std::max(ax, az) >= 540);
+    return ax >= kImuSideAxisMg && ay <= kImuSideUprightMaxMg;
 }
 
 void sensor_interaction_task(void*)

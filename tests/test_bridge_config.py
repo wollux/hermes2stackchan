@@ -63,6 +63,7 @@ from bridge.hermes2stackchan_bridge import (
     request_id_counts_as_idle_activity,
     rgb565_to_jpeg,
     SensorReactionState,
+    sensor_status_is_sideways,
     status_allows_life_animation,
 )
 
@@ -511,7 +512,7 @@ class BridgeConfigTests(unittest.TestCase):
             "sensors": {
                 "imu": {
                     "ready": True,
-                    "accel_mg": {"x": 720, "y": 0, "z": 650},
+                    "accel_mg": {"x": 820, "y": 0, "z": 650},
                     "motion_score_pct": 72,
                     "motion_active": True,
                 },
@@ -808,10 +809,12 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_sensor_reaction_sideways_requires_orientation_event(self) -> None:
         state = SensorReactionState()
-        side = self.sensor_status(accel_x=820)
+        side = self.sensor_status(accel_x=820, accel_y=100, accel_z=120)
 
         self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.0)[0], [])
-        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.1, source_hint="orientation")
+        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.1, source_hint="orientation")[0], [])
+        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.2, source_hint="orientation")[0], [])
+        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.3, source_hint="orientation")
 
         self.assertEqual(side_reasons, ["sideways"])
         self.assertEqual([action["action"] for action in side_actions], ["led", "face", "display", "local_tts"])
@@ -819,6 +822,9 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(side_actions[1]["emotion"], "surprise_pop")
         self.assertEqual(side_actions[2]["text"], "HILFE!")
         self.assertIn("umgekippt", side_actions[3]["text"])
+
+        pitched_head = self.sensor_status(accel_x=90, accel_y=430, accel_z=870)
+        self.assertFalse(sensor_status_is_sideways(pitched_head))
 
         upright = self.sensor_status(accel_x=0)
         self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.3)[0], [])

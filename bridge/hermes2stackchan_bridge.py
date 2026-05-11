@@ -55,7 +55,8 @@ SENSOR_PROXIMITY_OFF_RAW = 70
 SENSOR_PROXIMITY_STABLE_SAMPLES = 2
 SENSOR_PROXIMITY_CLEAR_SAMPLES = 3
 SENSOR_PROXIMITY_HEAD_DROP_PCT = 18
-SENSOR_SIDE_AXIS_MG = 650
+SENSOR_SIDE_AXIS_MG = 760
+SENSOR_SIDE_UPRIGHT_MAX_MG = 560
 SENSOR_UPRIGHT_AXIS_MG = 620
 SENSOR_SIDE_STABLE_SAMPLES = 3
 SENSOR_SHAKE_SCORE_THRESHOLD = 20
@@ -2131,12 +2132,7 @@ def status_is_busy(status: dict[str, Any]) -> bool:
 def sensor_status_is_sideways(status: dict[str, Any]) -> bool:
     ax = status_int_at(status, "sensors.imu.accel_mg.x")
     ay = status_int_at(status, "sensors.imu.accel_mg.y")
-    az = status_int_at(status, "sensors.imu.accel_mg.z")
-    return (
-        abs(ax) >= SENSOR_SIDE_AXIS_MG
-        or (abs(ay) <= SENSOR_UPRIGHT_AXIS_MG and abs(az) >= SENSOR_SIDE_AXIS_MG)
-        or (abs(ay) <= 460 and max(abs(ax), abs(az)) >= 540)
-    )
+    return abs(ax) >= SENSOR_SIDE_AXIS_MG and abs(ay) <= SENSOR_SIDE_UPRIGHT_MAX_MG
 
 
 def sensor_shake_motion_action() -> dict[str, Any]:
@@ -2259,7 +2255,7 @@ def build_sensor_reaction_actions(
     imu_motion = status_bool(nested_status_value(status, "sensors.imu.motion_active")) is True
     sideways = imu_ready and sensor_status_is_sideways(status)
     imu_event = source_hint in {"imu", "orientation"}
-    if source_hint in {"imu", "orientation"} and sideways:
+    if source_hint == "imu" and sideways:
         state.side_seen_count = max(state.side_seen_count, SENSOR_SIDE_STABLE_SAMPLES - 1)
     if source_hint == "orientation" and not sideways:
         state.upright_seen_count = max(state.upright_seen_count, SENSOR_SIDE_STABLE_SAMPLES - 1)
