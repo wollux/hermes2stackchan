@@ -105,8 +105,11 @@ volatile bool g_audio_input_ready = false;
 volatile bool g_wakeword_enabled = false;
 volatile bool g_recording = false;
 volatile bool g_head_touch_ready = false;
+volatile bool g_display_touch_ready = false;
 volatile bool g_touch_pressed = false;
 volatile int g_touch_raw = 0;
+volatile int g_touch_x = -1;
+volatile int g_touch_y = -1;
 volatile int64_t g_recording_started_ms = 0;
 volatile int g_recording_min_ms = 5000;
 volatile int g_recording_silence_timeout_ms = 1000;
@@ -259,6 +262,11 @@ public:
         return i2c_master_transmit_receive(device_, &reg, 1, &value, 1, 100);
     }
 
+    esp_err_t try_read(uint8_t reg, uint8_t* data, size_t len)
+    {
+        return i2c_master_transmit_receive(device_, &reg, 1, data, len, 100);
+    }
+
 private:
     i2c_master_dev_handle_t device_ = nullptr;
 };
@@ -266,6 +274,7 @@ private:
 std::unique_ptr<I2cDevice> g_pmic;
 std::unique_ptr<I2cDevice> g_py32;
 std::unique_ptr<I2cDevice> g_head_touch;
+std::unique_ptr<I2cDevice> g_display_touch;
 
 bool init_head_touch()
 {
@@ -322,6 +331,56 @@ bool read_head_touch_pressed(uint8_t* raw_out = nullptr)
         }
     }
     return false;
+}
+
+bool init_display_touch()
+{
+    if (!g_i2c_bus) {
+        return false;
+    }
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, 0x38, 200);
+    if (probe != ESP_OK) {
+        ESP_LOGW(kTag, "FT6336 display touch not found at 0x38: %s", esp_err_to_name(probe));
+        g_display_touch_ready = false;
+        return false;
+    }
+
+    g_display_touch = std::make_unique<I2cDevice>(g_i2c_bus, 0x38, 400 * 1000);
+    uint8_t chip_id = 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(g_display_touch->try_read_reg(0xA3, chip_id));
+    g_display_touch_ready = true;
+    ESP_LOGI(kTag, "FT6336 display touch ready: chip_id=0x%02x", chip_id);
+    return true;
+}
+
+bool read_display_touch_pressed(int* out_x = nullptr, int* out_y = nullptr, uint8_t* raw_points_out = nullptr)
+{
+    if (!g_display_touch_ready || !g_display_touch) {
+        return false;
+    }
+
+    uint8_t buf[6] = {};
+    const esp_err_t err = g_display_touch->try_read(0x02, buf, sizeof(buf));
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    const int points = buf[0] & 0x0F;
+    if (raw_points_out) {
+        *raw_points_out = static_cast<uint8_t>(points);
+    }
+    const bool pressed = points > 0;
+    if (pressed) {
+        const int x = ((buf[1] & 0x0F) << 8) | buf[2];
+        const int y = ((buf[3] & 0x0F) << 8) | buf[4];
+        if (out_x) {
+            *out_x = x;
+        }
+        if (out_y) {
+            *out_y = y;
+        }
+    }
+    return pressed;
 }
 
 bool set_i2c_bit(I2cDevice& device, uint8_t reg, uint8_t bit, bool enabled)
@@ -588,6 +647,7 @@ void init_power_and_reset_panel()
     vTaskDelay(pdMS_TO_TICKS(10));
 
     init_head_touch();
+    init_display_touch();
     init_robot_body_power();
 }
 
@@ -1994,24 +2054,36 @@ void publish_event(const char* event, const char* source, const char* request_id
     publish_json(g_topic_events, payload);
 }
 
-void publish_touch_event(const char* event, uint8_t raw, bool pressed)
+void publish_touch_event(const char* event, const char* source, uint8_t raw, bool pressed, int x, int y)
 {
     char payload[640] = {};
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
-                  "\"event\":\"%s\",\"source\":\"head_touch\",\"uptime_ms\":%lld,"
-                  "\"touch\":{\"ready\":%s,\"pressed\":%s,\"raw\":%u},"
+                  "\"event\":\"%s\",\"source\":\"%s\",\"uptime_ms\":%lld,"
+                  "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
+                  "\"pressed\":%s,\"raw\":%u,\"x\":%d,\"y\":%d},"
                   "\"message\":\"%s\"}",
                   CONFIG_STACKCHAN_PAIR_ID,
                   CONFIG_STACKCHAN_STACKCHAN_ID,
                   event,
+                  source && *source ? source : "touch",
                   static_cast<long long>(esp_timer_get_time() / 1000),
+                  (g_head_touch_ready || g_display_touch_ready) ? "true" : "false",
                   g_head_touch_ready ? "true" : "false",
+                  g_display_touch_ready ? "true" : "false",
                   pressed ? "true" : "false",
                   static_cast<unsigned>(raw),
+                  x,
+                  y,
                   pressed ? "head touch pressed" : "head touch released");
-    ESP_LOGI(kTag, "touch event=%s raw=0x%02x pressed=%s", event, raw, pressed ? "true" : "false");
+    ESP_LOGI(kTag, "touch event=%s source=%s raw=0x%02x pressed=%s x=%d y=%d",
+             event,
+             source && *source ? source : "touch",
+             raw,
+             pressed ? "true" : "false",
+             x,
+             y);
     publish_json(g_topic_events, payload);
 }
 
@@ -2041,7 +2113,8 @@ void publish_status()
                   "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\","
                   "\"recording\":%s,\"recording_source\":\"%s\",\"recording_started_ms\":%lld,"
                   "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d},"
-                  "\"touch\":{\"ready\":%s,\"pressed\":%s,\"raw\":%d},"
+                  "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
+                  "\"pressed\":%s,\"raw\":%d,\"x\":%d,\"y\":%d},"
                   "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
                   "\"led\":{\"mode\":\"%s\",\"mode_id\":%d,\"r\":%d,\"g\":%d,\"b\":%d,\"ready\":%s},"
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
@@ -2080,9 +2153,13 @@ void publish_status()
                   static_cast<int>(g_recording_min_ms),
                   static_cast<int>(g_recording_silence_timeout_ms),
                   static_cast<int>(g_recording_max_ms),
+                  (g_head_touch_ready || g_display_touch_ready) ? "true" : "false",
                   g_head_touch_ready ? "true" : "false",
+                  g_display_touch_ready ? "true" : "false",
                   g_touch_pressed ? "true" : "false",
                   static_cast<int>(g_touch_raw),
+                  static_cast<int>(g_touch_x),
+                  static_cast<int>(g_touch_y),
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
@@ -2761,20 +2838,42 @@ void touch_event_task(void*)
     int stable_count = 0;
     bool stable_pressed = false;
     uint8_t last_debug_raw = 0;
+    int last_debug_x = -1;
+    int last_debug_y = -1;
     int64_t last_debug_ms = 0;
+    char active_source[16] = "none";
     while (true) {
-        uint8_t raw = 0;
-        const bool pressed = read_head_touch_pressed(&raw);
+        uint8_t head_raw = 0;
+        uint8_t display_points = 0;
+        int x = -1;
+        int y = -1;
+        const bool head_pressed = read_head_touch_pressed(&head_raw);
+        const bool display_pressed = read_display_touch_pressed(&x, &y, &display_points);
+        const bool pressed = head_pressed || display_pressed;
+        const uint8_t raw = head_pressed ? head_raw : display_points;
+        const char* source = head_pressed ? "head_touch" : (display_pressed ? "display_touch" : active_source);
         g_touch_raw = raw;
+        g_touch_x = display_pressed ? x : -1;
+        g_touch_y = display_pressed ? y : -1;
         const int64_t now_ms = esp_timer_get_time() / 1000;
-        if (raw != last_debug_raw || now_ms - last_debug_ms >= 1000) {
-            ESP_LOGI(kTag, "touch sample raw=0x%02x pressed=%s stable=%s ready=%s",
-                     raw,
+        if (raw != last_debug_raw || x != last_debug_x || y != last_debug_y || now_ms - last_debug_ms >= 1000) {
+            ESP_LOGI(kTag, "touch sample source=%s head_raw=0x%02x display_points=%u x=%d y=%d pressed=%s stable=%s head_ready=%s display_ready=%s",
+                     source,
+                     head_raw,
+                     static_cast<unsigned>(display_points),
+                     x,
+                     y,
                      pressed ? "true" : "false",
                      stable_pressed ? "true" : "false",
-                     g_head_touch_ready ? "true" : "false");
+                     g_head_touch_ready ? "true" : "false",
+                     g_display_touch_ready ? "true" : "false");
             last_debug_raw = raw;
+            last_debug_x = x;
+            last_debug_y = y;
             last_debug_ms = now_ms;
+        }
+        if (pressed && !stable_pressed) {
+            copy_cstr(active_source, sizeof(active_source), source);
         }
         if (pressed == last_pressed) {
             stable_count++;
@@ -2786,7 +2885,15 @@ void touch_event_task(void*)
         if (stable_count >= 2 && pressed != stable_pressed) {
             stable_pressed = pressed;
             g_touch_pressed = pressed;
-            publish_touch_event(pressed ? "touch_down" : "touch_up", raw, pressed);
+            publish_touch_event(pressed ? "touch_down" : "touch_up",
+                                pressed ? source : active_source,
+                                raw,
+                                pressed,
+                                display_pressed ? x : -1,
+                                display_pressed ? y : -1);
+            if (!pressed) {
+                copy_cstr(active_source, sizeof(active_source), "none");
+            }
             publish_status();
         }
         vTaskDelay(pdMS_TO_TICKS(25));
