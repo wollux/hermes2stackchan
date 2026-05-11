@@ -13,6 +13,15 @@ This public slice supports direct MQTT hardware control. Hermes may request acti
 
 ## Actions
 
+### response contract
+
+For normal answers, direct messages, reminders, notifications, and command
+confirmations, put the spoken text in the top-level `reply` field.
+
+Do not use `say` for normal replies. The bridge handles `reply` by showing text
+and generating TTS when TTS is enabled. Use `display` only for extra visible text
+that should appear in addition to the spoken `reply`.
+
 ### display
 
 Publishes to `hermes-stackchan/desk/cmd/display`.
@@ -209,14 +218,14 @@ Bridge processing:
 5. Publish valid actions to `hermes-stackchan/desk/cmd/*`.
 6. Generate TTS for the final reply and return `tts_url` to StackChan.
 
-Hermes must return JSON only:
+Hermes must return JSON only. Put the answer in `reply`; do not use `say` for
+the spoken answer:
 
 ```json
 {
   "reply": "Mache ich.",
   "follow_up_listen": false,
   "actions": [
-    {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 65},
     {"action": "move", "pitch_target_pct": 55}
   ]
@@ -325,7 +334,6 @@ Hermes HTTP responses consumed by the bridge must be JSON:
 {
   "reply": "Kurz und freundlich antworten.",
   "actions": [
-    {"action": "say", "text": "Kurz und freundlich antworten.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 70}
   ]
 }

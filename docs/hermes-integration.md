@@ -24,14 +24,13 @@ This is the reproducible V1.0 integration path for one Hermes and one StackChan.
 {
   "reply": "Mache ich.",
   "actions": [
-    {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 70}
   ]
 }
 ```
 
-8. Bridge publishes valid actions to MQTT.
-9. Bridge creates TTS for `reply` and returns `tts_url`.
+8. Bridge publishes valid hardware/display actions to MQTT.
+9. Bridge creates TTS for `reply` and returns or sends a `tts_url`.
 10. StackChan plays the returned WAV.
 
 ## Required `.env`

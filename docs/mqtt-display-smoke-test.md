@@ -204,7 +204,7 @@ scripts/h2s_bridge.sh ask-hermes \
   --show-response
 ```
 
-Hermes is instructed to return JSON only. If it still returns plain text, the bridge falls back to a `say` action so StackChan can show the answer instead of doing nothing.
+Hermes is instructed to return JSON only and put the spoken answer in the top-level `reply` field. For external Hermes-triggered messages the bridge shows `reply` with `display` and then sends TTS, so Hermes should not use `say` for normal answers.
 
 ## Firmware Setup
 

@@ -44,6 +44,7 @@ from bridge.hermes2stackchan_bridge import (
     parse_hermes_action_response,
     parse_env_file,
     should_listen_for_followup,
+    build_hermes_messages,
     status_allows_life_animation,
 )
 
@@ -243,6 +244,17 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(parsed["actions"][0]["action"], "say")
         self.assertEqual(parsed["actions"][0]["text"], "Hallo Wolfgang.")
+
+    def test_hermes_prompt_forbids_say_for_normal_replies(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        messages = build_hermes_messages(pair, "", "", {}, "Sag hallo.")
+        system_text = messages[0]["content"]
+
+        self.assertIn("Do not use action say", system_text)
+        self.assertNotIn("Use action say", system_text)
+        self.assertIn("top-level reply", system_text)
 
     def test_external_tts_reply_uses_display_instead_of_say(self) -> None:
         actions = external_reply_actions(

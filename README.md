@@ -433,7 +433,6 @@ Expected Hermes JSON shape:
   "reply": "Hallo, ich bin bereit.",
   "follow_up_listen": false,
   "actions": [
-    {"action": "say", "text": "Hallo, ich bin bereit.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 70}
   ]
 }
