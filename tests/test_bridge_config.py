@@ -434,6 +434,7 @@ class BridgeConfigTests(unittest.TestCase):
             "surprise_pop",
             "happy_squint",
             "look_behind",
+            "desk_spin",
             "reset_grin",
         ]:
             self.assertIn(name, LIFE_VARIANT_NAMES)
@@ -584,6 +585,11 @@ class BridgeConfigTests(unittest.TestCase):
             for delay, motion in motions
             if any(abs(point["yaw_pct"]) >= 60 for point in motion["points"])
         ]
+        desk_spins = [
+            motion
+            for _delay, motion in motions
+            if motion.get("variant") == "desk_spin"
+        ]
         vertical_motion = [
             (delay, motion)
             for delay, motion in motions
@@ -597,15 +603,16 @@ class BridgeConfigTests(unittest.TestCase):
         ]
 
         self.assertTrue(big_horizontal)
+        self.assertTrue(desk_spins)
         self.assertTrue(vertical_motion)
         self.assertGreaterEqual(len(big_faces), (len(big_horizontal) + len(vertical_motion)))
         self.assertLess(len(big_horizontal), len(motions))
         for delay, motion in big_horizontal + vertical_motion:
             self.assertGreaterEqual(delay, 0)
-            self.assertLessEqual(motion["speed_pct"], 34)
+            self.assertLessEqual(motion["speed_pct"], 45)
             for point in motion["points"]:
                 self.assertLessEqual(abs(point["yaw_pct"]), 75)
-                self.assertLessEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT + 18)
+                self.assertLessEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT + 22)
                 self.assertGreaterEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT - 30)
 
     def test_life_motion_returns_to_high_idle_pose(self) -> None:

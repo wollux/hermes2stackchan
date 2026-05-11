@@ -1378,6 +1378,41 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
             ], 32, variant=name)),
             (1450, life_face(mood, base_intensity, name)),
         ]
+    if name == "desk_spin":
+        side = rng.choice([-1, 1])
+        return [
+            (0, life_face("surprise_pop", high, name)),
+            (
+                140,
+                life_motion(
+                    [
+                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 420, 42),
+                        motion_point(56 * side, DEFAULT_IDLE_PITCH_PCT + 11, 70, 45),
+                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 20, 70, 45),
+                        motion_point(-4 * side, DEFAULT_IDLE_PITCH_PCT + 22, 70, 45),
+                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 18, 70, 45),
+                        motion_point(-60 * side, DEFAULT_IDLE_PITCH_PCT + 9, 70, 45),
+                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 3, 70, 45),
+                        motion_point(-50 * side, DEFAULT_IDLE_PITCH_PCT - 14, 70, 45),
+                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 21, 70, 45),
+                        motion_point(13 * side, DEFAULT_IDLE_PITCH_PCT - 22, 70, 45),
+                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 16, 70, 45),
+                        motion_point(63 * side, DEFAULT_IDLE_PITCH_PCT - 6, 70, 45),
+                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 70, 45),
+                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 20, 70, 45),
+                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 18, 70, 45),
+                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 3, 70, 45),
+                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 21, 70, 45),
+                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 16, 70, 45),
+                        motion_point(0, DEFAULT_IDLE_PITCH_PCT, 420, 38),
+                    ],
+                    45,
+                    variant=name,
+                ),
+            ),
+            (1200, life_face("happy_squint", high, name)),
+            (1600, life_face(mood, base_intensity, name)),
+        ]
     if name == "drama_blink":
         return [(0, life_face("blink", low, name)), (520, life_face("surprise_pop", high, name))]
     if name == "shy_lookaway":
@@ -1486,14 +1521,14 @@ CURATED_LIFE_VARIANT_NAMES = [
     "look_up_think", "look_down_table", "wink_left", "wink_right", "deep_breathe",
     "mouth_wiggle", "micro_sleep", "surprise_pop", "cheeky_grin", "question_glance",
     "nervous_flick", "happy_squint", "grumble_mouth", "scanner_eyes", "yawn_hint",
-    "look_behind", "drama_blink", "shy_lookaway", "proud_lift", "bored_sigh",
+    "look_behind", "desk_spin", "drama_blink", "shy_lookaway", "proud_lift", "bored_sigh",
     "sneaky_side_eye", "tiny_laugh", "confused_scan", "sleepy_recover", "reset_grin",
 ]
 
 
 def build_life_variants() -> list[LifeVariant]:
     variants: list[LifeVariant] = []
-    rare_names = {"micro_sleep", "surprise_pop", "look_behind", "drama_blink", "yawn_hint", "sleepy_recover"}
+    rare_names = {"micro_sleep", "surprise_pop", "look_behind", "desk_spin", "drama_blink", "yawn_hint", "sleepy_recover"}
     for name in CURATED_LIFE_VARIANT_NAMES:
         variants.append(LifeVariant(
             name=name,
@@ -1532,7 +1567,7 @@ def build_life_variants() -> list[LifeVariant]:
         name = f"gen_breath_{style}_{index}"
         variants.append(LifeVariant(name, 3.2, style == "sleepy", 7.0 if style != "sleepy" else 45.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
 
-    head_specs = ["left", "right", "up", "down", "scan", "left", "right", "up", "down", "scan"]
+    head_specs = ["left", "right", "up", "down", "scan", "left", "right", "up", "down"]
     for index, direction in enumerate(head_specs):
         name = f"gen_head_{direction}_{index}"
         variants.append(LifeVariant(name, 1.6 if direction != "scan" else 0.8, direction == "scan", 12.0 if direction != "scan" else 40.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
@@ -1576,7 +1611,7 @@ LIFE_VARIANT_CATEGORIES: dict[str, list[LifeVariant]] = {
         lambda name: (name.startswith("gen_head_") and "_scan_" not in name)
     ),
     "big_head": life_variants_matching(
-        lambda name: name in {"look_behind", "shy_lookaway", "proud_lift"}
+        lambda name: name in {"look_behind", "desk_spin", "shy_lookaway", "proud_lift"}
         or (name.startswith("gen_head_") and "_scan_" in name)
     ),
     "rare_gag": life_variants_matching(
