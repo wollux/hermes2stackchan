@@ -1029,6 +1029,49 @@ void wake_display_if_needed()
     }
 }
 
+void shutdown_stackchan()
+{
+    ESP_LOGI(kTag, "stackchan shutdown requested; asking AXP2101 PMIC to power off");
+    g_wakeword_enabled = false;
+    g_recording = false;
+    g_tts_playing = false;
+    std::snprintf(g_ui_mode, sizeof(g_ui_mode), "shutdown");
+    g_face_extra_mode = FaceExtraMode::None;
+
+    set_neon_range(0, 12, 0, 0, 0);
+    show_neon_pixels();
+    set_servo_vm_power(false);
+    draw_face("sad", 65);
+    vTaskDelay(pdMS_TO_TICKS(450));
+    set_lcd_sleep(true);
+
+    if (!g_pmic) {
+        ESP_LOGW(kTag, "AXP2101 power off requested but PMIC is not available");
+        draw_face("error", 55);
+        return;
+    }
+
+    uint8_t reg10 = 0;
+    esp_err_t err = g_pmic->try_read_reg(0x10, reg10);
+    if (err == ESP_OK) {
+        ESP_LOGI(kTag, "AXP2101 power off: reg10 0x%02x -> 0x%02x", reg10, reg10 | 0x01);
+        err = g_pmic->try_write_reg(0x10, reg10 | 0x01);
+    } else {
+        ESP_LOGW(kTag, "AXP2101 power off requested but reg10 read failed: %s", esp_err_to_name(err));
+        err = g_pmic->try_write_reg(0x10, 0x01);
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "AXP2101 power off write failed: %s", esp_err_to_name(err));
+        draw_face("error", 55);
+        return;
+    }
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void draw_rect(int x, int y, int w, int h, uint16_t color)
 {
     if (w <= 0 || h <= 0) {
@@ -2900,6 +2943,29 @@ void publish_status()
     publish_json(g_topic_status, payload, 1, 1);
 }
 
+void execute_post_tts_system_action(const char* action)
+{
+    if (!action || !*action) {
+        return;
+    }
+    if (std::strcmp(action, "display_sleep") == 0) {
+        set_lcd_sleep(true);
+        publish_status();
+    } else if (std::strcmp(action, "display_wake") == 0) {
+        set_lcd_sleep(false);
+        publish_status();
+    } else if (std::strcmp(action, "shutdown") == 0 || std::strcmp(action, "power_off") == 0) {
+        publish_status();
+        shutdown_stackchan();
+    } else if (std::strcmp(action, "reboot") == 0) {
+        publish_status();
+        vTaskDelay(pdMS_TO_TICKS(250));
+        esp_restart();
+    } else {
+        ESP_LOGW(kTag, "unsupported post-tts system action: %s", action);
+    }
+}
+
 bool append_motion_point(MotionCommand& command, int yaw_pct, int pitch_pct,
                          int duration_ms, int speed_pct, int hold_ms)
 {
@@ -3636,7 +3702,9 @@ void handle_system_command(const char* data, int len)
     const char* request_id = json_string(root, "request_id");
     const char* action = json_string(root, "action");
 
-    if (std::strcmp(action, "ping") == 0) {
+    if (!action || !*action) {
+        publish_error(request_id, "system", "action is required");
+    } else if (std::strcmp(action, "ping") == 0) {
         publish_ack(request_id, "system", "pong");
     } else if (std::strcmp(action, "status") == 0) {
         publish_ack(request_id, "system", "status published");
@@ -3655,6 +3723,13 @@ void handle_system_command(const char* data, int len)
         set_lcd_sleep(false);
         publish_ack(request_id, "system", "display awake");
         publish_status();
+    } else if (std::strcmp(action, "shutdown") == 0 || std::strcmp(action, "power_off") == 0) {
+        publish_ack(request_id, "system", "shutting down");
+        publish_status();
+        cJSON_Delete(root);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        shutdown_stackchan();
+        return;
     } else if (std::strcmp(action, "take_photo") == 0) {
         auto* args = static_cast<PhotoTaskArgs*>(std::malloc(sizeof(PhotoTaskArgs)));
         if (!args) {
@@ -3784,6 +3859,13 @@ bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request
         play_wav_url(tts_url);
     } else {
         ESP_LOGW(kTag, "voice upload response has no tts_url");
+    }
+    char post_tts_system_action[32] = {};
+    if (extract_json_string(response->data,
+                            "post_tts_system_action",
+                            post_tts_system_action,
+                            sizeof(post_tts_system_action))) {
+        execute_post_tts_system_action(post_tts_system_action);
     }
     return true;
 }

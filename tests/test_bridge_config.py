@@ -28,6 +28,7 @@ from bridge.hermes2stackchan_bridge import (
     build_power_followup_actions,
     build_reminder,
     build_touch_lamp_payload,
+    direct_system_command_from_transcript,
     due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
     DEFAULT_IDLE_YAW_PCT,
@@ -45,6 +46,7 @@ from bridge.hermes2stackchan_bridge import (
     pending_reminders,
     reminder_actions,
     schedule_reminders_from_actions,
+    split_post_tts_system_actions,
     parse_hermes_action_response,
     parse_env_file,
     should_listen_for_followup,
@@ -443,6 +445,44 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], "req-001")
         self.assertEqual(payload["yaw_target_pct"], 25)
         self.assertEqual(payload["pitch_target_pct"], 0)
+
+    def test_system_sleep_wake_shutdown_actions_to_topic_payload(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        for action_name in ("display_sleep", "display_wake", "shutdown", "power_off"):
+            topic, payload = action_to_topic_payload(
+                pair,
+                {"action": "system", "system_action": action_name},
+                f"system-{action_name}",
+            )
+            self.assertEqual(topic, "hermes-stackchan/desk/cmd/system")
+            self.assertEqual(payload["request_id"], f"system-{action_name}")
+            self.assertEqual(payload["action"], action_name)
+
+    def test_direct_spoken_system_commands(self) -> None:
+        self.assertEqual(
+            direct_system_command_from_transcript("Geh schlafen.")[:2],
+            ("Ich schlafe jetzt.", []),
+        )
+        self.assertEqual(direct_system_command_from_transcript("Geh schlafen.")[2], "display_sleep")
+        self.assertEqual(direct_system_command_from_transcript("StackChan runterfahren.")[2], "shutdown")
+        self.assertEqual(direct_system_command_from_transcript("Wach auf.")[1][0]["system_action"], "display_wake")
+        self.assertIsNone(direct_system_command_from_transcript("Kannst du schlafen?"))
+        self.assertIsNone(direct_system_command_from_transcript("Bitte nicht schlafen."))
+        self.assertIsNone(direct_system_command_from_transcript("Radio abschalten."))
+
+    def test_split_post_tts_system_actions(self) -> None:
+        actions, post_tts = split_post_tts_system_actions(
+            [
+                {"action": "face", "emotion": "sad"},
+                {"action": "system", "system_action": "shutdown"},
+                {"action": "led", "mode": "off"},
+            ]
+        )
+
+        self.assertEqual(post_tts, "shutdown")
+        self.assertEqual([action["action"] for action in actions], ["face", "led"])
 
     def test_battery_snapshot_accepts_status_aliases(self) -> None:
         snapshot = battery_snapshot(

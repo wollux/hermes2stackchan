@@ -290,7 +290,7 @@ Use these through Hermes JSON actions or through bridge helper commands:
 - `device`: brightness, volume, display sleep/wake, persistent settings where
   supported
 - `audio`: play a TTS URL
-- `system`: restart/reset/sleep style commands when implemented
+- `system`: ping/status, display sleep/wake, reboot, and explicit shutdown
 - `system take_photo`: request a StackChan photo when camera firmware is available
 - `reminder` or `notify`: schedule bridge reminders if the user asks for them
 
@@ -410,6 +410,9 @@ run correctly. Do not confuse that warning with StackChan notify audio failure.
 
 - Never print keys from `.env`.
 - Do not reboot the Pi or StackChan unless explicitly asked.
+- Do not shut StackChan down unless Wollux explicitly says to power off,
+  runterfahren, abschalten, or ausschalten. Sleep/display-off uses
+  `display_sleep`, not `shutdown`.
 - Do not restart services just to inspect state.
 - Do not claim live playback unless `/stackchan/notify` succeeded and StackChan
   fetched the TTS WAV.

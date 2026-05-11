@@ -27,7 +27,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Expressive motion commands for nodding, shaking, scans, circles, and Hermes-selected motion profiles.
 - LED/neon commands and recording-level LED feedback.
 - Speaker volume and local tone test commands.
-- Display brightness, display sleep, display wake, reboot, ping, and status commands.
+- Display brightness, display sleep, display wake, shutdown, reboot, ping, and status commands.
 - Battery and power status in retained MQTT state.
 - Power watcher reactions for plug/unplug without taking over LEDs.
 - Temperature fields for SoC and servos where available.
@@ -402,8 +402,13 @@ scripts/h2s_bridge.sh send-led --pair desk --mode party --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --volume-pct 80 --brightness-pct 70 --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --display-sleep --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --display-wake --wait-ack
+scripts/h2s_bridge.sh send-system --pair desk --action shutdown --wait-ack
 scripts/h2s_bridge.sh send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
 ```
+
+`display_sleep` only turns the display/backlight off and keeps StackChan alive.
+`display_wake` wakes the display. `shutdown` is a real power-off request through
+the AXP2101 PMIC, so use it only when you really want StackChan to turn off.
 
 Retained device settings:
 

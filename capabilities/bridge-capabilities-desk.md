@@ -377,7 +377,12 @@ answer.
 
 Publishes to `hermes-stackchan/desk/cmd/system`.
 
-Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`.
+Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`, `shutdown`, `power_off`.
+
+Use `display_sleep` when the user wants StackChan to sleep or turn only the
+screen off. Use `display_wake` for wake/display-on commands. Use `shutdown`
+only for explicit power-off/runterfahren/abschalten commands; it asks the
+AXP2101 PMIC to turn StackChan off after any voice reply has finished.
 
 ## Status
 

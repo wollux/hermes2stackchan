@@ -964,6 +964,7 @@ def build_hermes_system_content(
         "If your reply is only a statement, command confirmation, or rhetorical question, set follow_up_listen to false.",
         "For reminders or notifications, use action reminder with text and delay_s or due_at. Example: {\"action\":\"reminder\",\"text\":\"Wasser trinken\",\"delay_s\":120}.",
         "If the user only says 'erinnere mich' without enough time or content, ask what/when and set follow_up_listen to true; do not invent reminder details.",
+        "For explicit StackChan sleep commands use {\"action\":\"system\",\"system_action\":\"display_sleep\"}. For wake/display-on commands use display_wake. For explicit power-off/shutdown/runterfahren/abschalten commands use {\"action\":\"system\",\"system_action\":\"shutdown\"}; never use shutdown for ordinary sleep.",
         "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
         f"Current StackChan status JSON: {status_text}",
     ]
@@ -1278,13 +1279,14 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["enabled"] = parse_bool_value(action.get("enabled"), True)
         return pair.audio_topic, with_request_id(payload, action_request_id)
 
-    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake", "take_photo", "photo", "camera"}:
+    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake", "shutdown", "power_off", "take_photo", "photo", "camera"}:
         system_action = optional_string(action.get("system_action") or action.get("command"))
         if name != "system":
             system_action = "take_photo" if name in {"photo", "camera"} else name
         if not system_action:
             raise ConfigError("system action needs system_action or command")
-        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake", "take_photo"}:
+        system_action = system_action.strip().lower().replace("-", "_")
+        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake", "shutdown", "power_off", "take_photo"}:
             raise ConfigError(f"unsupported system action: {system_action}")
         return pair.system_topic, with_request_id({"action": system_action}, action_request_id)
 
@@ -1322,6 +1324,7 @@ def parse_bool_value(value: Any, default: bool) -> bool:
 
 
 REMINDER_ACTIONS = {"reminder", "notify", "notification", "remind"}
+POST_TTS_SYSTEM_ACTIONS = {"display_sleep", "shutdown", "power_off"}
 
 
 def action_name(action: dict[str, Any]) -> str:
@@ -1329,6 +1332,104 @@ def action_name(action: dict[str, Any]) -> str:
     if not isinstance(raw_name, str) or not raw_name.strip():
         return ""
     return raw_name.strip().lower().replace("-", "_")
+
+
+def normalize_spoken_command_text(text: str) -> str:
+    translation = str.maketrans(
+        {
+            "ä": "ae",
+            "ö": "oe",
+            "ü": "ue",
+            "ß": "ss",
+            "Ä": "ae",
+            "Ö": "oe",
+            "Ü": "ue",
+        }
+    )
+    normalized = text.translate(translation).lower()
+    for char in ".,!?;:()[]{}\"'`´":
+        normalized = normalized.replace(char, " ")
+    return " ".join(normalized.split())
+
+
+def direct_system_command_from_transcript(text: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    normalized = normalize_spoken_command_text(text)
+    if not normalized:
+        return None
+    command = normalized
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("bitte ", "computer ", "stackchan ", "stack chan "):
+            if command.startswith(prefix):
+                command = command[len(prefix):].strip()
+                changed = True
+    if any(negative in f" {normalized} " for negative in (" nicht ", " kein ", " keine ")):
+        return None
+    if any(media in f" {normalized} " for media in (" radio ", " musik ", " lautstaerke ", " lampe ", " led ")):
+        return None
+
+    def is_command_phrase(phrase: str) -> bool:
+        return command == phrase or command.startswith(f"{phrase} ")
+
+    shutdown_phrases = (
+        "runterfahren",
+        "fahre runter",
+        "fahr runter",
+        "herunterfahren",
+        "abschalten",
+        "ausschalten",
+        "schalte dich ab",
+        "mach dich aus",
+        "power off",
+        "shutdown",
+    )
+    if any(is_command_phrase(phrase) for phrase in shutdown_phrases):
+        return "Ich fahre jetzt runter.", [], "shutdown"
+
+    sleep_phrases = (
+        "geh schlafen",
+        "gehe schlafen",
+        "schlafen",
+        "schlaf ein",
+        "schlafmodus",
+        "bildschirm aus",
+        "display aus",
+        "mach den bildschirm aus",
+    )
+    if any(is_command_phrase(phrase) for phrase in sleep_phrases):
+        return "Ich schlafe jetzt.", [], "display_sleep"
+
+    wake_phrases = (
+        "wach auf",
+        "aufwachen",
+        "weck auf",
+        "bildschirm an",
+        "display an",
+        "mach den bildschirm an",
+    )
+    if any(is_command_phrase(phrase) for phrase in wake_phrases):
+        return "Bin wach.", [{"action": "system", "system_action": "display_wake"}], ""
+
+    return None
+
+
+def split_post_tts_system_actions(actions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    kept: list[dict[str, Any]] = []
+    post_tts_system_action = ""
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        name = action_name(action)
+        system_action = optional_string(action.get("system_action") or action.get("command"))
+        if name != "system":
+            system_action = "shutdown" if name == "power_off" else name
+        system_action = (system_action or "").strip().lower().replace("-", "_")
+        if system_action in POST_TTS_SYSTEM_ACTIONS:
+            post_tts_system_action = "shutdown" if system_action == "power_off" else system_action
+            continue
+        kept.append(action)
+    return kept, post_tts_system_action
 
 
 def reminder_store_path(config: BridgeConfig) -> Path:
@@ -4261,6 +4362,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             stt_started = time.monotonic()
             transcript, backend = transcribe_audio_bytes(audio, self.server.config.speech)
             stt_ms = round((time.monotonic() - stt_started) * 1000)
+            post_tts_system_action = ""
             if not transcript:
                 display_text = "NICHTS VERSTANDEN"
                 hermes_response: dict[str, Any] = {"reply": display_text, "actions": [{"action": "say", "text": display_text, "emotion": "question"}]}
@@ -4270,34 +4372,49 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 mqtt_ms = 0
                 action_count = 0
             else:
-                status_started = time.monotonic()
-                status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
-                status_ms = round((time.monotonic() - status_started) * 1000)
-                capabilities = read_optional_text(
-                    self.server.pair.capabilities_file,
-                    self.server.config_path,
-                )
-                personality = read_optional_text(
-                    self.server.pair.personality_file,
-                    self.server.config_path,
-                )
-                hermes_started = time.monotonic()
-                hermes_response = ask_hermes_http(
-                    self.server.config,
-                    self.server.pair,
-                    capabilities,
-                    personality,
-                    status,
-                    transcript,
-                )
-                hermes_ms = round((time.monotonic() - hermes_started) * 1000)
-                actions = ensure_reply_action(hermes_response)
-                actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
-                    self.server.config,
-                    self.server.pair,
-                    actions,
-                    f"speech-reminder-{request_id}",
-                )
+                direct_command = direct_system_command_from_transcript(transcript)
+                if direct_command:
+                    display_text, actions, post_tts_system_action = direct_command
+                    hermes_response = {"reply": display_text, "actions": actions}
+                    hermes_ms = 0
+                    status_ms = 0
+                    scheduled_reminders = []
+                    reminder_errors = []
+                    print(
+                        f"[bridge-http] local system command request_id={request_id}: "
+                        f"post_tts={post_tts_system_action or '-'} actions={len(actions)}",
+                        flush=True,
+                    )
+                else:
+                    status_started = time.monotonic()
+                    status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
+                    status_ms = round((time.monotonic() - status_started) * 1000)
+                    capabilities = read_optional_text(
+                        self.server.pair.capabilities_file,
+                        self.server.config_path,
+                    )
+                    personality = read_optional_text(
+                        self.server.pair.personality_file,
+                        self.server.config_path,
+                    )
+                    hermes_started = time.monotonic()
+                    hermes_response = ask_hermes_http(
+                        self.server.config,
+                        self.server.pair,
+                        capabilities,
+                        personality,
+                        status,
+                        transcript,
+                    )
+                    hermes_ms = round((time.monotonic() - hermes_started) * 1000)
+                    actions = ensure_reply_action(hermes_response)
+                    actions, post_tts_system_action = split_post_tts_system_actions(actions)
+                    actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+                        self.server.config,
+                        self.server.pair,
+                        actions,
+                        f"speech-reminder-{request_id}",
+                    )
                 action_messages, action_errors = actions_to_topic_payloads(
                     self.server.pair,
                     actions,
@@ -4337,23 +4454,23 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     f"[bridge-http] ignored invalid Hermes actions request_id={request_id}: {action_errors}",
                     flush=True,
                 )
-            self.send_json(
-                200,
-                {
-                    "ok": bool(display_text),
-                    "request_id": request_id,
-                    "tts_path": tts_path,
-                    "tts_url": tts_url,
-                    "reply": display_text[:240],
-                    "follow_up_listen": follow_up_listen,
-                    "follow_up_source": "hermes_question" if follow_up_listen else "",
-                    "stt_ms": stt_ms,
-                    "hermes_ms": hermes_ms,
-                    "tts_ms": tts_ms,
-                    "total_ms": total_ms,
-                    "actions_published": action_count,
-                },
-            )
+            response_payload = {
+                "ok": bool(display_text),
+                "request_id": request_id,
+                "tts_path": tts_path,
+                "tts_url": tts_url,
+                "reply": display_text[:240],
+                "follow_up_listen": follow_up_listen,
+                "follow_up_source": "hermes_question" if follow_up_listen else "",
+                "stt_ms": stt_ms,
+                "hermes_ms": hermes_ms,
+                "tts_ms": tts_ms,
+                "total_ms": total_ms,
+                "actions_published": action_count,
+            }
+            if post_tts_system_action:
+                response_payload["post_tts_system_action"] = post_tts_system_action
+            self.send_json(200, response_payload)
         except Exception as exc:
             error_text = f"SPRACHBRIDGE FEHLER: {exc}"
             print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
@@ -4732,7 +4849,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     system = subcommands.add_parser("send-system", help="Send a system action.")
     add_common_send_options(system)
-    system.add_argument("--action", required=True, choices=["ping", "status", "reboot", "display_sleep", "display_wake"])
+    system.add_argument(
+        "--action",
+        required=True,
+        choices=["ping", "status", "reboot", "display_sleep", "display_wake", "shutdown", "power_off"],
+    )
     system.set_defaults(func=send_system)
 
     raw = subcommands.add_parser("send-raw", help="Send a raw JSON payload to a cmd/* topic inside the pair namespace.")
