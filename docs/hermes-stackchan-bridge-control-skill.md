@@ -123,6 +123,43 @@ Expected success:
 - Bridge publishes `cmd/display` with `mode:"image"`
 - StackChan fetches `/stackchan/images/...jpg`, decodes JPEG locally, and shows the image.
 
+## Internet Image Search Endpoint
+
+When the user asks for an image from the internet and gives no direct URL, call
+the bridge search endpoint or emit an `image_search` action. The bridge searches
+Openverse, prefers images close to StackChan's 4:3 display ratio, converts the
+chosen image to a 320x240 JPEG, and sends it to StackChan.
+
+Hermes action:
+
+```json
+{
+  "action": "image_search",
+  "query": "polar lights over iceland",
+  "caption": "Polarlicht",
+  "duration_ms": 9000
+}
+```
+
+HTTP:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8788/stackchan/search-image \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"polar lights over iceland","caption":"Polarlicht","duration_ms":9000}'
+```
+
+StackChan display payload after conversion:
+
+```json
+{
+  "mode": "image",
+  "format": "jpeg",
+  "width": 320,
+  "height": 240
+}
+```
+
 ## Camera Photo Endpoint
 
 The bridge accepts direct camera uploads:

@@ -50,6 +50,7 @@ from bridge.hermes2stackchan_bridge import (
     build_hermes_messages,
     build_hermes_vision_messages,
     image_data_url,
+    image_result_aspect_score,
     rgb565_to_jpeg,
     status_allows_life_animation,
 )
@@ -190,6 +191,14 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["width"], 320)
         self.assertEqual(payload["height"], 240)
         self.assertEqual(payload["request_id"], "img-1")
+
+    def test_image_result_aspect_score_prefers_stackchan_ratio(self) -> None:
+        good = {"width": 1024, "height": 768, "url": "https://example.com/good.jpg"}
+        tall = {"width": 400, "height": 1200, "url": "https://example.com/tall.jpg"}
+        tiny = {"width": 120, "height": 90, "url": "https://example.com/tiny.jpg"}
+
+        self.assertLess(image_result_aspect_score(good), image_result_aspect_score(tall))
+        self.assertLess(image_result_aspect_score(good), image_result_aspect_score(tiny))
 
     def test_hermes_vision_messages_include_data_url(self) -> None:
         config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})

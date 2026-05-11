@@ -63,6 +63,37 @@ Content-Type: application/json
 }
 ```
 
+If the user asks for an image from the internet and does not provide a URL, use
+the bridge image search action. The bridge searches Openverse, prefers results
+close to StackChan's 4:3 display ratio, converts the chosen result to a 320x240
+JPEG preview, and sends it to StackChan.
+
+Hermes action:
+
+```json
+{
+  "action": "image_search",
+  "query": "polar lights over iceland",
+  "caption": "Polarlicht",
+  "duration_ms": 9000
+}
+```
+
+Direct HTTP endpoint:
+
+```http
+POST http://127.0.0.1:8788/stackchan/search-image
+Content-Type: application/json
+```
+
+```json
+{
+  "query": "polar lights over iceland",
+  "caption": "Polarlicht",
+  "duration_ms": 9000
+}
+```
+
 StackChan camera uploads use:
 
 ```http

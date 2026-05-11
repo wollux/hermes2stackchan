@@ -32,6 +32,8 @@ POWER_DISPLAY_DURATION_MS = 5000
 MAX_STACKCHAN_TEXT_CHARS = 700
 MAX_STACKCHAN_DISPLAY_CHARS = 320
 MAX_STACKCHAN_TTS_CHARS = 2500
+STACKCHAN_DISPLAY_ASPECT = 320 / 240
+OPENVERSE_IMAGE_SEARCH_URL = "https://api.openverse.org/v1/images/"
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
 YAW_TARGET_MIN_PCT = -100
@@ -1087,16 +1089,41 @@ def actions_to_topic_payloads(
     actions: list[dict[str, Any]],
     request_id_prefix: str,
     skip_actions: set[str] | None = None,
+    config: BridgeConfig | None = None,
+    handler: http.server.BaseHTTPRequestHandler | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
     messages: list[tuple[str, dict[str, Any]]] = []
     errors: list[str] = []
     skip_actions = skip_actions or set()
     for index, action in enumerate(actions):
+        name = ""
         if isinstance(action, dict):
             name = str(action.get("action") or action.get("type") or action.get("name") or "").strip().lower().replace("-", "_")
             if name in skip_actions:
                 continue
         try:
+            if name in {"search_image", "image_search", "web_image", "internet_image", "net_image"}:
+                if config is None:
+                    raise ConfigError("image_search action needs bridge config")
+                query = optional_string(action.get("query") or action.get("q") or action.get("text") or action.get("prompt"))
+                image_bytes, _content_type, meta = search_openverse_image(
+                    query or "",
+                    config.speech,
+                    parse_int_value(action.get("limit"), 20, "image_search.limit"),
+                )
+                image_info = prepare_stackchan_image(config, handler, image_bytes, f"{request_id_prefix}-{index:02d}")
+                caption = optional_string(action.get("caption")) or query or meta.get("title", "")
+                display_action = {
+                    "action": "display_image",
+                    "url": image_info["url"],
+                    "width": image_info["width"],
+                    "height": image_info["height"],
+                    "format": image_info["format"],
+                    "duration_ms": parse_int_value(action.get("duration_ms"), 9000, "image_search.duration_ms"),
+                    "caption": caption,
+                }
+                messages.append(action_to_topic_payload(pair, display_action, f"{request_id_prefix}-{index:02d}"))
+                continue
             messages.append(action_to_topic_payload(pair, action, f"{request_id_prefix}-{index:02d}"))
         except ConfigError as exc:
             errors.append(str(exc))
@@ -3308,6 +3335,80 @@ def download_image_bytes(url: str, max_bytes: int, timeout_s: float = 12.0) -> t
     return data, content_type
 
 
+def image_result_aspect_score(result: dict[str, Any], target_aspect: float = STACKCHAN_DISPLAY_ASPECT) -> float:
+    width = parse_int(result.get("width"), 0, "image.width")
+    height = parse_int(result.get("height"), 0, "image.height")
+    if width <= 0 or height <= 0:
+        return 500.0
+    aspect = width / height
+    aspect_penalty = abs(math.log(max(aspect, 0.01) / target_aspect)) * 100.0
+    size_penalty = 0.0
+    if width < 320 or height < 240:
+        size_penalty += 60.0
+    if width < 160 or height < 120:
+        size_penalty += 120.0
+    url = optional_string(result.get("url")) or ""
+    if not re_like_image_url(url):
+        size_penalty += 12.0
+    return aspect_penalty + size_penalty
+
+
+def re_like_image_url(url: str) -> bool:
+    clean = urllib.parse.urlsplit(url).path.lower()
+    return clean.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+
+def search_openverse_image(query: str, speech: SpeechConfig, limit: int = 20) -> tuple[bytes, str, dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        raise ConfigError("image search needs query")
+    params = urllib.parse.urlencode({
+        "q": query,
+        "page_size": clamp_int(limit, 1, 20),
+        "mature": "false",
+    })
+    request = urllib.request.Request(
+        f"{OPENVERSE_IMAGE_SEARCH_URL}?{params}",
+        headers={"User-Agent": "hermes2stackchan-bridge/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=speech.timeout_s) as response:
+        payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    results = payload.get("results") if isinstance(payload, dict) else []
+    if not isinstance(results, list) or not results:
+        raise ConfigError(f"no image search results for {query!r}")
+
+    candidates = [item for item in results if isinstance(item, dict) and optional_string(item.get("url"))]
+    candidates.sort(key=image_result_aspect_score)
+    errors: list[str] = []
+    for item in candidates:
+        for url_key in ("url", "thumbnail"):
+            image_url = optional_string(item.get(url_key))
+            if not image_url:
+                continue
+            try:
+                data, content_type = download_image_bytes(image_url, speech.max_image_bytes, speech.timeout_s)
+                if not content_type.startswith("image/"):
+                    raise ConfigError(f"not an image: {content_type}")
+                meta = {
+                    "provider": "openverse",
+                    "query": query,
+                    "title": optional_string(item.get("title")) or "",
+                    "source_url": image_url,
+                    "foreign_landing_url": optional_string(item.get("foreign_landing_url")) or "",
+                    "creator": optional_string(item.get("creator")) or "",
+                    "license": optional_string(item.get("license")) or "",
+                    "license_url": optional_string(item.get("license_url")) or "",
+                    "width": parse_int(item.get("width"), 0, "image.width"),
+                    "height": parse_int(item.get("height"), 0, "image.height"),
+                    "aspect_score": round(image_result_aspect_score(item), 3),
+                }
+                return data, content_type, meta
+            except Exception as exc:
+                errors.append(f"{image_url}: {exc}")
+                continue
+    raise ConfigError(f"image search found results but none were downloadable: {'; '.join(errors[:3])}")
+
+
 def image_bytes_from_payload(payload: dict[str, Any], speech: SpeechConfig) -> tuple[bytes, str, str]:
     data_url = optional_string(payload.get("data_url") or payload.get("image_data_url"))
     if data_url:
@@ -3511,6 +3612,46 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             print(f"[bridge-http] display-image error request_id={request_id}: {exc}", flush=True)
             self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
 
+    def handle_search_image_post(self, request_id: str) -> None:
+        payload = self.read_json_body(request_id, 65536)
+        if payload is None:
+            return
+        started = time.monotonic()
+        request_id = optional_string(payload.get("request_id")) or request_id
+        pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+        query = optional_string(payload.get("query") or payload.get("q") or payload.get("text") or payload.get("prompt"))
+        if not query:
+            self.send_json(400, {"ok": False, "error": "search-image needs query", "request_id": request_id})
+            return
+
+        try:
+            image_bytes, content_type, meta = search_openverse_image(
+                query,
+                self.server.config.speech,
+                parse_int_value(payload.get("limit"), 20, "search-image.limit"),
+            )
+            image_info = prepare_stackchan_image(self.server.config, self, image_bytes, f"search-{request_id}")
+            caption = safe_stackchan_text(optional_string(payload.get("caption")) or query, 80)
+            duration_ms = parse_int_value(payload.get("duration_ms"), 9000, "search-image.duration_ms")
+            pause_life_animation(self.server.pair.pair_id, max(12.0, duration_ms / 1000.0 + 4.0), f"image search {request_id}")
+            self.publish_image_to_stackchan(image_info, f"search-image-{request_id}", caption, duration_ms)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] search-image request_id={request_id} query={query!r} "
+                f"type={content_type} source={meta.get('source_url', '')} total={total_ms}ms",
+                flush=True,
+            )
+            self.send_json(
+                200,
+                {"ok": True, "request_id": request_id, "query": query, "image": image_info, "source": meta, "total_ms": total_ms},
+            )
+        except Exception as exc:
+            print(f"[bridge-http] search-image error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
     def handle_photo_post(self, request_id: str) -> None:
         started = time.monotonic()
         pair_id = (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
@@ -3593,6 +3734,8 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 actions,
                 f"photo-{request_id}",
                 skip_actions={"say"},
+                config=self.server.config,
+                handler=self,
             )
             action_errors.extend(reminder_errors)
             if display_text and not any(
@@ -3676,6 +3819,8 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.server.pair,
                 actions,
                 f"notify-{request_id}",
+                config=self.server.config,
+                handler=self,
             )
             action_messages.append(
                 action_to_topic_payload(
@@ -3769,6 +3914,14 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             ).strip()
             self.handle_display_image_post(request_id)
             return
+        if path in {"/stackchan/search-image", "/hermes/search-image"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_search_image_post(request_id)
+            return
         if path in {"/stackchan/photo", "/hermes/photo"}:
             request_id = (
                 self.headers.get("X-H2S-Request-Id")
@@ -3858,6 +4011,8 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     actions,
                     f"speech-{request_id}",
                     skip_actions={"say"},
+                    config=self.server.config,
+                    handler=self,
                 )
                 action_errors.extend(reminder_errors)
                 publish_started = time.monotonic()
@@ -3938,6 +4093,7 @@ def serve_audio(args: argparse.Namespace) -> int:
     print(f"[bridge-http] endpoint: POST /stackchan/audio (audio/wav)", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/notify (application/json)", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/display-image (application/json)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/search-image (application/json)", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/photo (image/*)", flush=True)
     print(f"[bridge-http] Hermes API: {hermes_chat_url(config.hermes.base_url)}", flush=True)
     print(f"[bridge-http] dispatch Hermes actions to {pair.mqtt_prefix}/cmd/*", flush=True)
