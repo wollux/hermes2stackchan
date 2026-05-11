@@ -1049,9 +1049,25 @@ void draw_voice_waveform_overlay()
     }
 }
 
+void draw_listening_ear_icon()
+{
+    const uint16_t outer = rgb565(120, 245, 210);
+    const uint16_t inner = rgb565(20, 95, 105);
+    const int x = 282;
+    const int y = 22;
+
+    draw_ellipse(x, y + 11, 10, 13, outer);
+    draw_ellipse(x - 1, y + 11, 6, 9, kBlack);
+    draw_ellipse(x + 1, y + 11, 4, 6, inner);
+    draw_line(x - 2, y + 11, x - 5, y + 18, outer, 2);
+    draw_line(x - 5, y + 18, x - 1, y + 23, outer, 2);
+    draw_ellipse(x + 12, y + 11, 2, 2, outer);
+}
+
 void draw_face_extras()
 {
     if (g_face_extra_mode == FaceExtraMode::VoiceWaveform) {
+        draw_listening_ear_icon();
         draw_voice_waveform_overlay();
     }
 }
