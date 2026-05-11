@@ -61,6 +61,7 @@ esp_lcd_panel_io_handle_t g_panel_io = nullptr;
 uint16_t* g_framebuffer = nullptr;
 bool g_framebuffer_active = false;
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
+SemaphoreHandle_t g_i2c_mutex = nullptr;
 EventGroupHandle_t g_wifi_events = nullptr;
 esp_mqtt_client_handle_t g_mqtt_client = nullptr;
 bool g_mqtt_connected = false;
@@ -243,7 +244,9 @@ public:
     esp_err_t try_write_reg(uint8_t reg, uint8_t value)
     {
         uint8_t data[2] = {reg, value};
-        return i2c_master_transmit(device_, data, sizeof(data), 100);
+        return transact([&]() {
+            return i2c_master_transmit(device_, data, sizeof(data), 100);
+        });
     }
 
     esp_err_t try_write(uint8_t reg, const uint8_t* data, size_t len)
@@ -254,20 +257,40 @@ public:
         }
         buffer[0] = reg;
         std::memcpy(buffer.data() + 1, data, len);
-        return i2c_master_transmit(device_, buffer.data(), len + 1, 100);
+        return transact([&]() {
+            return i2c_master_transmit(device_, buffer.data(), len + 1, 100);
+        });
     }
 
     esp_err_t try_read_reg(uint8_t reg, uint8_t& value)
     {
-        return i2c_master_transmit_receive(device_, &reg, 1, &value, 1, 100);
+        return transact([&]() {
+            return i2c_master_transmit_receive(device_, &reg, 1, &value, 1, 100);
+        });
     }
 
     esp_err_t try_read(uint8_t reg, uint8_t* data, size_t len)
     {
-        return i2c_master_transmit_receive(device_, &reg, 1, data, len, 100);
+        return transact([&]() {
+            return i2c_master_transmit_receive(device_, &reg, 1, data, len, 100);
+        });
     }
 
 private:
+    template <typename Operation>
+    esp_err_t transact(Operation operation)
+    {
+        if (g_i2c_mutex) {
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+                return ESP_ERR_TIMEOUT;
+            }
+            const esp_err_t err = operation();
+            xSemaphoreGive(g_i2c_mutex);
+            return err;
+        }
+        return operation();
+    }
+
     i2c_master_dev_handle_t device_ = nullptr;
 };
 
@@ -612,6 +635,10 @@ void update_battery_status()
 
 void init_power_and_reset_panel()
 {
+    if (!g_i2c_mutex) {
+        g_i2c_mutex = xSemaphoreCreateMutex();
+    }
+
     i2c_master_bus_config_t bus_config = {};
     bus_config.i2c_port = I2C_NUM_1;
     bus_config.sda_io_num = kI2cSda;
