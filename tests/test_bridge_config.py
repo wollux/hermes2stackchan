@@ -801,9 +801,7 @@ class BridgeConfigTests(unittest.TestCase):
         later_actions, later_reasons = build_sensor_reaction_actions(shake, state, now_s=35.0, source_hint="imu")
 
         self.assertEqual(reasons, ["shake"])
-        self.assertEqual([action["action"] for action in actions], ["face", "motion"])
-        self.assertEqual(actions[0], {"action": "face", "emotion": "surprise_pop", "intensity_pct": 90})
-        self.assertLessEqual(actions[1]["speed_pct"], 30)
+        self.assertEqual(actions, [{"action": "face", "emotion": "surprise_pop", "intensity_pct": 90}])
         self.assertEqual(immediate_actions, [])
         self.assertEqual(later_reasons, ["shake"])
         self.assertEqual(later_actions[0]["emotion"], "surprise_pop")

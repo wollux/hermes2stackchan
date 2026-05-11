@@ -5719,7 +5719,7 @@ extern "C" void app_main()
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
-    xTaskCreate(sensor_interaction_task, "interaction", 6144, nullptr, 2, nullptr);
+    xTaskCreate(sensor_interaction_task, "interaction", 12288, nullptr, 2, nullptr);
     xTaskCreate(camera_init_task, "camera_init", 12288, nullptr, 2, nullptr);
 
     if (!init_wifi()) {

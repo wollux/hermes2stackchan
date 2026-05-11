@@ -2260,10 +2260,7 @@ def build_sensor_reaction_actions(
         and now_s - state.last_shake_at >= SENSOR_SHAKE_COOLDOWN_S
     ):
         maybe_wake("shake")
-        actions.extend([
-            {"action": "face", "emotion": "surprise_pop", "intensity_pct": 90},
-            sensor_shake_motion_action(),
-        ])
+        actions.append({"action": "face", "emotion": "surprise_pop", "intensity_pct": 90})
         reasons.append("shake")
         state.last_shake_at = now_s
 
@@ -3803,8 +3800,20 @@ def watch_sensors(args: argparse.Namespace) -> int:
     latest_status: dict[str, Any] | None = None
 
     def publish_reactions(actions: list[dict[str, Any]], reasons: list[str]) -> None:
+        nonlocal latest_status
         if not actions:
             return
+        fresh_status = read_latest_status(config, pair, timeout_s=0.25)
+        if isinstance(fresh_status, dict):
+            if status_is_busy(fresh_status):
+                if args.verbose:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction skipped while busy: {reasons}",
+                        flush=True,
+                    )
+                return
+            if fresh_status:
+                latest_status = fresh_status
         pause_life_animation(pair.pair_id, args.life_pause_s, f"sensor reaction {','.join(reasons)}")
         messages = [
             action_to_topic_payload(pair, action, f"sensor-{uuid.uuid4().hex[:10]}-{index:02d}")
