@@ -15,6 +15,7 @@ from bridge.hermes2stackchan_bridge import (
     ConfigError,
     action_to_topic_payload,
     battery_snapshot,
+    bridge_base_url_from_audio_url,
     build_display_payload,
     build_life_sequence,
     build_multipart_form_data,
@@ -99,6 +100,12 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(config.hermes.base_url, "http://127.0.0.1:8642")
         self.assertIn("bench", config.pairs)
         self.assertEqual(config.pairs["bench"].display_topic, "hermes-stackchan/bench/cmd/display")
+
+    def test_bridge_public_url_can_derive_from_audio_url(self) -> None:
+        self.assertEqual(
+            bridge_base_url_from_audio_url("http://192.168.99.58:8788/stackchan/audio"),
+            "http://192.168.99.58:8788",
+        )
 
     def test_env_overrides_hermes(self) -> None:
         config = load_config(
@@ -414,6 +421,19 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["source"], "push_to_talk")
         self.assertEqual(payload["request_id"], "audio-001")
         self.assertEqual(payload["min_ms"], 5000)
+
+    def test_audio_action_to_topic_payload_play_tts_url(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {"action": "audio", "audio_action": "play_tts_url", "url": "http://example.test/tts.wav"},
+            "tts-001",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/audio")
+        self.assertEqual(payload["action"], "play_tts_url")
+        self.assertEqual(payload["url"], "http://example.test/tts.wav")
 
     def test_reminder_builds_from_delay_and_fires_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

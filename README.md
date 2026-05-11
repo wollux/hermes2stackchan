@@ -209,6 +209,7 @@ H2S_MQTT_TLS=false
 
 H2S_BRIDGE_HTTP_HOST=0.0.0.0
 H2S_BRIDGE_HTTP_PORT=8788
+H2S_BRIDGE_PUBLIC_URL=http://192.168.99.58:8788
 
 H2S_STT_PROVIDER=groq
 H2S_GROQ_API_KEY=put-your-groq-key-here
@@ -465,10 +466,12 @@ Hermes can also schedule reminders:
 ```
 
 The bridge stores pending reminders persistently in `H2S_REMINDER_STORE`. When a
-reminder is due, the unified bridge wakes StackChan, plays a short tone, shows
-the reminder, and sends a `say` command. If the user only says "erinnere mich"
-without time or content, Hermes should ask what/when and set
-`follow_up_listen: true`.
+reminder is due, the unified bridge wakes StackChan, shows the reminder, sets a
+speaking face, generates TTS on the bridge, and sends StackChan a TTS URL to
+play. Set `H2S_BRIDGE_PUBLIC_URL` to the bridge URL reachable from StackChan,
+for example `http://192.168.99.58:8788`. If the user only says "erinnere mich"
+without time or content, Hermes should ask what/when and set `follow_up_listen:
+true`.
 
 Reminder CLI:
 

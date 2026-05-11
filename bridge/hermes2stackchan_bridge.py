@@ -145,6 +145,7 @@ class SpeechConfig:
     edge_tts_python: str = ""
     edge_tts_voice: str = "de-DE-KatjaNeural"
     edge_tts_rate: str = "+8%"
+    bridge_public_url: str = ""
     display_duration_ms: int = 9000
 
 
@@ -237,6 +238,11 @@ def load_config(
         edge_tts_python=env.get("H2S_EDGE_TTS_PYTHON") or str(speech_raw.get("edge_tts_python") or ""),
         edge_tts_voice=env.get("H2S_EDGE_TTS_VOICE") or str(speech_raw.get("edge_tts_voice") or "de-DE-KatjaNeural"),
         edge_tts_rate=env.get("H2S_EDGE_TTS_RATE") or str(speech_raw.get("edge_tts_rate") or "+8%"),
+        bridge_public_url=(
+            env.get("H2S_BRIDGE_PUBLIC_URL")
+            or bridge_base_url_from_audio_url(env.get("H2S_BRIDGE_AUDIO_URL"))
+            or str(speech_raw.get("bridge_public_url") or "")
+        ).rstrip("/"),
         display_duration_ms=parse_int(
             env.get("H2S_TRANSCRIPT_DISPLAY_MS"),
             int(speech_raw.get("display_duration_ms", 9000)),
@@ -366,6 +372,15 @@ def parse_bool(value: str | None, default: bool, label: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ConfigError(f"{label} must be true or false")
+
+
+def bridge_base_url_from_audio_url(value: str | None) -> str:
+    if not value:
+        return ""
+    marker = "/stackchan/audio"
+    if marker in value:
+        return value.split(marker, 1)[0].rstrip("/")
+    return value.rstrip("/")
 
 
 def has_pair_env(env: dict[str, str]) -> bool:
@@ -1108,19 +1123,21 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["volume_pct"] = action["volume_pct"]
         return pair.sound_topic, with_request_id(payload, action_request_id)
 
-    if name in {"audio", "start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"}:
+    if name in {"audio", "start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "play_tts_url"}:
         audio_action = optional_string(action.get("audio_action") or action.get("command"))
         if name != "audio":
             audio_action = name
         if not audio_action:
             raise ConfigError("audio action needs audio_action or command")
         audio_action = audio_action.strip().lower().replace("-", "_")
-        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"}:
+        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "play_tts_url"}:
             raise ConfigError(f"unsupported audio action: {audio_action}")
         payload: dict[str, Any] = {"action": audio_action}
         for key in ("source", "wakeword", "reason"):
             if optional_string(action.get(key)):
                 payload[key] = optional_string(action.get(key))
+        if optional_string(action.get("url")):
+            payload["url"] = optional_string(action.get("url"))
         for key in ("min_ms", "silence_timeout_ms", "max_ms"):
             if action.get(key) is not None:
                 payload[key] = parse_int_value(action.get(key), 0, f"audio.{key}")
@@ -1330,9 +1347,28 @@ def reminder_actions(reminder: dict[str, Any], display_duration_ms: int) -> list
     text = optional_string(reminder.get("text")) or "Erinnerung."
     return [
         {"action": "system", "system_action": "display_wake"},
-        {"action": "face", "emotion": "question", "intensity_pct": 70},
+        {"action": "face", "emotion": "speaking", "intensity_pct": 72},
         {"action": "display", "text": f"ERINNERUNG: {text}", "duration_ms": display_duration_ms},
     ]
+
+
+def tts_public_url(config: BridgeConfig, tts_path: str) -> str:
+    if not tts_path:
+        return ""
+    base_url = config.speech.bridge_public_url
+    if not base_url:
+        raise ConfigError("H2S_BRIDGE_PUBLIC_URL or H2S_BRIDGE_AUDIO_URL is required for scheduled TTS playback")
+    return f"{base_url}{tts_path}"
+
+
+def reminder_actions_with_tts(config: BridgeConfig, reminder: dict[str, Any]) -> list[dict[str, Any]]:
+    text = optional_string(reminder.get("text")) or "Erinnerung."
+    spoken_text = f"Erinnerung: {text}"
+    request_id = optional_string(reminder.get("id")) or uuid.uuid4().hex
+    tts_path = make_tts_wav(spoken_text, config.speech, f"reminder-{request_id}")
+    actions = reminder_actions(reminder, config.reminders.display_duration_ms)
+    actions.append({"action": "audio", "audio_action": "play_tts_url", "url": tts_public_url(config, tts_path)})
+    return actions
 
 
 def status_bool(value: Any) -> bool | None:
@@ -3231,7 +3267,7 @@ def list_reminders_cli(args: argparse.Namespace) -> int:
 def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder: dict[str, Any]) -> None:
     messages = [
         action_to_topic_payload(pair, action, f"reminder-{reminder.get('id', uuid.uuid4().hex[:8])}-{index:02d}")
-        for index, action in enumerate(reminder_actions(reminder, config.reminders.display_duration_ms))
+        for index, action in enumerate(reminder_actions_with_tts(config, reminder))
     ]
     print(
         f"[{time.strftime('%H:%M:%S')}] [bridge] firing reminder {reminder.get('id')}: {reminder.get('text')}",

@@ -230,6 +230,8 @@ Use `follow_up_listen: true` only when the reply is a real question and Hermes e
 Schedules a persistent reminder on the bridge host. Use this when the user says
 things like "erinnere mich in zwei Minuten" or "benachrichtige mich morgen".
 The bridge stores the reminder outside git and later wakes StackChan via MQTT.
+When it fires, the bridge generates TTS, sets a fitting speaking face, shows the
+reminder on the display, and sends StackChan a TTS URL to play.
 
 Parameters:
 

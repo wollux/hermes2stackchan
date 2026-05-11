@@ -134,6 +134,8 @@ char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
+bool play_wav_url(const char* url);
+void play_wav_url_task(void* arg);
 volatile bool g_audio_input_ready = false;
 volatile bool g_tts_playing = false;
 volatile bool g_wakeword_enabled = true;
@@ -3401,6 +3403,34 @@ void handle_audio_command(const char* data, int len)
         g_wakeword_enabled = true;
         set_recording_state(true, "wakeword", request_id, "wakeword detected");
         publish_ack(request_id, "audio", "wakeword simulated");
+    } else if (std::strcmp(action, "play_tts_url") == 0) {
+        const char* url = json_string(root, "url");
+        if (!url || !*url) {
+            publish_error(request_id, "audio", "url is required");
+            cJSON_Delete(root);
+            return;
+        }
+        if (!g_audio_output_ready || !g_audio_output) {
+            publish_error(request_id, "audio", "speaker not ready");
+            cJSON_Delete(root);
+            return;
+        }
+        char* task_url = static_cast<char*>(std::malloc(std::strlen(url) + 1));
+        if (!task_url) {
+            publish_error(request_id, "audio", "url allocation failed");
+            cJSON_Delete(root);
+            return;
+        }
+        std::strcpy(task_url, url);
+        const BaseType_t ok = xTaskCreate(play_wav_url_task, "tts_url", 6144, task_url, 3, nullptr);
+        if (ok != pdPASS) {
+            std::free(task_url);
+            publish_error(request_id, "audio", "tts task failed");
+            cJSON_Delete(root);
+            return;
+        }
+        publish_ack(request_id, "audio", "tts playback started");
+        publish_status();
     } else {
         publish_error(request_id, "audio", "unsupported action");
     }
@@ -3645,6 +3675,14 @@ bool play_wav_url(const char* url)
     publish_status();
     ESP_LOGI(kTag, "tts playback done: status=%d err=%s", status, esp_err_to_name(err));
     return err == ESP_OK && status >= 200 && status < 300;
+}
+
+void play_wav_url_task(void* arg)
+{
+    char* url = static_cast<char*>(arg);
+    play_wav_url(url);
+    std::free(url);
+    vTaskDelete(nullptr);
 }
 
 void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, int data_len)
