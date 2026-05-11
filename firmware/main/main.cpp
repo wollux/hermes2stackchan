@@ -72,6 +72,8 @@ constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
+constexpr int kMaxTextPayloadBytes = 1600;
+constexpr int kMaxDisplayedWords = 80;
 constexpr uint32_t kMqttTaskStackBytes = 8192;
 constexpr uint32_t kUiTaskStackBytes = 12288;
 constexpr gpio_num_t kAudioMclk = GPIO_NUM_0;
@@ -1325,12 +1327,12 @@ void draw_word_message(const char* title, const char* word, int index, int total
 
 void draw_word_sequence(const char* title, const char* text, int duration_ms, uint16_t accent)
 {
-    const int total = std::max(1, count_words(text));
+    const int total = clamp_int(count_words(text), 1, kMaxDisplayedWords);
     const int per_word_ms = clamp_int(duration_ms / total, 360, 1150);
     const char* cursor = text;
     int index = 0;
 
-    while (cursor && *cursor) {
+    while (cursor && *cursor && index < kMaxDisplayedWords) {
         while (*cursor && std::isspace(static_cast<unsigned char>(*cursor))) {
             ++cursor;
         }
@@ -3718,6 +3720,10 @@ void play_wav_url_task(void* arg)
 void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, int data_len)
 {
     if (topic_matches(topic, topic_len, g_topic_display)) {
+        if (data_len > kMaxTextPayloadBytes) {
+            publish_error("", "display", "display payload too large");
+            return;
+        }
         handle_display_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_system)) {
         handle_system_command(data, data_len);
@@ -3736,6 +3742,10 @@ void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, i
     } else if (topic_matches(topic, topic_len, g_topic_device)) {
         handle_device_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_say)) {
+        if (data_len > kMaxTextPayloadBytes) {
+            publish_error("", "say", "say payload too large");
+            return;
+        }
         handle_say_command(data, data_len);
     }
 }

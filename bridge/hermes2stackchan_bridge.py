@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 SCHEMA_VERSION = "1.0"
 POWER_DISPLAY_DURATION_MS = 5000
+MAX_STACKCHAN_TEXT_CHARS = 700
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
 YAW_TARGET_MIN_PCT = -100
@@ -426,7 +427,7 @@ def clamp_int(value: int, min_value: int, max_value: int) -> int:
 
 
 def build_display_payload(text: str, duration_ms: int, request_id: str | None = None) -> dict[str, Any]:
-    text = text.strip()
+    text = safe_stackchan_text(text)
     if not text:
         raise ConfigError("display text must not be empty")
     if duration_ms < 0:
@@ -1031,6 +1032,7 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         text = optional_string(action.get("text"))
         if not text:
             raise ConfigError("display action needs text")
+        text = safe_stackchan_text(text)
         payload = build_display_payload(text, parse_int_value(action.get("duration_ms"), 5000, "display.duration_ms"), action_request_id)
         return pair.display_topic, payload
 
@@ -1038,6 +1040,7 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         text = optional_string(action.get("text"))
         if not text:
             raise ConfigError("say action needs text")
+        text = safe_stackchan_text(text)
         payload = with_request_id(
             {
                 "text": text,
@@ -2582,6 +2585,14 @@ def build_restore_device_payload(settings: dict[str, Any] | None, display_wake: 
     return payload
 
 
+def safe_stackchan_text(text: str, max_chars: int = MAX_STACKCHAN_TEXT_CHARS) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= max_chars:
+        return value
+    clipped = value[: max(0, max_chars - 4)].rstrip()
+    return f"{clipped} ..."
+
+
 def restore_device_settings(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
@@ -2715,7 +2726,7 @@ def send_say(args: argparse.Namespace) -> int:
     pair = get_pair(config, args.pair)
     payload = with_request_id(
         {
-            "text": args.text,
+            "text": safe_stackchan_text(args.text),
             "emotion": args.emotion,
             "beep": not args.no_beep,
         },
