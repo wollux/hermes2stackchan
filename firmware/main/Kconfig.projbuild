@@ -18,6 +18,12 @@ config STACKCHAN_MQTT_URI
     help
         MQTT URI such as mqtt://192.168.99.58:1883.
 
+config STACKCHAN_BRIDGE_AUDIO_URL
+    string "Bridge audio HTTP endpoint"
+    default ""
+    help
+        HTTP endpoint for recorded WAV uploads, for example http://192.168.99.58:8788/stackchan/audio.
+
 config STACKCHAN_PAIR_ID
     string "Pair ID"
     default "desk"

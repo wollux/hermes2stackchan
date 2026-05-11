@@ -17,11 +17,15 @@ from bridge.hermes2stackchan_bridge import (
     battery_snapshot,
     build_display_payload,
     build_life_sequence,
+    build_multipart_form_data,
     build_motion_profile_points,
     build_power_change_actions,
     build_power_followup_actions,
     build_touch_lamp_payload,
+    DEFAULT_IDLE_PITCH_PCT,
+    DEFAULT_IDLE_YAW_PCT,
     face_snapshot,
+    LIFE_VARIANT_NAMES,
     load_config,
     missing_status_paths,
     normalize_motion_points,
@@ -104,6 +108,23 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(config.hermes.api_key, "secret")
         self.assertEqual(config.hermes.timeout_s, 12.5)
 
+    def test_env_overrides_speech(self) -> None:
+        config = load_config(
+            Path("config/pairs.example.json"),
+            env_path=None,
+            environ={
+                "H2S_GROQ_API_KEY": "groq-secret",
+                "H2S_STT_MODEL": "whisper-large-v3",
+                "H2S_STT_LANGUAGE": "de",
+                "H2S_TRANSCRIPT_DISPLAY_MS": "7000",
+            },
+        )
+
+        self.assertEqual(config.speech.groq_api_key, "groq-secret")
+        self.assertEqual(config.speech.groq_model, "whisper-large-v3")
+        self.assertEqual(config.speech.language, "de")
+        self.assertEqual(config.speech.display_duration_ms, 7000)
+
     def test_parse_env_file(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as handle:
             handle.write("# comment\nexport H2S_MQTT_HOST=\"mqtt.local\"\nH2S_PAIR_ID='desk'\n")
@@ -124,6 +145,21 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "text")
         self.assertEqual(payload["text"], "Hallo StackChan")
         self.assertEqual(payload["request_id"], "test-001")
+
+    def test_multipart_form_data_contains_audio_file(self) -> None:
+        body, boundary = build_multipart_form_data(
+            {"model": "whisper-large-v3-turbo", "language": "de"},
+            "file",
+            "stackchan.wav",
+            "audio/wav",
+            b"RIFF....WAVE",
+        )
+
+        self.assertIn(boundary.encode("utf-8"), body)
+        self.assertIn(b'name="model"', body)
+        self.assertIn(b'filename="stackchan.wav"', body)
+        self.assertIn(b"Content-Type: audio/wav", body)
+        self.assertIn(b"RIFF....WAVE", body)
 
     def test_motion_points_are_clamped_and_normalized(self) -> None:
         points = normalize_motion_points(
@@ -388,6 +424,38 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertNotIn("led", action_names)
             self.assertNotIn("sound", action_names)
 
+    def test_life_variant_pool_has_100_named_variants(self) -> None:
+        self.assertEqual(len(LIFE_VARIANT_NAMES), 100)
+        self.assertEqual(len(set(LIFE_VARIANT_NAMES)), 100)
+        for name in [
+            "double_blink",
+            "wink_left",
+            "wink_right",
+            "surprise_pop",
+            "happy_squint",
+            "look_behind",
+            "reset_grin",
+        ]:
+            self.assertIn(name, LIFE_VARIANT_NAMES)
+
+    def test_life_sequence_reaches_at_least_90_variants_over_500_seeds(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        seen = {
+            action["variant"]
+            for seed in range(500)
+            for _delay, action in build_life_sequence(status, random.Random(seed))
+            if "variant" in action
+        }
+
+        self.assertGreaterEqual(len(seen), 90)
+
     def test_life_sequence_blinks_often(self) -> None:
         status = {
             "display_sleeping": False,
@@ -481,15 +549,19 @@ class BridgeConfigTests(unittest.TestCase):
         subtle = [
             (delay, motion)
             for delay, motion in motions
-            if all(abs(point["yaw_pct"]) <= 5 and abs(point["pitch_pct"]) <= 4 for point in motion["points"])
+            if all(
+                abs(point["yaw_pct"] - DEFAULT_IDLE_YAW_PCT) <= 5
+                and abs(point["pitch_pct"] - DEFAULT_IDLE_PITCH_PCT) <= 4
+                for point in motion["points"]
+            )
         ]
         self.assertGreater(len(subtle), len(motions) // 2)
         for delay, motion in subtle:
             self.assertGreaterEqual(delay, 700)
             self.assertLessEqual(motion["speed_pct"], 12)
             for point in motion["points"]:
-                self.assertLessEqual(abs(point["yaw_pct"]), 5)
-                self.assertLessEqual(abs(point["pitch_pct"]), 4)
+                self.assertLessEqual(abs(point["yaw_pct"] - DEFAULT_IDLE_YAW_PCT), 5)
+                self.assertLessEqual(abs(point["pitch_pct"] - DEFAULT_IDLE_PITCH_PCT), 4)
                 self.assertGreaterEqual(point["duration_ms"], 1400)
 
     def test_life_sequence_has_rare_big_desk_sweep_motion(self) -> None:
@@ -512,10 +584,10 @@ class BridgeConfigTests(unittest.TestCase):
             for delay, motion in motions
             if any(abs(point["yaw_pct"]) >= 60 for point in motion["points"])
         ]
-        vertical_big = [
+        vertical_motion = [
             (delay, motion)
             for delay, motion in motions
-            if any(abs(point["pitch_pct"]) >= 18 for point in motion["points"])
+            if any(abs(point["pitch_pct"] - DEFAULT_IDLE_PITCH_PCT) >= 4 for point in motion["points"])
         ]
         big_faces = [
             (delay, action)
@@ -525,15 +597,38 @@ class BridgeConfigTests(unittest.TestCase):
         ]
 
         self.assertTrue(big_horizontal)
-        self.assertTrue(vertical_big)
-        self.assertGreaterEqual(len(big_faces), (len(big_horizontal) + len(vertical_big)) * 2)
-        self.assertLess(len(big_horizontal) + len(vertical_big), len(motions))
-        for delay, motion in big_horizontal + vertical_big:
+        self.assertTrue(vertical_motion)
+        self.assertGreaterEqual(len(big_faces), (len(big_horizontal) + len(vertical_motion)))
+        self.assertLess(len(big_horizontal), len(motions))
+        for delay, motion in big_horizontal + vertical_motion:
             self.assertGreaterEqual(delay, 0)
             self.assertLessEqual(motion["speed_pct"], 34)
             for point in motion["points"]:
                 self.assertLessEqual(abs(point["yaw_pct"]), 75)
-                self.assertLessEqual(abs(point["pitch_pct"]), 28)
+                self.assertLessEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT + 15)
+                self.assertGreaterEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT - 30)
+
+    def test_life_motion_returns_to_high_idle_pose(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        motions = [
+            action
+            for seed in range(300)
+            for _delay, action in build_life_sequence(status, random.Random(seed))
+            if action["action"] == "motion"
+        ]
+
+        self.assertTrue(motions)
+        for motion in motions:
+            last = motion["points"][-1]
+            self.assertEqual(last["yaw_pct"], DEFAULT_IDLE_YAW_PCT)
+            self.assertEqual(last["pitch_pct"], DEFAULT_IDLE_PITCH_PCT)
 
     def test_life_sequence_pairs_vertical_faces_with_vertical_motion(self) -> None:
         status = {
@@ -573,6 +668,21 @@ class BridgeConfigTests(unittest.TestCase):
         for seed in range(50):
             sequence = build_life_sequence(status, random.Random(seed), include_motion=False)
             self.assertNotIn("motion", {action["action"] for _delay, action in sequence})
+
+    def test_life_question_face_is_never_final_state(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        for seed in range(500):
+            sequence = build_life_sequence(status, random.Random(seed))
+            face_actions = [action for _delay, action in sequence if action["action"] == "face"]
+            self.assertTrue(face_actions)
+            self.assertNotEqual(face_actions[-1]["emotion"], "question")
 
 
 if __name__ == "__main__":

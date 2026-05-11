@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import math
 import os
 import random
+import signal
 import ssl
+import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, Timer
-from typing import Any
+from threading import Event, Thread, Timer
+from typing import Any, Callable
 
 
 SCHEMA_VERSION = "1.0"
 POWER_DISPLAY_DURATION_MS = 5000
+DEFAULT_IDLE_YAW_PCT = 0
+DEFAULT_IDLE_PITCH_PCT = 45
 DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
@@ -113,10 +119,42 @@ class HermesConfig:
 
 
 @dataclass(frozen=True)
+class SpeechConfig:
+    provider: str = "groq"
+    groq_api_key: str | None = None
+    groq_url: str = "https://api.groq.com/openai/v1/audio/transcriptions"
+    groq_model: str = "whisper-large-v3-turbo"
+    language: str = "de"
+    prompt: str = "Deutsch. StackChan, Hermes, Wollux. Kurze Befehle und Fragen."
+    timeout_s: float = 30.0
+    max_audio_bytes: int = 2 * 1024 * 1024
+    archive_dir: str | None = None
+    tts_dir: str | None = None
+    tts_engine: str = "edge"
+    edge_tts_python: str = ""
+    edge_tts_voice: str = "de-DE-KatjaNeural"
+    edge_tts_rate: str = "+8%"
+    display_duration_ms: int = 9000
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     mqtt: MqttConfig
     pairs: dict[str, PairConfig]
     hermes: HermesConfig = field(default_factory=HermesConfig)
+    speech: SpeechConfig = field(default_factory=SpeechConfig)
+
+
+LifeSequence = list[tuple[int, dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class LifeVariant:
+    name: str
+    weight: float
+    rare: bool
+    min_gap_s: float
+    builder: Callable[[random.Random, int, str], LifeSequence]
 
 
 def load_config(
@@ -152,6 +190,39 @@ def load_config(
         api_key=optional_string(env.get("H2S_HERMES_API_KEY") or env.get("API_SERVER_KEY") or hermes_raw.get("api_key")),
         model=env.get("H2S_HERMES_MODEL") or str(hermes_raw.get("model") or "default"),
         timeout_s=parse_float(env.get("H2S_HERMES_TIMEOUT_S"), float(hermes_raw.get("timeout_s", 30.0)), "H2S_HERMES_TIMEOUT_S"),
+    )
+    speech_raw = raw.get("speech") or {}
+    if not isinstance(speech_raw, dict):
+        raise ConfigError("speech must be an object when present")
+    speech = SpeechConfig(
+        provider=(env.get("H2S_STT_PROVIDER") or str(speech_raw.get("provider") or "groq")).strip().lower(),
+        groq_api_key=optional_string(
+            env.get("H2S_GROQ_API_KEY")
+            or env.get("GROQ_API_KEY")
+            or env.get("GROQ_KEY")
+            or speech_raw.get("groq_api_key")
+        ),
+        groq_url=env.get("H2S_GROQ_STT_URL") or str(speech_raw.get("groq_url") or "https://api.groq.com/openai/v1/audio/transcriptions"),
+        groq_model=env.get("H2S_STT_MODEL") or str(speech_raw.get("groq_model") or "whisper-large-v3-turbo"),
+        language=env.get("H2S_STT_LANGUAGE") or str(speech_raw.get("language") or "de"),
+        prompt=env.get("H2S_STT_PROMPT") or str(speech_raw.get("prompt") or "Deutsch. StackChan, Hermes, Wollux. Kurze Befehle und Fragen."),
+        timeout_s=parse_float(env.get("H2S_STT_TIMEOUT_S"), float(speech_raw.get("timeout_s", 30.0)), "H2S_STT_TIMEOUT_S"),
+        max_audio_bytes=parse_int(
+            env.get("H2S_MAX_AUDIO_BYTES"),
+            int(speech_raw.get("max_audio_bytes", 2 * 1024 * 1024)),
+            "H2S_MAX_AUDIO_BYTES",
+        ),
+        archive_dir=optional_string(env.get("H2S_WAV_ARCHIVE_DIR") or speech_raw.get("archive_dir")),
+        tts_dir=optional_string(env.get("H2S_TTS_DIR") or speech_raw.get("tts_dir")),
+        tts_engine=env.get("H2S_TTS_ENGINE") or str(speech_raw.get("tts_engine") or "edge"),
+        edge_tts_python=env.get("H2S_EDGE_TTS_PYTHON") or str(speech_raw.get("edge_tts_python") or ""),
+        edge_tts_voice=env.get("H2S_EDGE_TTS_VOICE") or str(speech_raw.get("edge_tts_voice") or "de-DE-KatjaNeural"),
+        edge_tts_rate=env.get("H2S_EDGE_TTS_RATE") or str(speech_raw.get("edge_tts_rate") or "+8%"),
+        display_duration_ms=parse_int(
+            env.get("H2S_TRANSCRIPT_DISPLAY_MS"),
+            int(speech_raw.get("display_duration_ms", 9000)),
+            "H2S_TRANSCRIPT_DISPLAY_MS",
+        ),
     )
 
     pairs_raw = raw.get("pairs")
@@ -194,7 +265,7 @@ def load_config(
             )
         }
 
-    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes)
+    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech)
 
 
 def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -204,7 +275,7 @@ def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> di
 
     source = os.environ if environ is None else environ
     for key, value in source.items():
-        if key.startswith("H2S_") or key == "API_SERVER_KEY":
+        if key.startswith("H2S_") or key in {"API_SERVER_KEY", "GROQ_API_KEY", "GROQ_KEY"}:
             env[key] = value
     return {key: value for key, value in env.items() if value != ""}
 
@@ -1051,12 +1122,73 @@ def current_face_action(status: dict[str, Any] | None, default_intensity: int = 
         "breathe",
         "deep_breathe",
         "micro_sleep",
+        "question",
+        "wink_left",
+        "wink_right",
+        "surprise_pop",
+        "grumble",
+        "yawn",
+        "happy_squint",
     }:
         emotion = "neutral"
     intensity = nested_status_value(status, "face.intensity_pct")
     if not isinstance(intensity, int):
         intensity = default_intensity
     return {"action": "face", "emotion": emotion, "intensity_pct": clamp_int(intensity, 35, 90)}
+
+
+def life_face(emotion: str, intensity_pct: int, variant: str) -> dict[str, Any]:
+    return {
+        "action": "face",
+        "emotion": emotion,
+        "intensity_pct": clamp_int(intensity_pct, 35, 95),
+        "variant": variant,
+    }
+
+
+def life_motion(points: list[dict[str, int]], speed_pct: int = 18, curve: str = "spline", variant: str = "") -> dict[str, Any]:
+    return {
+        "action": "motion",
+        "curve": curve,
+        "speed_pct": clamp_int(speed_pct, 1, 100),
+        "points": points,
+        "variant": variant,
+    }
+
+
+def gaze_for_direction(direction: str) -> str:
+    return {
+        "left": "glance_left",
+        "right": "glance_right",
+        "up": "glance_up",
+        "down": "glance_down",
+        "up_left": "glance_up",
+        "up_right": "glance_up",
+        "down_left": "glance_down",
+        "down_right": "glance_down",
+    }.get(direction, "glance_left")
+
+
+def motion_point(yaw_pct: int, pitch_pct: int, duration_ms: int, speed_pct: int, hold_ms: int = 0) -> dict[str, int]:
+    point = {
+        "yaw_pct": clamp_int(yaw_pct, -90, 90),
+        "pitch_pct": clamp_int(pitch_pct, -30, 60),
+        "duration_ms": clamp_int(duration_ms, 120, 2800),
+        "speed_pct": clamp_int(speed_pct, 6, 45),
+    }
+    if hold_ms:
+        point["hold_ms"] = clamp_int(hold_ms, 0, 1600)
+    return point
+
+
+def idle_motion_point(yaw_offset_pct: int, pitch_offset_pct: int, duration_ms: int, speed_pct: int, hold_ms: int = 0) -> dict[str, int]:
+    return motion_point(
+        DEFAULT_IDLE_YAW_PCT + yaw_offset_pct,
+        DEFAULT_IDLE_PITCH_PCT + pitch_offset_pct,
+        duration_ms,
+        speed_pct,
+        hold_ms,
+    )
 
 
 def build_subtle_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
@@ -1068,8 +1200,8 @@ def build_subtle_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
         "curve": "spline",
         "speed_pct": 12,
         "points": [
-            {"yaw_pct": yaw, "pitch_pct": pitch, "duration_ms": 1400, "speed_pct": 12, "hold_ms": 350},
-            {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 1800, "speed_pct": 10},
+            idle_motion_point(yaw, pitch, 1400, 12, 350),
+            idle_motion_point(0, 0, 1800, 10),
         ],
     }
 
@@ -1080,8 +1212,8 @@ def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) 
         up_first = rng.choice([True, False])
         first_yaw = rng.choice([-10, 10])
         second_yaw = -first_yaw
-        first_pitch = 28 if up_first else -20
-        second_pitch = -18 if up_first else 24
+        first_pitch = DEFAULT_IDLE_PITCH_PCT if up_first else DEFAULT_IDLE_PITCH_PCT - 20
+        second_pitch = DEFAULT_IDLE_PITCH_PCT - 18 if up_first else DEFAULT_IDLE_PITCH_PCT
         first_glance = "glance_up" if up_first else "glance_down"
         second_glance = "glance_down" if up_first else "glance_up"
         center_glance = rng.choice(["glance_left", "glance_right"])
@@ -1091,8 +1223,8 @@ def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) 
         left_first = rng.choice([True, False])
         first_yaw = -58 if left_first else 58
         second_yaw = 46 if left_first else -46
-        first_pitch = rng.choice([18, 22])
-        second_pitch = rng.choice([-16, -20])
+        first_pitch = DEFAULT_IDLE_PITCH_PCT
+        second_pitch = DEFAULT_IDLE_PITCH_PCT + rng.choice([-16, -20])
         first_glance = "glance_up"
         second_glance = "glance_down"
         center_glance = "glance_right" if left_first else "glance_left"
@@ -1102,8 +1234,8 @@ def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) 
         left_first = rng.choice([True, False])
         first_yaw = -75 if left_first else 75
         second_yaw = 75 if left_first else -75
-        first_pitch = 4
-        second_pitch = 6
+        first_pitch = DEFAULT_IDLE_PITCH_PCT + 4
+        second_pitch = DEFAULT_IDLE_PITCH_PCT + 6
         first_glance = "glance_left" if left_first else "glance_right"
         second_glance = "glance_right" if left_first else "glance_left"
         center_glance = first_glance
@@ -1156,11 +1288,302 @@ def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) 
                 "action": "motion",
                 "curve": "spline",
                 "speed_pct": 22,
-                "points": [{"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 1200, "speed_pct": 22}],
+                "points": [motion_point(DEFAULT_IDLE_YAW_PCT, DEFAULT_IDLE_PITCH_PCT, 1200, 22)],
             },
         ),
         (1500, {"action": "face", "emotion": mood, "intensity_pct": base_intensity}),
     ]
+
+
+def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int, mood: str) -> LifeSequence:
+    low = clamp_int(base_intensity - 5, 35, 90)
+    high = clamp_int(base_intensity + 12, 35, 95)
+
+    if name == "double_blink":
+        return [(0, life_face("blink", low, name)), (360, life_face("blink", low, name))]
+    if name == "lazy_blink":
+        return [(0, life_face("breathe", low, name)), (360, life_face("blink", low, name))]
+    if name == "suspicious_left":
+        return [(0, life_face("glance_left", base_intensity, name)), (900, life_face("mouth_tiny", base_intensity, name))]
+    if name == "suspicious_right":
+        return [(0, life_face("glance_right", base_intensity, name)), (900, life_face("mouth_tiny", base_intensity, name))]
+    if name == "tiny_smile":
+        return [(0, life_face("mouth_tiny", high, name))]
+    if name == "look_up_think":
+        return [
+            (0, life_face("glance_up", base_intensity, name)),
+            (520, life_face("question", base_intensity, name)),
+            (820, life_face(mood, base_intensity, name)),
+        ]
+    if name == "look_down_table":
+        return [(0, life_face("glance_down", base_intensity, name)), (700, life_face("mouth_tiny", low, name))]
+    if name == "wink_left":
+        return [(0, life_face("wink_left", high, name))]
+    if name == "wink_right":
+        return [(0, life_face("wink_right", high, name))]
+    if name == "deep_breathe":
+        return [(0, life_face("deep_breathe", base_intensity, name))]
+    if name == "mouth_wiggle":
+        return [(0, life_face("mouth_wiggle", base_intensity, name))]
+    if name == "micro_sleep":
+        return [(0, life_face("micro_sleep", low, name))]
+    if name == "surprise_pop":
+        return [(0, life_face("surprise_pop", high, name)), (720, life_face("blink", base_intensity, name))]
+    if name == "cheeky_grin":
+        side = rng.choice(["glance_left", "glance_right"])
+        return [(0, life_face(side, base_intensity, name)), (520, life_face("wink_right" if side == "glance_left" else "wink_left", high, name))]
+    if name == "question_glance":
+        return [
+            (0, life_face("glance_up", base_intensity, name)),
+            (440, life_face("question", base_intensity, name)),
+            (820, life_face(mood, base_intensity, name)),
+        ]
+    if name == "nervous_flick":
+        return [(0, life_face("glance_left", base_intensity, name)), (180, life_face("glance_right", base_intensity, name)), (180, life_face("blink", low, name))]
+    if name == "happy_squint":
+        return [(0, life_face("happy_squint", high, name))]
+    if name == "grumble_mouth":
+        return [(0, life_face("grumble", low, name))]
+    if name == "scanner_eyes":
+        return [(0, life_face("glance_left", base_intensity, name)), (520, life_face("glance_right", base_intensity, name)), (520, life_face("glance_left", base_intensity, name))]
+    if name == "yawn_hint":
+        return [(0, life_face("yawn", low, name))]
+    if name == "look_behind":
+        return [
+            (0, life_face("glance_up", base_intensity, name)),
+            (180, life_motion([
+                idle_motion_point(rng.choice([-75, 75]), 0, 1000, 32, 300),
+                idle_motion_point(0, 0, 1000, 24),
+            ], 32, variant=name)),
+            (1450, life_face(mood, base_intensity, name)),
+        ]
+    if name == "drama_blink":
+        return [(0, life_face("blink", low, name)), (520, life_face("surprise_pop", high, name))]
+    if name == "shy_lookaway":
+        side = rng.choice(["left", "right"])
+        yaw = -18 if side == "left" else 18
+        return [
+            (0, life_face(gaze_for_direction(side), low, name)),
+            (300, life_motion([idle_motion_point(yaw, -4, 1200, 14, 420), idle_motion_point(0, 0, 1500, 10)], 14, variant=name)),
+            (2200, life_face("mouth_tiny", low, name)),
+        ]
+    if name == "proud_lift":
+        return [
+            (0, life_face("happy_squint", high, name)),
+            (120, life_motion([idle_motion_point(0, 0, 1000, 18, 260), idle_motion_point(0, 0, 1300, 12)], 18, variant=name)),
+        ]
+    if name == "bored_sigh":
+        return [(0, life_face("glance_down", low, name)), (520, life_face("deep_breathe", low, name))]
+    if name == "sneaky_side_eye":
+        side = rng.choice(["glance_left", "glance_right"])
+        return [(0, life_face(side, low, name)), (900, life_face("mouth_tiny", high, name)), (500, life_face(side, low, name))]
+    if name == "tiny_laugh":
+        return [(0, life_face("happy_squint", high, name)), (360, life_face("mouth_smile", high, name)), (360, life_face("blink", base_intensity, name))]
+    if name == "confused_scan":
+        return [
+            (0, life_face("glance_up", base_intensity, name)),
+            (420, life_face("glance_left", base_intensity, name)),
+            (420, life_face("glance_right", base_intensity, name)),
+            (420, life_face("question", base_intensity, name)),
+            (820, life_face(mood, base_intensity, name)),
+        ]
+    if name == "sleepy_recover":
+        return [(0, life_face("micro_sleep", low, name)), (900, life_face("surprise_pop", high, name)), (620, life_face("blink", base_intensity, name))]
+    if name == "reset_grin":
+        return [(0, life_face(rng.choice(["glance_left", "glance_right"]), base_intensity, name)), (520, life_face("mouth_smile", high, name)), (620, life_face(mood, base_intensity, name))]
+
+    return [(0, life_face("blink", base_intensity, name))]
+
+
+def build_generated_life_sequence(name: str, rng: random.Random, base_intensity: int, mood: str) -> LifeSequence:
+    parts = name.split("_")
+    family = parts[1]
+
+    if family == "gaze":
+        direction = "_".join(parts[2:-1])
+        hold_ms = int(parts[-1])
+        glance = gaze_for_direction(direction)
+        return [
+            (0, life_face(glance, base_intensity, name)),
+            (hold_ms, life_face(rng.choice(["mouth_tiny", "blink", mood]), base_intensity, name)),
+        ]
+
+    if family == "mouth":
+        mouth = parts[2]
+        intensity_delta = int(parts[3])
+        emotion = {
+            "smile": "mouth_smile",
+            "tiny": "mouth_tiny",
+            "wiggle": "mouth_wiggle",
+            "grumble": "grumble",
+            "laugh": "happy_squint",
+        }[mouth]
+        return [(0, life_face(emotion, base_intensity + intensity_delta, name))]
+
+    if family == "blink":
+        style = parts[2]
+        if style == "single":
+            return [(0, life_face("blink", base_intensity, name))]
+        if style == "double":
+            return [(0, life_face("blink", base_intensity, name)), (int(parts[3]), life_face("blink", base_intensity, name))]
+        if style == "slow":
+            return [(0, life_face("breathe", base_intensity - 4, name)), (500, life_face("blink", base_intensity - 4, name))]
+        if style == "asym":
+            return [(0, life_face(rng.choice(["wink_left", "wink_right"]), base_intensity + 8, name))]
+        return [(0, life_face("blink", base_intensity - 4, name)), (540, life_face("surprise_pop", base_intensity + 10, name))]
+
+    if family == "breath":
+        style = parts[2]
+        if style in {"small", "held"}:
+            return [(0, life_face("breathe", base_intensity, name))]
+        if style == "sleepy":
+            return [(0, life_face("micro_sleep", base_intensity - 6, name))]
+        return [(0, life_face("deep_breathe", base_intensity - (5 if style == "sigh" else 0), name))]
+
+    if family == "head":
+        direction = parts[2]
+        glance = gaze_for_direction(direction)
+        yaw_map = {"left": -5, "right": 5, "up": rng.choice([-2, 2]), "down": rng.choice([-2, 2]), "scan": rng.choice([-42, 42])}
+        pitch_map = {"left": 2, "right": 2, "up": 4, "down": -4, "scan": rng.choice([8, -8])}
+        yaw = yaw_map[direction]
+        pitch = pitch_map[direction]
+        speed = rng.choice([10, 12]) if direction != "scan" else rng.choice([20, 24])
+        return [
+            (0, life_face(glance, base_intensity, name)),
+            (760, life_motion([
+                idle_motion_point(yaw, pitch, rng.choice([1400, 1600, 1800]), speed, rng.choice([180, 320, 480])),
+                idle_motion_point(0, 0, rng.choice([1500, 1700, 1900]), max(10, speed - 2)),
+            ], speed, variant=name)),
+            (1800, life_face(mood, base_intensity, name)),
+        ]
+
+    return [(0, life_face("blink", base_intensity, name))]
+
+
+CURATED_LIFE_VARIANT_NAMES = [
+    "double_blink", "lazy_blink", "suspicious_left", "suspicious_right", "tiny_smile",
+    "look_up_think", "look_down_table", "wink_left", "wink_right", "deep_breathe",
+    "mouth_wiggle", "micro_sleep", "surprise_pop", "cheeky_grin", "question_glance",
+    "nervous_flick", "happy_squint", "grumble_mouth", "scanner_eyes", "yawn_hint",
+    "look_behind", "drama_blink", "shy_lookaway", "proud_lift", "bored_sigh",
+    "sneaky_side_eye", "tiny_laugh", "confused_scan", "sleepy_recover", "reset_grin",
+]
+
+
+def build_life_variants() -> list[LifeVariant]:
+    variants: list[LifeVariant] = []
+    rare_names = {"micro_sleep", "surprise_pop", "look_behind", "drama_blink", "yawn_hint", "sleepy_recover"}
+    for name in CURATED_LIFE_VARIANT_NAMES:
+        variants.append(LifeVariant(
+            name=name,
+            weight=0.8 if name in rare_names else 2.4,
+            rare=name in rare_names,
+            min_gap_s=45.0 if name in rare_names else 8.0,
+            builder=lambda rng, intensity, mood, variant_name=name: build_named_life_sequence(variant_name, rng, intensity, mood),
+        ))
+
+    gaze_directions = ["left", "right", "up", "down", "up_left", "up_right", "down_left", "down_right"]
+    for index in range(20):
+        direction = gaze_directions[index % len(gaze_directions)]
+        hold = [360, 520, 700, 900, 1150][index % 5]
+        name = f"gen_gaze_{direction}_{hold}"
+        variants.append(LifeVariant(name, 2.6, False, 5.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
+
+    mouth_specs = [
+        ("smile", 4), ("smile", 10), ("tiny", -4), ("tiny", 2), ("wiggle", 0),
+        ("wiggle", 6), ("grumble", -8), ("grumble", -2), ("laugh", 8), ("laugh", 14),
+        ("smile", -2), ("tiny", 8), ("wiggle", -4), ("grumble", 4), ("laugh", 2),
+    ]
+    for index, (mouth, delta) in enumerate(mouth_specs):
+        name = f"gen_mouth_{mouth}_{delta}_{index}"
+        variants.append(LifeVariant(name, 1.9, False, 7.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
+
+    blink_specs = [
+        "single", "single", "single", "single", "double_260", "double_360", "double_480",
+        "slow", "slow", "asym", "asym", "drama", "single", "double_300", "slow",
+    ]
+    for index, style in enumerate(blink_specs):
+        name = f"gen_blink_{style}_{index}"
+        variants.append(LifeVariant(name, 8.0, style == "drama", 4.0 if style != "drama" else 35.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
+
+    breath_specs = ["small", "small", "deep", "deep", "held", "sigh", "sleepy", "small", "deep", "sigh"]
+    for index, style in enumerate(breath_specs):
+        name = f"gen_breath_{style}_{index}"
+        variants.append(LifeVariant(name, 3.2, style == "sleepy", 7.0 if style != "sleepy" else 45.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
+
+    head_specs = ["left", "right", "up", "down", "scan", "left", "right", "up", "down", "scan"]
+    for index, direction in enumerate(head_specs):
+        name = f"gen_head_{direction}_{index}"
+        variants.append(LifeVariant(name, 1.6 if direction != "scan" else 0.8, direction == "scan", 12.0 if direction != "scan" else 40.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
+
+    if len(variants) != 100:
+        raise RuntimeError(f"expected 100 life variants, got {len(variants)}")
+    return variants
+
+
+LIFE_VARIANTS = build_life_variants()
+LIFE_VARIANT_NAMES = tuple(variant.name for variant in LIFE_VARIANTS)
+LIFE_VARIANTS_BY_NAME = {variant.name: variant for variant in LIFE_VARIANTS}
+
+
+def life_variants_matching(predicate: Callable[[str], bool]) -> list[LifeVariant]:
+    return [variant for variant in LIFE_VARIANTS if predicate(variant.name)]
+
+
+LIFE_VARIANT_CATEGORIES: dict[str, list[LifeVariant]] = {
+    "blink_breathe": life_variants_matching(
+        lambda name: name.startswith("gen_blink_")
+        or name.startswith("gen_breath_")
+        or name in {"double_blink", "lazy_blink", "deep_breathe"}
+    ),
+    "gaze": life_variants_matching(
+        lambda name: name.startswith("gen_gaze_")
+        or name in {
+            "suspicious_left", "suspicious_right", "look_up_think", "look_down_table",
+            "question_glance", "nervous_flick", "scanner_eyes", "sneaky_side_eye",
+            "confused_scan", "reset_grin",
+        }
+    ),
+    "mouth": life_variants_matching(
+        lambda name: name.startswith("gen_mouth_")
+        or name in {
+            "tiny_smile", "mouth_wiggle", "cheeky_grin", "happy_squint",
+            "grumble_mouth", "tiny_laugh",
+        }
+    ),
+    "small_head": life_variants_matching(
+        lambda name: (name.startswith("gen_head_") and "_scan_" not in name)
+    ),
+    "big_head": life_variants_matching(
+        lambda name: name in {"look_behind", "shy_lookaway", "proud_lift"}
+        or (name.startswith("gen_head_") and "_scan_" in name)
+    ),
+    "rare_gag": life_variants_matching(
+        lambda name: name in {"wink_left", "wink_right", "micro_sleep", "surprise_pop", "yawn_hint", "drama_blink", "sleepy_recover"}
+    ),
+}
+
+
+def choose_life_variant(rng: random.Random) -> LifeVariant:
+    roll = rng.random()
+    if roll < 0.54:
+        category = LIFE_VARIANT_CATEGORIES["blink_breathe"]
+    elif roll < 0.72:
+        category = LIFE_VARIANT_CATEGORIES["gaze"]
+    elif roll < 0.82:
+        category = LIFE_VARIANT_CATEGORIES["mouth"]
+    elif roll < 0.94:
+        category = LIFE_VARIANT_CATEGORIES["small_head"]
+    elif roll < 0.985:
+        category = LIFE_VARIANT_CATEGORIES["big_head"]
+    else:
+        category = LIFE_VARIANT_CATEGORIES["rare_gag"]
+    return rng.choices(category, weights=[variant.weight for variant in category], k=1)[0]
+
+
+def strip_motion_from_life_sequence(sequence: LifeSequence) -> LifeSequence:
+    stripped = [(delay, action) for delay, action in sequence if action.get("action") != "motion"]
+    return stripped or [(0, {"action": "face", "emotion": "breathe", "intensity_pct": 60, "variant": "motion_stripped_breathe"})]
 
 
 def build_life_sequence(
@@ -1174,43 +1597,13 @@ def build_life_sequence(
     restore = current_face_action(status)
     mood = restore["emotion"]
     base_intensity = int(restore["intensity_pct"])
-    choice = rng.random()
-
-    if choice < 0.34:
-        return [(0, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity})]
-
-    if choice < 0.50:
-        return [
-            (0, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity}),
-            (360, {"action": "face", "emotion": "blink", "intensity_pct": base_intensity}),
-        ]
-
-    if choice < 0.66:
-        glance = rng.choice(["glance_left", "glance_right", "glance_up", "glance_up", "glance_down"])
-        return [(0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity})]
-
-    if choice < 0.80:
-        mouth = rng.choice(["mouth_smile", "mouth_tiny", "mouth_wiggle"])
-        return [(0, {"action": "face", "emotion": mouth, "intensity_pct": base_intensity})]
-
-    if choice < 0.86:
-        return [(0, {"action": "face", "emotion": "deep_breathe", "intensity_pct": base_intensity})]
-
-    if choice < 0.89:
-        return [(0, {"action": "face", "emotion": "micro_sleep", "intensity_pct": base_intensity})]
-
-    if include_motion and choice >= 0.97:
-        return build_big_life_sequence(rng, base_intensity, mood)
-
-    if include_motion and choice >= 0.89:
-        glance, motion = build_subtle_life_motion(rng)
-        return [
-            (0, {"action": "face", "emotion": glance, "intensity_pct": base_intensity}),
-            (760, motion),
-            (2200, {"action": "face", "emotion": mood, "intensity_pct": base_intensity}),
-        ]
-
-    return [(0, {"action": "face", "emotion": "breathe", "intensity_pct": base_intensity})]
+    variant = choose_life_variant(rng)
+    sequence = variant.builder(rng, base_intensity, mood)
+    if not include_motion:
+        sequence = strip_motion_from_life_sequence(sequence)
+    for _delay, action in sequence:
+        action.setdefault("variant", variant.name)
+    return sequence
 
 
 def ensure_reply_action(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1892,6 +2285,430 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         client.disconnect()
 
 
+def build_multipart_form_data(fields: dict[str, str], file_field: str, filename: str, content_type: str, data: bytes) -> tuple[bytes, str]:
+    boundary = f"h2s-{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(str(value).encode("utf-8"))
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+    chunks.append(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    chunks.append(data)
+    chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), boundary
+
+
+def transcribe_wav_groq_bytes(audio: bytes, speech: SpeechConfig) -> str:
+    if not speech.groq_api_key:
+        raise ConfigError("Groq STT key missing. Set H2S_GROQ_API_KEY or GROQ_API_KEY in .env.")
+    fields = {
+        "model": speech.groq_model,
+        "response_format": "json",
+        "temperature": "0",
+    }
+    if speech.language:
+        fields["language"] = speech.language
+    if speech.prompt:
+        fields["prompt"] = speech.prompt
+    body, boundary = build_multipart_form_data(fields, "file", "stackchan.wav", "audio/wav", audio)
+    request = urllib.request.Request(
+        speech.groq_url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {speech.groq_api_key}",
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "hermes2stackchan/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=speech.timeout_s) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ConfigError(f"Groq STT HTTP {exc.code}: {error_body}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"Groq STT returned non-JSON response: {raw[:500]}") from exc
+    text = payload.get("text")
+    if not isinstance(text, str):
+        raise ConfigError("Groq STT response did not contain text")
+    return text.strip()
+
+
+def transcribe_audio_bytes(audio: bytes, speech: SpeechConfig) -> tuple[str, str]:
+    provider = speech.provider.lower()
+    if provider != "groq":
+        raise ConfigError(f"unsupported STT provider for bridge HTTP audio: {speech.provider}")
+    return transcribe_wav_groq_bytes(audio, speech), "groq"
+
+
+def archive_audio_if_requested(audio: bytes, speech: SpeechConfig, request_id: str) -> Path | None:
+    if not speech.archive_dir:
+        return None
+    archive_dir = Path(speech.archive_dir).expanduser()
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    safe_request_id = "".join(char for char in request_id if char.isalnum() or char in {"-", "_"})[:48] or uuid.uuid4().hex[:12]
+    path = archive_dir / f"stackchan-{time.strftime('%Y%m%d-%H%M%S')}-{safe_request_id}.wav"
+    path.write_bytes(audio)
+    return path
+
+
+def tts_dir_for(speech: SpeechConfig) -> Path:
+    path = Path(speech.tts_dir or Path.home() / ".hermes" / "stackchan_tts").expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def make_tts_wav(text: str, speech: SpeechConfig, request_id: str) -> str:
+    clean = text.strip()
+    if not clean:
+        return ""
+    out_id = "".join(char for char in request_id if char.isalnum() or char in {"-", "_"})[:48] or uuid.uuid4().hex
+    out_path = tts_dir_for(speech) / f"{out_id}.wav"
+    tmp_mp3 = out_path.with_suffix(".mp3")
+
+    engine = speech.tts_engine.strip().lower()
+    if engine in {"edge", "katja", "edge-tts", "edge_tts"}:
+        python_bin = speech.edge_tts_python or str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python")
+        subprocess.run(
+            [
+                python_bin,
+                "-m",
+                "edge_tts",
+                "--voice",
+                speech.edge_tts_voice,
+                "--rate",
+                speech.edge_tts_rate,
+                "--text",
+                clean,
+                "--write-media",
+                str(tmp_mp3),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(tmp_mp3),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-sample_fmt",
+                "s16",
+                str(out_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        tmp_mp3.unlink(missing_ok=True)
+    else:
+        subprocess.run(
+            ["espeak-ng", "-v", "de", "-s", "180", "-w", str(out_path), clean],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(out_path), "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(out_path.with_suffix(".tmp.wav"))],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+        )
+        out_path.with_suffix(".tmp.wav").replace(out_path)
+    return f"/stackchan/tts/{out_path.name}"
+
+
+class SpeechHttpServer(http.server.ThreadingHTTPServer):
+    config: BridgeConfig
+    pair: PairConfig
+    mqtt_client: Any
+
+
+class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
+    server: SpeechHttpServer
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"[bridge-http] {self.address_string()} {fmt % args}", flush=True)
+
+    def send_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/health":
+            self.send_json(200, {"ok": True, "service": "hermes2stackchan-bridge", "pair_id": self.server.pair.pair_id})
+            return
+        if path.startswith("/stackchan/tts/") and path.endswith(".wav"):
+            filename = Path(path).name
+            wav_path = tts_dir_for(self.server.config.speech) / filename
+            if not wav_path.exists():
+                self.send_json(404, {"ok": False, "error": "tts not found"})
+                return
+            body = wav_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_json(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path != "/stackchan/audio":
+            self.send_json(404, {"ok": False, "error": "not found"})
+            return
+
+        started = time.monotonic()
+        request_id = (
+            self.headers.get("X-H2S-Request-Id")
+            or self.headers.get("X-StackChan-Request-Id")
+            or uuid.uuid4().hex
+        ).strip()
+        pair_id = (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.send_json(400, {"ok": False, "error": "invalid content length", "request_id": request_id})
+            return
+        if length <= 44:
+            self.send_json(400, {"ok": False, "error": "missing wav body", "request_id": request_id})
+            return
+        if length > self.server.config.speech.max_audio_bytes:
+            self.send_json(413, {"ok": False, "error": "audio too large", "request_id": request_id})
+            return
+
+        audio = self.rfile.read(length)
+        read_ms = round((time.monotonic() - started) * 1000)
+        archive_path = archive_audio_if_requested(audio, self.server.config.speech, request_id)
+        if archive_path:
+            print(f"[bridge-http] archived wav: {archive_path}", flush=True)
+        print(f"[bridge-http] received {len(audio)} bytes in {read_ms}ms request_id={request_id}", flush=True)
+
+        try:
+            stt_started = time.monotonic()
+            transcript, backend = transcribe_audio_bytes(audio, self.server.config.speech)
+            stt_ms = round((time.monotonic() - stt_started) * 1000)
+            display_text = transcript or "NICHTS VERSTANDEN"
+            tts_started = time.monotonic()
+            tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if transcript else ""
+            tts_ms = round((time.monotonic() - tts_started) * 1000) if tts_path else 0
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            tts_url = f"http://{host}{tts_path}" if tts_path else ""
+            payload = build_display_payload(display_text, self.server.config.speech.display_duration_ms, request_id)
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            publish_started = time.monotonic()
+            result = self.server.mqtt_client.publish(self.server.pair.display_topic, body, qos=1, retain=False)
+            result.wait_for_publish(timeout=5)
+            mqtt_ms = round((time.monotonic() - publish_started) * 1000)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] transcript after {stt_ms}ms via {backend}: {transcript!r}; "
+                f"display published in {mqtt_ms}ms tts={tts_ms}ms",
+                flush=True,
+            )
+            self.send_json(
+                200,
+                {
+                    "ok": bool(transcript),
+                    "request_id": request_id,
+                    "transcript": transcript,
+                    "stt_backend": backend,
+                    "audio_bytes": len(audio),
+                    "request_read_ms": read_ms,
+                    "stt_ms": stt_ms,
+                    "tts_ms": tts_ms,
+                    "tts_path": tts_path,
+                    "tts_url": tts_url,
+                    "mqtt_ms": mqtt_ms,
+                    "total_ms": total_ms,
+                    "display_topic": self.server.pair.display_topic,
+                },
+            )
+        except Exception as exc:
+            error_text = f"STT FEHLER: {exc}"
+            print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
+            try:
+                payload = build_display_payload("STT FEHLER", 5000, request_id)
+                self.server.mqtt_client.publish(
+                    self.server.pair.display_topic,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    qos=1,
+                    retain=False,
+                )
+            except Exception:
+                pass
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": error_text})
+
+
+def serve_audio(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    connect_and_start(client, config.mqtt)
+    server = SpeechHttpServer((args.host, args.port), SpeechRequestHandler)
+    server.config = config
+    server.pair = pair
+    server.mqtt_client = client
+    print(f"[bridge-http] listening on http://{args.host}:{args.port}", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/audio (audio/wav)", flush=True)
+    print(f"[bridge-http] mirror transcript to {pair.display_topic}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.2)
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+        client.loop_stop()
+        client.disconnect()
+
+
+def bridge_worker(
+    name: str,
+    target: Any,
+    worker_args: argparse.Namespace,
+    stop_event: Event,
+    restart_delay_s: float,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge-run] starting {name}", flush=True)
+            exit_code = target(worker_args)
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge-run] {name} exited with code {exit_code}", flush=True)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)) and stop_event.is_set():
+                return
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge-run] {name} crashed: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        if stop_event.wait(restart_delay_s):
+            return
+
+
+def run_bridge(args: argparse.Namespace) -> int:
+    stop_event = Event()
+    restart_delay_s = max(0.5, float(args.restart_delay_s))
+    workers: list[tuple[str, Any, argparse.Namespace]] = []
+
+    if not args.no_audio:
+        workers.append((
+            "audio-http",
+            serve_audio,
+            argparse.Namespace(config=args.config, env=args.env, pair=args.pair, host=args.host, port=args.port),
+        ))
+    if not args.no_touch_lamp:
+        workers.append((
+            "touch-lamp",
+            watch_touch_lamp,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                verbose=args.touch_verbose,
+                off_delay_ms=args.touch_off_delay_ms,
+            ),
+        ))
+    if not args.no_power:
+        workers.append((
+            "power-watcher",
+            watch_power,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                debounce_s=args.power_debounce_s,
+                announce_initial=args.power_announce_initial,
+                once=False,
+                no_restore_face=args.power_no_restore_face,
+            ),
+        ))
+    if not args.no_life:
+        workers.append((
+            "life-animator",
+            animate_life,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                min_interval_s=args.life_min_interval_s,
+                max_interval_s=args.life_max_interval_s,
+                status_timeout=args.life_status_timeout,
+                seed=args.life_seed,
+                once=False,
+                no_motion=args.life_no_motion,
+            ),
+        ))
+
+    if not workers:
+        raise ConfigError("run needs at least one worker enabled")
+
+    def stop(_signum: int | None = None, _frame: Any | None = None) -> None:
+        stop_event.set()
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    threads = [
+        Thread(
+            target=bridge_worker,
+            name=f"h2s-{name}",
+            args=(name, target, worker_args, stop_event, restart_delay_s),
+            daemon=True,
+        )
+        for name, target, worker_args in workers
+    ]
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge-run] starting unified bridge "
+        f"pair={args.pair} workers={','.join(name for name, _, _ in workers)}",
+        flush=True,
+    )
+    for thread in threads:
+        thread.start()
+
+    try:
+        while not stop_event.wait(1.0):
+            pass
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge-run] stopping unified bridge", flush=True)
+    return 0
+
+
 def get_pair(config: BridgeConfig, pair_id: str) -> PairConfig:
     try:
         return config.pairs[pair_id]
@@ -2043,6 +2860,12 @@ def build_parser() -> argparse.ArgumentParser:
     touch_lamp.add_argument("--off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     touch_lamp.set_defaults(func=watch_touch_lamp)
 
+    serve_audio_parser = subcommands.add_parser("serve-audio", help="Run HTTP audio endpoint and mirror STT text to StackChan display.")
+    serve_audio_parser.add_argument("--pair", default="desk", help="Pair id to serve.")
+    serve_audio_parser.add_argument("--host", default=os.environ.get("H2S_BRIDGE_HTTP_HOST", "0.0.0.0"), help="HTTP listen host.")
+    serve_audio_parser.add_argument("--port", type=int, default=int(os.environ.get("H2S_BRIDGE_HTTP_PORT", "8788")), help="HTTP listen port.")
+    serve_audio_parser.set_defaults(func=serve_audio)
+
     power = subcommands.add_parser("watch-power", help="React to StackChan battery charge/discharge status changes.")
     power.add_argument("--pair", default="desk", help="Pair id to watch.")
     power.add_argument("--debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
@@ -2060,6 +2883,27 @@ def build_parser() -> argparse.ArgumentParser:
     life.add_argument("--once", action="store_true", help="Emit one life sequence and exit.")
     life.add_argument("--no-motion", action="store_true", help="Only animate the face, without servo head motion.")
     life.set_defaults(func=animate_life)
+
+    run = subcommands.add_parser("run", help="Run the full bridge as one multithreaded process.")
+    run.add_argument("--pair", default="desk", help="Pair id to serve.")
+    run.add_argument("--host", default=os.environ.get("H2S_BRIDGE_HTTP_HOST", "0.0.0.0"), help="HTTP listen host.")
+    run.add_argument("--port", type=int, default=int(os.environ.get("H2S_BRIDGE_HTTP_PORT", "8788")), help="HTTP listen port.")
+    run.add_argument("--restart-delay-s", type=float, default=3.0, help="Delay before restarting a crashed worker thread.")
+    run.add_argument("--no-audio", action="store_true", help="Disable the HTTP audio/STT/TTS worker.")
+    run.add_argument("--no-touch-lamp", action="store_true", help="Disable the fast touch/recording LED worker.")
+    run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
+    run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
+    run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
+    run.add_argument("--touch-off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
+    run.add_argument("--power-debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
+    run.add_argument("--power-announce-initial", action="store_true", help="Also show the current power state immediately.")
+    run.add_argument("--power-no-restore-face", action="store_true", help="Do not run delayed face/motion reaction after battery overlay.")
+    run.add_argument("--life-min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
+    run.add_argument("--life-max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
+    run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
+    run.add_argument("--life-seed", type=int, default=None, help="Optional random seed for repeatable tests.")
+    run.add_argument("--life-no-motion", action="store_true", help="Only animate the face, without servo head motion.")
+    run.set_defaults(func=run_bridge)
     return parser
 
 

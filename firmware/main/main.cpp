@@ -18,6 +18,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_lcd_ili9341.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -53,6 +54,9 @@ constexpr uint8_t kEs7210Addr = ES7210_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
 constexpr size_t kFrameBufferBytes = kWidth * kHeight * sizeof(uint16_t);
 constexpr int kAudioSampleRate = 16000;
+constexpr size_t kWavHeaderBytes = 44;
+constexpr int kDefaultIdleYawPct = 0;
+constexpr int kDefaultIdlePitchPct = 45;
 constexpr int kVoiceStartGraceMs = 250;
 constexpr int kVoiceNoSpeechTimeoutMs = 5000;
 constexpr int kVoiceMinSpeechMs = 250;
@@ -182,6 +186,20 @@ struct MotionCommand {
     MotionPoint points[48];
 };
 
+struct HttpResponseBuffer {
+    char data[2048] = {};
+    int len = 0;
+    bool truncated = false;
+};
+
+struct WavPlaybackState {
+    uint8_t header[256] = {};
+    int header_len = 0;
+    bool data_started = false;
+    uint8_t pending_byte = 0;
+    bool has_pending_byte = false;
+};
+
 enum class UiCommandType : uint8_t {
     Display,
     Face,
@@ -190,7 +208,7 @@ enum class UiCommandType : uint8_t {
 
 struct UiCommand {
     UiCommandType type;
-    char text[192];
+    char text[768];
     char emotion[24];
     int intensity_pct;
     int duration_ms;
@@ -209,6 +227,9 @@ enum class FaceExtraMode : uint8_t {
 
 volatile FaceExtraMode g_face_extra_mode = FaceExtraMode::None;
 
+bool wait_for_wifi(TickType_t timeout);
+bool play_wav_url(const char* url);
+
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
@@ -217,6 +238,36 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 int clamp_int(int value, int min_value, int max_value)
 {
     return std::max(min_value, std::min(max_value, value));
+}
+
+void write_le16(uint8_t* out, uint16_t value)
+{
+    out[0] = static_cast<uint8_t>(value & 0xff);
+    out[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+}
+
+void write_le32(uint8_t* out, uint32_t value)
+{
+    out[0] = static_cast<uint8_t>(value & 0xff);
+    out[1] = static_cast<uint8_t>((value >> 8) & 0xff);
+    out[2] = static_cast<uint8_t>((value >> 16) & 0xff);
+    out[3] = static_cast<uint8_t>((value >> 24) & 0xff);
+}
+
+void make_wav_header(uint8_t* out, uint32_t pcm_bytes)
+{
+    std::memcpy(out + 0, "RIFF", 4);
+    write_le32(out + 4, 36 + pcm_bytes);
+    std::memcpy(out + 8, "WAVEfmt ", 8);
+    write_le32(out + 16, 16);
+    write_le16(out + 20, 1);
+    write_le16(out + 22, 1);
+    write_le32(out + 24, kAudioSampleRate);
+    write_le32(out + 28, kAudioSampleRate * 2);
+    write_le16(out + 32, 2);
+    write_le16(out + 34, 16);
+    std::memcpy(out + 36, "data", 4);
+    write_le32(out + 40, pcm_bytes);
 }
 
 int sanitize_temperature_c(int value)
@@ -1126,6 +1177,73 @@ void draw_wrapped_message(const char* title, const char* message, uint16_t accen
     }
 }
 
+int count_words(const char* text)
+{
+    int count = 0;
+    bool in_word = false;
+    for (const char* p = text; p && *p; ++p) {
+        const bool space = std::isspace(static_cast<unsigned char>(*p)) != 0;
+        if (space) {
+            in_word = false;
+        } else if (!in_word) {
+            in_word = true;
+            ++count;
+        }
+    }
+    return count;
+}
+
+void draw_word_message(const char* title, const char* word, int index, int total, uint16_t accent)
+{
+    wake_display_if_needed();
+    copy_ui_mode("display");
+    FrameGuard frame;
+    clear(kBlack);
+    draw_centered_text(16, title, 2, accent);
+    draw_rect(24, 45, 272, 2, accent);
+
+    const int len = static_cast<int>(std::strlen(word));
+    const int scale = len <= 6 ? 7 : len <= 9 ? 6 : len <= 12 ? 5 : len <= 18 ? 4 : 3;
+    const int text_height = 7 * scale;
+    draw_centered_text((kHeight - text_height) / 2 + 8, word, scale, rgb565(245, 250, 255));
+
+    if (total > 1) {
+        const int bar_w = 240;
+        const int filled = clamp_int((bar_w * index) / total, 1, bar_w);
+        draw_rect((kWidth - bar_w) / 2, 218, bar_w, 4, rgb565(24, 45, 60));
+        draw_rect((kWidth - bar_w) / 2, 218, filled, 4, accent);
+    }
+}
+
+void draw_word_sequence(const char* title, const char* text, int duration_ms, uint16_t accent)
+{
+    const int total = std::max(1, count_words(text));
+    const int per_word_ms = clamp_int(duration_ms / total, 360, 1150);
+    const char* cursor = text;
+    int index = 0;
+
+    while (cursor && *cursor) {
+        while (*cursor && std::isspace(static_cast<unsigned char>(*cursor))) {
+            ++cursor;
+        }
+        if (!*cursor) {
+            break;
+        }
+        char word[64] = {};
+        int len = 0;
+        while (*cursor && !std::isspace(static_cast<unsigned char>(*cursor)) && len < static_cast<int>(sizeof(word) - 1)) {
+            word[len++] = *cursor++;
+        }
+        word[len] = '\0';
+        while (*cursor && !std::isspace(static_cast<unsigned char>(*cursor))) {
+            ++cursor;
+        }
+        ++index;
+        draw_word_message(title, word, index, total, accent);
+        vTaskDelay(pdMS_TO_TICKS(per_word_ms));
+    }
+}
+
 void copy_face_emotion(const char* emotion, int intensity_pct)
 {
     const char* value = emotion && *emotion ? emotion : "neutral";
@@ -1150,7 +1268,13 @@ bool is_transient_face_emotion(const char* emotion)
            std::strcmp(emotion, "look_down") == 0 ||
            std::strcmp(emotion, "breathe") == 0 ||
            std::strcmp(emotion, "deep_breathe") == 0 ||
-           std::strcmp(emotion, "micro_sleep") == 0;
+           std::strcmp(emotion, "micro_sleep") == 0 ||
+           std::strcmp(emotion, "wink_left") == 0 ||
+           std::strcmp(emotion, "wink_right") == 0 ||
+           std::strcmp(emotion, "surprise_pop") == 0 ||
+           std::strcmp(emotion, "grumble") == 0 ||
+           std::strcmp(emotion, "yawn") == 0 ||
+           std::strcmp(emotion, "happy_squint") == 0;
 }
 
 void draw_face(const char* emotion, int intensity_pct);
@@ -1284,6 +1408,106 @@ void animate_transient_face(const char* emotion, int intensity_pct)
                 draw_centered_text(26, "Z", 1, rgb565(90, 150, 220));
             }
             vTaskDelay(pdMS_TO_TICKS(i >= 2 && i <= 4 ? 180 : 90));
+        }
+        draw_face(base_emotion, base_intensity);
+        return;
+    }
+
+    if (std::strcmp(emotion, "wink_left") == 0 ||
+        std::strcmp(emotion, "wink_right") == 0) {
+        const bool left_closed = std::strcmp(emotion, "wink_left") == 0;
+        const int pupil_shift = left_closed ? 4 : -4;
+        const int phases[] = {0, 1, 2, 2, 1, 0};
+        for (int phase : phases) {
+            FaceFrameGuard frame;
+            clear(kBlack);
+            const uint16_t white = rgb565(245, 250, 255);
+            const int pulse = clamp_int(base_intensity / 18, 0, 6);
+            const int left_x = 105;
+            const int right_x = 215;
+            const int eye_y = 92;
+            const int mouth_y = 154;
+            if (left_closed) {
+                draw_line(left_x - 24, eye_y, left_x + 24, eye_y + phase, white, 5);
+                draw_open_eyes(right_x, right_x, eye_y, 13 + pulse, 28 + pulse, pupil_shift, 0, white);
+            } else {
+                draw_open_eyes(left_x, left_x, eye_y, 13 + pulse, 28 + pulse, pupil_shift, 0, white);
+                draw_line(right_x - 24, eye_y + phase, right_x + 24, eye_y, white, 5);
+            }
+            draw_mouth_curve(160 + pupil_shift, mouth_y - 8, 70, 24 + pulse, true, white);
+            vTaskDelay(pdMS_TO_TICKS(80));
+        }
+        draw_face(base_emotion, base_intensity);
+        return;
+    }
+
+    if (std::strcmp(emotion, "surprise_pop") == 0) {
+        const int sizes[] = {0, 4, 10, 4, 0};
+        for (int size : sizes) {
+            draw_life_face_frame(base_emotion,
+                                 clamp_int(base_intensity + size, 0, 100),
+                                 0,
+                                 -size / 3,
+                                 30 + size,
+                                 0,
+                                 -size / 4);
+            draw_ellipse(160, 154, 18 + size, 18 + size / 2, rgb565(245, 250, 255));
+            draw_ellipse(160, 154, 8 + size / 2, 8 + size / 4, kBlack);
+            vTaskDelay(pdMS_TO_TICKS(95));
+        }
+        draw_face(base_emotion, base_intensity);
+        return;
+    }
+
+    if (std::strcmp(emotion, "happy_squint") == 0) {
+        const int offsets[] = {0, 2, 4, 4, 2, 0};
+        for (int offset : offsets) {
+            FaceFrameGuard frame;
+            clear(kBlack);
+            const uint16_t warm = rgb565(255, 230, 120);
+            const uint16_t white = rgb565(245, 250, 255);
+            draw_mouth_curve(105, 86 + offset, 46, 18, false, warm);
+            draw_mouth_curve(215, 86 + offset, 46, 18, false, warm);
+            draw_mouth_curve(160, 146, 88, 34 + offset, true, white);
+            vTaskDelay(pdMS_TO_TICKS(105));
+        }
+        draw_face(base_emotion, base_intensity);
+        return;
+    }
+
+    if (std::strcmp(emotion, "grumble") == 0) {
+        const int wiggles[] = {0, 3, -2, 2, 0};
+        for (int wiggle : wiggles) {
+            draw_life_face_frame(base_emotion,
+                                 clamp_int(base_intensity - 6, 0, 100),
+                                 0,
+                                 2,
+                                 26,
+                                 wiggle / 2,
+                                 0,
+                                 3);
+            draw_line(126, 170 + wiggle, 194, 166 - wiggle, rgb565(245, 250, 255), 3);
+            vTaskDelay(pdMS_TO_TICKS(110));
+        }
+        draw_face(base_emotion, base_intensity);
+        return;
+    }
+
+    if (std::strcmp(emotion, "yawn") == 0) {
+        const int sizes[] = {2, 8, 16, 22, 18, 8, 2};
+        for (int i = 0; i < 7; ++i) {
+            const int size = sizes[i];
+            draw_life_face_frame(base_emotion,
+                                 clamp_int(base_intensity - 8, 0, 100),
+                                 0,
+                                 3,
+                                 clamp_int(24 - size / 2, 4, 28),
+                                 0,
+                                 1,
+                                 0);
+            draw_ellipse(160, 158, 24 + size, 10 + size, rgb565(245, 250, 255));
+            draw_ellipse(160, 158, 12 + size / 2, 4 + size / 2, kBlack);
+            vTaskDelay(pdMS_TO_TICKS(i >= 2 && i <= 4 ? 160 : 95));
         }
         draw_face(base_emotion, base_intensity);
         return;
@@ -2531,9 +2755,92 @@ void copy_cstr(char* destination, size_t destination_len, const char* source)
     destination[destination_len - 1] = '\0';
 }
 
+void append_ascii_text(char* destination, size_t destination_len, size_t& offset, const char* text)
+{
+    for (const char* p = text; p && *p && offset + 1 < destination_len; ++p) {
+        destination[offset++] = *p;
+    }
+    destination[offset] = '\0';
+}
+
+void copy_display_text(char* destination, size_t destination_len, const char* source)
+{
+    if (!destination || destination_len == 0) {
+        return;
+    }
+    destination[0] = '\0';
+    size_t offset = 0;
+    const auto* p = reinterpret_cast<const uint8_t*>(source ? source : "");
+    while (*p && offset + 1 < destination_len) {
+        if (p[0] == 0xC3 && p[1] != 0) {
+            switch (p[1]) {
+            case 0x84:
+            case 0xA4:
+                append_ascii_text(destination, destination_len, offset, "ae");
+                p += 2;
+                continue;
+            case 0x96:
+            case 0xB6:
+                append_ascii_text(destination, destination_len, offset, "oe");
+                p += 2;
+                continue;
+            case 0x9C:
+            case 0xBC:
+                append_ascii_text(destination, destination_len, offset, "ue");
+                p += 2;
+                continue;
+            case 0x9F:
+                append_ascii_text(destination, destination_len, offset, "ss");
+                p += 2;
+                continue;
+            default:
+                break;
+            }
+        }
+        const char c = static_cast<char>(*p++);
+        destination[offset++] = (static_cast<unsigned char>(c) < 128) ? c : ' ';
+        destination[offset] = '\0';
+    }
+}
+
 bool enqueue_ui_command(const UiCommand& command)
 {
     return g_ui_queue && xQueueSend(g_ui_queue, &command, pdMS_TO_TICKS(50)) == pdTRUE;
+}
+
+bool extract_json_string(const char* json, const char* key, char* out, size_t out_len)
+{
+    if (!json || !key || !out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    char pattern[64] = {};
+    std::snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char* p = std::strstr(json, pattern);
+    if (!p) {
+        return false;
+    }
+    p = std::strchr(p + std::strlen(pattern), ':');
+    if (!p) {
+        return false;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    if (*p != '"') {
+        return false;
+    }
+    ++p;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_len) {
+        if (*p == '\\' && p[1]) {
+            ++p;
+        }
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return n > 0;
 }
 
 void enqueue_direction_glance(int yaw_change_pct, int pitch_change_pct)
@@ -2578,7 +2885,7 @@ void handle_display_command(const char* data, int len)
     command.type = UiCommandType::Display;
     command.accent = rgb565(0, 220, 230);
     command.duration_ms = clamp_int(json_int(root, "duration_ms", 3500), 500, 10000);
-    copy_cstr(command.text, sizeof(command.text), text);
+    copy_display_text(command.text, sizeof(command.text), text);
     copy_cstr(command.emotion, sizeof(command.emotion), "neutral");
     command.intensity_pct = g_face_intensity_pct;
     if (!enqueue_ui_command(command)) {
@@ -2648,8 +2955,8 @@ void handle_move_command(const char* data, int len)
         } else if (std::strcmp(direction, "right") == 0) {
             yaw_target_pct = 100;
         } else if (std::strcmp(direction, "center") == 0 || std::strcmp(direction, "straight") == 0) {
-            yaw_target_pct = 0;
-            pitch_target_pct = 0;
+            yaw_target_pct = kDefaultIdleYawPct;
+            pitch_target_pct = kDefaultIdlePitchPct;
         } else if (std::strcmp(direction, "up") == 0) {
             pitch_target_pct = 100;
         } else if (std::strcmp(direction, "down") == 0) {
@@ -2842,7 +3149,7 @@ void handle_say_command(const char* data, int len)
     command.intensity_pct = json_int(root, "intensity_pct", 70);
     command.duration_ms = clamp_int(json_int(root, "duration_ms", 4500), 1000, 15000);
     command.beep = json_bool(root, "beep", true);
-    copy_cstr(command.text, sizeof(command.text), text);
+    copy_display_text(command.text, sizeof(command.text), text);
     copy_cstr(command.emotion, sizeof(command.emotion), emotion);
     if (!enqueue_ui_command(command)) {
         publish_error(request_id, "say", "ui queue full");
@@ -2986,6 +3293,196 @@ void handle_system_command(const char* data, int len)
     cJSON_Delete(root);
 }
 
+esp_err_t http_event_handler(esp_http_client_event_t* evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->user_data || !evt->data || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    auto* response = static_cast<HttpResponseBuffer*>(evt->user_data);
+    const int space = static_cast<int>(sizeof(response->data)) - response->len - 1;
+    if (space <= 0) {
+        response->truncated = true;
+        return ESP_OK;
+    }
+    const int copy = std::min(space, evt->data_len);
+    if (copy < evt->data_len) {
+        response->truncated = true;
+    }
+    std::memcpy(response->data + response->len, evt->data, copy);
+    response->len += copy;
+    response->data[response->len] = '\0';
+    return ESP_OK;
+}
+
+bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request_id, const char* source)
+{
+    if (!wav || wav_size <= kWavHeaderBytes) {
+        return false;
+    }
+    if (std::strlen(CONFIG_STACKCHAN_BRIDGE_AUDIO_URL) == 0) {
+        ESP_LOGW(kTag, "voice upload skipped: CONFIG_STACKCHAN_BRIDGE_AUDIO_URL is empty");
+        publish_event("audio_upload_skipped", source, request_id, "bridge audio url empty");
+        return false;
+    }
+    if (!wait_for_wifi(pdMS_TO_TICKS(5000))) {
+        ESP_LOGW(kTag, "voice upload skipped: wifi not connected");
+        publish_event("audio_upload_failed", source, request_id, "wifi not connected");
+        return false;
+    }
+
+    auto response = std::make_unique<HttpResponseBuffer>();
+    esp_http_client_config_t config = {};
+    config.url = CONFIG_STACKCHAN_BRIDGE_AUDIO_URL;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 45000;
+    config.disable_auto_redirect = true;
+    config.event_handler = http_event_handler;
+    config.user_data = response.get();
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGW(kTag, "voice upload failed: http client init");
+        publish_event("audio_upload_failed", source, request_id, "http init failed");
+        return false;
+    }
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Content-Type", "audio/wav"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Pair-Id", CONFIG_STACKCHAN_PAIR_ID));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-StackChan-Id", CONFIG_STACKCHAN_STACKCHAN_ID));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Request-Id", request_id && *request_id ? request_id : ""));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Recording-Source", source && *source ? source : "unknown"));
+
+    ESP_LOGI(kTag,
+             "voice upload start: %u bytes -> %s request_id=%s",
+             static_cast<unsigned>(wav_size),
+             CONFIG_STACKCHAN_BRIDGE_AUDIO_URL,
+             request_id && *request_id ? request_id : "");
+    publish_event("audio_upload_started", source, request_id, "posting wav to bridge");
+
+    esp_err_t err = esp_http_client_set_post_field(client,
+                                                   reinterpret_cast<const char*>(wav),
+                                                   static_cast<int>(wav_size));
+    const int64_t started_us = esp_timer_get_time();
+    if (err == ESP_OK) {
+        err = esp_http_client_perform(client);
+    }
+    const int elapsed_ms = static_cast<int>((esp_timer_get_time() - started_us) / 1000);
+    const int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(kTag,
+                 "voice upload failed: err=%s status=%d elapsed=%dms response=%s",
+                 esp_err_to_name(err),
+                 status,
+                 elapsed_ms,
+                 response->data);
+        publish_event("audio_upload_failed", source, request_id, "bridge upload failed");
+        return false;
+    }
+
+    ESP_LOGI(kTag, "voice upload done: status=%d elapsed=%dms response=%s", status, elapsed_ms, response->data);
+    publish_event("audio_upload_done", source, request_id, "bridge accepted wav");
+    char tts_url[256] = {};
+    if (extract_json_string(response->data, "tts_url", tts_url, sizeof(tts_url))) {
+        play_wav_url(tts_url);
+    }
+    return true;
+}
+
+void write_aligned_pcm16(WavPlaybackState& state, const uint8_t* data, int len)
+{
+    if (!data || len <= 0 || !g_audio_output_ready || !g_audio_output) {
+        return;
+    }
+    if (state.has_pending_byte) {
+        uint8_t sample[2] = {state.pending_byte, data[0]};
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, sample, sizeof(sample)));
+        state.has_pending_byte = false;
+        ++data;
+        --len;
+    }
+    const int aligned_len = len & ~1;
+    if (aligned_len > 0) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, const_cast<uint8_t*>(data), aligned_len));
+        data += aligned_len;
+        len -= aligned_len;
+    }
+    if (len == 1) {
+        state.pending_byte = data[0];
+        state.has_pending_byte = true;
+    }
+}
+
+int find_wav_data_offset(const uint8_t* data, int len)
+{
+    if (!data || len < 12 || std::memcmp(data, "RIFF", 4) != 0 || std::memcmp(data + 8, "WAVE", 4) != 0) {
+        return -1;
+    }
+    for (int i = 12; i + 8 <= len; ++i) {
+        if (std::memcmp(data + i, "data", 4) == 0) {
+            return i + 8;
+        }
+    }
+    return -1;
+}
+
+esp_err_t wav_playback_http_event_handler(esp_http_client_event_t* evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->user_data || !evt->data || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    auto* state = static_cast<WavPlaybackState*>(evt->user_data);
+    const auto* bytes = static_cast<const uint8_t*>(evt->data);
+    int len = evt->data_len;
+    if (!state->data_started) {
+        const int copy = std::min<int>(len, sizeof(state->header) - state->header_len);
+        std::memcpy(state->header + state->header_len, bytes, copy);
+        state->header_len += copy;
+        const int data_offset = find_wav_data_offset(state->header, state->header_len);
+        if (data_offset < 0) {
+            return ESP_OK;
+        }
+        state->data_started = true;
+        if (state->header_len > data_offset) {
+            write_aligned_pcm16(*state, state->header + data_offset, state->header_len - data_offset);
+        }
+        bytes += copy;
+        len -= copy;
+    }
+    write_aligned_pcm16(*state, bytes, len);
+    return ESP_OK;
+}
+
+bool play_wav_url(const char* url)
+{
+    if (!url || !*url || !g_audio_output_ready || !g_audio_output) {
+        return false;
+    }
+    WavPlaybackState playback = {};
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = 30000;
+    config.disable_auto_redirect = true;
+    config.event_handler = wav_playback_http_event_handler;
+    config.user_data = &playback;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return false;
+    }
+    ESP_LOGI(kTag, "tts playback start: %s", url);
+    const esp_err_t err = esp_http_client_perform(client);
+    const int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (playback.has_pending_byte) {
+        uint8_t sample[2] = {playback.pending_byte, 0};
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, sample, sizeof(sample)));
+    }
+    ESP_LOGI(kTag, "tts playback done: status=%d err=%s", status, esp_err_to_name(err));
+    return err == ESP_OK && status >= 200 && status < 300;
+}
+
 void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, int data_len)
 {
     if (topic_matches(topic, topic_len, g_topic_display)) {
@@ -3081,9 +3578,8 @@ void ui_task(void*)
         }
 
         if (command.type == UiCommandType::Display) {
-            draw_wrapped_message("STACKCHAN", command.text, command.accent);
+            draw_word_sequence("HERMES", command.text, command.duration_ms, command.accent);
             publish_status();
-            vTaskDelay(pdMS_TO_TICKS(command.duration_ms));
             draw_face(g_face_emotion, g_face_intensity_pct);
         } else if (command.type == UiCommandType::Face) {
             if (is_transient_face_emotion(command.emotion)) {
@@ -3116,11 +3612,24 @@ void audio_state_task(void*)
     int64_t last_status_ms = 0;
     bool speech_seen = false;
     int active_chunks = 0;
+    uint8_t* wav = nullptr;
+    size_t wav_capacity_bytes = 0;
+    size_t captured_samples = 0;
+    char upload_request_id[24] = {};
+    char upload_source[24] = {};
     const int min_speech_chunks = std::max(1, (kAudioSampleRate * kVoiceMinSpeechMs / 1000 + kAudioChunkSamples - 1) /
                                               kAudioChunkSamples);
 
     while (true) {
         if (!g_recording) {
+            if (wav) {
+                heap_caps_free(wav);
+                wav = nullptr;
+            }
+            wav_capacity_bytes = 0;
+            captured_samples = 0;
+            upload_request_id[0] = '\0';
+            upload_source[0] = '\0';
             session_start_ms = 0;
             quiet_started_ms = 0;
             last_draw_ms = 0;
@@ -3139,12 +3648,40 @@ void audio_state_task(void*)
             speech_seen = false;
             active_chunks = 0;
             reset_voice_meter();
+            captured_samples = 0;
+            copy_cstr(upload_source, sizeof(upload_source), g_recording_source);
+            std::snprintf(upload_request_id,
+                          sizeof(upload_request_id),
+                          "%08x%08x",
+                          static_cast<unsigned>(esp_timer_get_time() & 0xffffffff),
+                          static_cast<unsigned>(esp_random()));
+            if (wav) {
+                heap_caps_free(wav);
+                wav = nullptr;
+            }
+            const size_t max_samples = static_cast<size_t>(kAudioSampleRate) *
+                                       static_cast<size_t>(clamp_int(static_cast<int>(g_recording_max_ms), 1000, 60000)) /
+                                       1000;
+            wav_capacity_bytes = kWavHeaderBytes + max_samples * sizeof(int16_t);
+            wav = static_cast<uint8_t*>(heap_caps_malloc(wav_capacity_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (!wav) {
+                wav = static_cast<uint8_t*>(heap_caps_malloc(wav_capacity_bytes, MALLOC_CAP_8BIT));
+            }
+            if (!wav) {
+                ESP_LOGW(kTag, "voice monitor stopped: no wav buffer for %u bytes", static_cast<unsigned>(wav_capacity_bytes));
+                set_recording_state(false, g_recording_source, "", "audio buffer allocation failed");
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            make_wav_header(wav, 0);
             ESP_LOGI(kTag,
-                     "voice monitor start: source=%s max=%dms silence=%dms no_voice=%dms",
+                     "voice monitor start: source=%s max=%dms silence=%dms no_voice=%dms wav_cap=%u request_id=%s",
                      g_recording_source,
                      static_cast<int>(g_recording_max_ms),
                      static_cast<int>(g_recording_silence_timeout_ms),
-                     kVoiceNoSpeechTimeoutMs);
+                     kVoiceNoSpeechTimeoutMs,
+                     static_cast<unsigned>(wav_capacity_bytes),
+                     upload_request_id);
         }
 
         if (!g_audio_input_ready || !g_audio_input) {
@@ -3162,6 +3699,17 @@ void audio_state_task(void*)
             set_recording_state(false, g_recording_source, "", "microphone read failed");
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
+        }
+
+        if (wav && wav_capacity_bytes > kWavHeaderBytes) {
+            const size_t max_samples = (wav_capacity_bytes - kWavHeaderBytes) / sizeof(int16_t);
+            const size_t remaining = captured_samples < max_samples ? max_samples - captured_samples : 0;
+            if (remaining > 0) {
+                const size_t copy_samples = std::min(remaining, samples.size());
+                auto* pcm = reinterpret_cast<int16_t*>(wav + kWavHeaderBytes);
+                std::memcpy(pcm + captured_samples, samples.data(), copy_samples * sizeof(int16_t));
+                captured_samples += copy_samples;
+            }
         }
 
         int64_t sum = 0;
@@ -3212,7 +3760,17 @@ void audio_state_task(void*)
                      avg,
                      peak,
                      level_pct);
+            const size_t actual_pcm_bytes = captured_samples * sizeof(int16_t);
+            if (wav && actual_pcm_bytes > 0) {
+                make_wav_header(wav, static_cast<uint32_t>(actual_pcm_bytes));
+            }
             set_recording_state(false, g_recording_source, "", "voice silence");
+            if (wav && actual_pcm_bytes > kAudioSampleRate / 2) {
+                draw_wrapped_message("SPRACHE", "SENDE ZUR BRIDGE", rgb565(0, 220, 230));
+                post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                draw_face(g_face_emotion, g_face_intensity_pct);
+                publish_status();
+            }
         } else if (!speech_seen && elapsed_ms >= kVoiceNoSpeechTimeoutMs) {
             ESP_LOGI(kTag,
                      "voice monitor stop: no voice elapsed=%lldms avg=%d peak=%d level=%d%%",
@@ -3228,7 +3786,17 @@ void audio_state_task(void*)
                      avg,
                      peak,
                      level_pct);
+            const size_t actual_pcm_bytes = captured_samples * sizeof(int16_t);
+            if (wav && actual_pcm_bytes > 0) {
+                make_wav_header(wav, static_cast<uint32_t>(actual_pcm_bytes));
+            }
             set_recording_state(false, g_recording_source, "", "max duration");
+            if (speech_seen && wav && actual_pcm_bytes > kAudioSampleRate / 2) {
+                draw_wrapped_message("SPRACHE", "SENDE ZUR BRIDGE", rgb565(0, 220, 230));
+                post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                draw_face(g_face_emotion, g_face_intensity_pct);
+                publish_status();
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
