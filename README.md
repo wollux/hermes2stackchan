@@ -241,7 +241,7 @@ scripts/status_life_animator.sh desk
 scripts/stop_life_animator.sh desk
 ```
 
-The life animator only runs while StackChan is idle on the face screen. It avoids LED and sound commands. It currently sends face impulses and occasional small head movements. PR #4 extends this with more frequent blinking and larger desk-scan movements.
+The life animator only runs while StackChan is idle on the face screen. It avoids LED and sound commands. It sends face impulses and occasional bounded head movements. Idle action now includes horizontal sweeps, cautious up/down scans, diagonal room glances, matching pupil direction, blinking, breathing, mouth impulses, and tiny micro-sleep moments.
 
 ## What Worked In The Prototype
 

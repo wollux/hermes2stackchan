@@ -1075,12 +1075,41 @@ def build_subtle_life_motion(rng: random.Random) -> tuple[str, dict[str, Any]]:
 
 
 def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) -> list[tuple[int, dict[str, Any]]]:
-    left_first = rng.choice([True, False])
-    first = -75 if left_first else 75
-    second = 75 if left_first else -75
-    first_glance = "glance_left" if left_first else "glance_right"
-    second_glance = "glance_right" if left_first else "glance_left"
-    center_glance = first_glance
+    pattern = rng.choices(["horizontal", "vertical", "diagonal"], weights=[5, 3, 2], k=1)[0]
+    if pattern == "vertical":
+        up_first = rng.choice([True, False])
+        first_yaw = rng.choice([-10, 10])
+        second_yaw = -first_yaw
+        first_pitch = 28 if up_first else -20
+        second_pitch = -18 if up_first else 24
+        first_glance = "glance_up" if up_first else "glance_down"
+        second_glance = "glance_down" if up_first else "glance_up"
+        center_glance = rng.choice(["glance_left", "glance_right"])
+        first_speed = 24
+        second_speed = 22
+    elif pattern == "diagonal":
+        left_first = rng.choice([True, False])
+        first_yaw = -58 if left_first else 58
+        second_yaw = 46 if left_first else -46
+        first_pitch = rng.choice([18, 22])
+        second_pitch = rng.choice([-16, -20])
+        first_glance = "glance_up"
+        second_glance = "glance_down"
+        center_glance = "glance_right" if left_first else "glance_left"
+        first_speed = 30
+        second_speed = 28
+    else:
+        left_first = rng.choice([True, False])
+        first_yaw = -75 if left_first else 75
+        second_yaw = 75 if left_first else -75
+        first_pitch = 4
+        second_pitch = 6
+        first_glance = "glance_left" if left_first else "glance_right"
+        second_glance = "glance_right" if left_first else "glance_left"
+        center_glance = first_glance
+        first_speed = 34
+        second_speed = 32
+
     return [
         (0, {"action": "face", "emotion": first_glance, "intensity_pct": base_intensity}),
         (
@@ -1088,8 +1117,16 @@ def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) 
             {
                 "action": "motion",
                 "curve": "spline",
-                "speed_pct": 34,
-                "points": [{"yaw_pct": first, "pitch_pct": 4, "duration_ms": 900, "speed_pct": 34, "hold_ms": 300}],
+                "speed_pct": first_speed,
+                "points": [
+                    {
+                        "yaw_pct": first_yaw,
+                        "pitch_pct": first_pitch,
+                        "duration_ms": 900,
+                        "speed_pct": first_speed,
+                        "hold_ms": 300,
+                    }
+                ],
             },
         ),
         (650, {"action": "face", "emotion": first_glance, "intensity_pct": base_intensity}),
@@ -1099,8 +1136,16 @@ def build_big_life_sequence(rng: random.Random, base_intensity: int, mood: str) 
             {
                 "action": "motion",
                 "curve": "spline",
-                "speed_pct": 32,
-                "points": [{"yaw_pct": second, "pitch_pct": 6, "duration_ms": 1600, "speed_pct": 32, "hold_ms": 260}],
+                "speed_pct": second_speed,
+                "points": [
+                    {
+                        "yaw_pct": second_yaw,
+                        "pitch_pct": second_pitch,
+                        "duration_ms": 1600,
+                        "speed_pct": second_speed,
+                        "hold_ms": 260,
+                    }
+                ],
             },
         ),
         (850, {"action": "face", "emotion": second_glance, "intensity_pct": base_intensity}),

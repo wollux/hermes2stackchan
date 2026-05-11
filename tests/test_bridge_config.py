@@ -507,27 +507,59 @@ class BridgeConfigTests(unittest.TestCase):
             for delay, action in build_life_sequence(status, random.Random(seed))
             if action["action"] == "motion"
         ]
-        big = [
+        big_horizontal = [
             (delay, motion)
             for delay, motion in motions
             if any(abs(point["yaw_pct"]) >= 60 for point in motion["points"])
+        ]
+        vertical_big = [
+            (delay, motion)
+            for delay, motion in motions
+            if any(abs(point["pitch_pct"]) >= 18 for point in motion["points"])
         ]
         big_faces = [
             (delay, action)
             for seed in range(300)
             for delay, action in build_life_sequence(status, random.Random(seed))
-            if action["action"] == "face" and action["emotion"] in {"glance_left", "glance_right"}
+            if action["action"] == "face" and action["emotion"] in {"glance_left", "glance_right", "glance_up", "glance_down"}
         ]
 
-        self.assertTrue(big)
-        self.assertGreaterEqual(len(big_faces), len(big) * 2)
-        self.assertLess(len(big), len(motions) // 2)
-        for delay, motion in big:
+        self.assertTrue(big_horizontal)
+        self.assertTrue(vertical_big)
+        self.assertGreaterEqual(len(big_faces), (len(big_horizontal) + len(vertical_big)) * 2)
+        self.assertLess(len(big_horizontal) + len(vertical_big), len(motions))
+        for delay, motion in big_horizontal + vertical_big:
             self.assertGreaterEqual(delay, 0)
             self.assertLessEqual(motion["speed_pct"], 34)
             for point in motion["points"]:
                 self.assertLessEqual(abs(point["yaw_pct"]), 75)
-                self.assertLessEqual(abs(point["pitch_pct"]), 6)
+                self.assertLessEqual(abs(point["pitch_pct"]), 28)
+
+    def test_life_sequence_pairs_vertical_faces_with_vertical_motion(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        vertical_sequences = []
+        for seed in range(400):
+            sequence = build_life_sequence(status, random.Random(seed))
+            has_vertical_face = any(
+                action["action"] == "face" and action["emotion"] in {"glance_up", "glance_down"}
+                for _delay, action in sequence
+            )
+            has_vertical_motion = any(
+                action["action"] == "motion"
+                and any(abs(point["pitch_pct"]) >= 18 for point in action["points"])
+                for _delay, action in sequence
+            )
+            if has_vertical_face and has_vertical_motion:
+                vertical_sequences.append(sequence)
+
+        self.assertTrue(vertical_sequences)
 
     def test_life_sequence_can_disable_motion(self) -> None:
         status = {
