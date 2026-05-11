@@ -79,9 +79,9 @@ constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
 constexpr int kInteractionPollIntervalMs = 100;
 constexpr int kInteractionEventCooldownMs = 1500;
-constexpr int kImuIgnoreAfterHeadMotionMs = 1400;
-constexpr int kLtr553NearRawThreshold = 500;
-constexpr int kLtr553NearDeltaThreshold = 180;
+constexpr int kImuIgnoreAfterHeadMotionMs = 4500;
+constexpr int kLtr553NearRawThreshold = 120;
+constexpr int kLtr553NearDeltaThreshold = 55;
 constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
@@ -2982,6 +2982,53 @@ void publish_event(const char* event, const char* source, const char* request_id
     publish_json(g_topic_events, payload);
 }
 
+void publish_interaction_event(const char* source, const char* message)
+{
+    char payload[1400] = {};
+    std::snprintf(payload,
+                  sizeof(payload),
+                  "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
+                  "\"event\":\"interaction\",\"source\":\"%s\",\"request_id\":\"\","
+                  "\"uptime_ms\":%lld,\"recording\":%s,\"speaking\":%s,\"display_sleeping\":%s,"
+                  "\"message\":\"%s\","
+                  "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
+                  "\"sensors\":{\"imu\":{\"ready\":%s,"
+                  "\"accel_mg\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"gyro_dps\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"motion_score_pct\":%d,\"motion_active\":%s},"
+                  "\"ltr553\":{\"ready\":%s,\"proximity_raw\":%d,\"ambient_raw\":%d,"
+                  "\"proximity_baseline\":%d,\"proximity_delta\":%d,"
+                  "\"near\":%s,\"light_changed\":%s}}}",
+                  CONFIG_STACKCHAN_PAIR_ID,
+                  CONFIG_STACKCHAN_STACKCHAN_ID,
+                  source && *source ? source : "sensor",
+                  static_cast<long long>(esp_timer_get_time() / 1000),
+                  g_recording ? "true" : "false",
+                  g_tts_playing ? "true" : "false",
+                  g_display_sleeping ? "true" : "false",
+                  message && *message ? message : "",
+                  static_cast<int>(g_servo_yaw_pct),
+                  static_cast<int>(g_servo_pitch_pct),
+                  g_servo_ready ? "true" : "false",
+                  g_imu_ready ? "true" : "false",
+                  static_cast<int>(g_imu_accel_x_mg),
+                  static_cast<int>(g_imu_accel_y_mg),
+                  static_cast<int>(g_imu_accel_z_mg),
+                  static_cast<int>(g_imu_gyro_x_dps),
+                  static_cast<int>(g_imu_gyro_y_dps),
+                  static_cast<int>(g_imu_gyro_z_dps),
+                  static_cast<int>(g_imu_motion_score_pct),
+                  g_imu_motion_active ? "true" : "false",
+                  g_ltr553_ready ? "true" : "false",
+                  static_cast<int>(g_ltr553_proximity_raw),
+                  static_cast<int>(g_ltr553_ambient_raw),
+                  static_cast<int>(g_ltr553_proximity_baseline),
+                  static_cast<int>(g_ltr553_proximity_delta),
+                  g_ltr553_near ? "true" : "false",
+                  g_ltr553_light_changed ? "true" : "false");
+    publish_json(g_topic_events, payload);
+}
+
 void publish_touch_event(const char* event, const char* source, uint8_t raw, bool pressed, int x, int y)
 {
     char payload[640] = {};
@@ -3277,7 +3324,7 @@ void mark_sensor_interaction(const char* source, const char* message)
         set_lcd_sleep(false);
     }
 
-    publish_event("interaction", source, "", message);
+    publish_interaction_event(source, message);
     publish_status();
 }
 
@@ -3351,7 +3398,7 @@ void update_imu_interaction(bool& previous_motion, bool& has_previous,
             const int64_t now_ms = esp_timer_get_time() / 1000;
             const bool own_head_motion = g_head_motion_active ||
                                          (now_ms - g_last_head_motion_ms) < kImuIgnoreAfterHeadMotionMs;
-            motion = !own_head_motion && (acc_diff >= 2.4f || gyro_abs >= 65.0f);
+            motion = !own_head_motion && (acc_diff >= 1.25f || gyro_abs >= 42.0f);
         }
 
         previous_ax = data.accel_x;
@@ -3370,10 +3417,22 @@ void update_imu_interaction(bool& previous_motion, bool& has_previous,
     previous_motion = motion;
 }
 
+bool imu_orientation_sideways()
+{
+    if (!g_imu_ready) {
+        return false;
+    }
+    const int ax = std::abs(static_cast<int>(g_imu_accel_x_mg));
+    const int ay = std::abs(static_cast<int>(g_imu_accel_y_mg));
+    const int az = std::abs(static_cast<int>(g_imu_accel_z_mg));
+    return ax >= 650 || (ay <= 620 && az >= 650) || (ay <= 460 && std::max(ax, az) >= 540);
+}
+
 void sensor_interaction_task(void*)
 {
     bool previous_near = false;
     bool previous_imu_motion = false;
+    bool previous_sideways = false;
     bool has_previous_imu = false;
     float previous_ax = 0.0f;
     float previous_ay = 0.0f;
@@ -3385,6 +3444,17 @@ void sensor_interaction_task(void*)
         update_ltr553_interaction(previous_near, previous_ambient);
         update_imu_interaction(previous_imu_motion, has_previous_imu,
                                previous_ax, previous_ay, previous_az);
+
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const bool own_head_motion = g_head_motion_active ||
+                                     (now_ms - g_last_head_motion_ms) < kImuIgnoreAfterHeadMotionMs;
+        if (!own_head_motion) {
+            const bool sideways = imu_orientation_sideways();
+            if (sideways != previous_sideways) {
+                mark_sensor_interaction("orientation", sideways ? "stackchan sideways" : "stackchan upright");
+                previous_sideways = sideways;
+            }
+        }
 
         const bool combined = g_ltr553_near || g_imu_motion_active || g_touch_pressed;
         g_interaction_active = combined;

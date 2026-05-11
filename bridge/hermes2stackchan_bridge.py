@@ -48,16 +48,17 @@ EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
-SENSOR_PROXIMITY_ON_DELTA = 120
-SENSOR_PROXIMITY_OFF_DELTA = 65
-SENSOR_PROXIMITY_ON_RAW = 420
-SENSOR_PROXIMITY_OFF_RAW = 260
+SENSOR_PROXIMITY_ON_DELTA = 55
+SENSOR_PROXIMITY_OFF_DELTA = 28
+SENSOR_PROXIMITY_ON_RAW = 120
+SENSOR_PROXIMITY_OFF_RAW = 70
 SENSOR_PROXIMITY_STABLE_SAMPLES = 2
 SENSOR_PROXIMITY_CLEAR_SAMPLES = 3
-SENSOR_PROXIMITY_HEAD_DROP_PCT = 14
+SENSOR_PROXIMITY_HEAD_DROP_PCT = 18
 SENSOR_SIDE_AXIS_MG = 650
+SENSOR_UPRIGHT_AXIS_MG = 620
 SENSOR_SIDE_STABLE_SAMPLES = 3
-SENSOR_SHAKE_SCORE_THRESHOLD = 55
+SENSOR_SHAKE_SCORE_THRESHOLD = 20
 SENSOR_SHAKE_COOLDOWN_S = 4.0
 SENSOR_REACTION_COOLDOWN_S = 1.0
 SENSOR_WAKE_COOLDOWN_S = 2.0
@@ -2104,23 +2105,64 @@ def command_counts_as_idle_activity(pair: PairConfig, topic: str, payload: dict[
     return True
 
 
-def status_is_busy(status: dict[str, Any]) -> bool:
+def status_is_recording(status: dict[str, Any]) -> bool:
     return (
         status_bool(status.get("recording")) is True
-        or status_bool(status.get("speaking")) is True
         or status_bool(nested_status_value(status, "audio.recording")) is True
     )
 
 
+def status_is_busy(status: dict[str, Any]) -> bool:
+    return status_is_recording(status) or status_bool(status.get("speaking")) is True
+
+
 def sensor_status_is_sideways(status: dict[str, Any]) -> bool:
     ax = status_int_at(status, "sensors.imu.accel_mg.x")
-    return abs(ax) >= SENSOR_SIDE_AXIS_MG
+    ay = status_int_at(status, "sensors.imu.accel_mg.y")
+    az = status_int_at(status, "sensors.imu.accel_mg.z")
+    return (
+        abs(ax) >= SENSOR_SIDE_AXIS_MG
+        or (abs(ay) <= SENSOR_UPRIGHT_AXIS_MG and abs(az) >= SENSOR_SIDE_AXIS_MG)
+        or (abs(ay) <= 460 and max(abs(ax), abs(az)) >= 540)
+    )
+
+
+def sensor_shake_motion_action() -> dict[str, Any]:
+    return {
+        "action": "motion",
+        "curve": "spline",
+        "speed_pct": 60,
+        "points": [
+            {"yaw_pct": -16, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 2, "duration_ms": 120},
+            {"yaw_pct": 16, "pitch_pct": DEFAULT_IDLE_PITCH_PCT - 2, "duration_ms": 130},
+            {"yaw_pct": -10, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 120},
+            {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 160},
+        ],
+    }
+
+
+def merge_sensor_event_status(
+    latest_status: dict[str, Any] | None,
+    event_payload: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(latest_status or {})
+    for key in ("recording", "speaking", "display_sleeping"):
+        if key in event_payload:
+            merged[key] = event_payload[key]
+    if "audio" in event_payload and isinstance(event_payload["audio"], dict):
+        merged["audio"] = event_payload["audio"]
+    if "head" in event_payload and isinstance(event_payload["head"], dict):
+        merged["head"] = event_payload["head"]
+    if "sensors" in event_payload and isinstance(event_payload["sensors"], dict):
+        merged["sensors"] = event_payload["sensors"]
+    return merged
 
 
 def build_sensor_reaction_actions(
     status: dict[str, Any] | None,
     state: SensorReactionState,
     now_s: float | None = None,
+    source_hint: str = "",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(status, dict):
         return [], []
@@ -2129,7 +2171,8 @@ def build_sensor_reaction_actions(
     actions: list[dict[str, Any]] = []
     reasons: list[str] = []
     display_sleeping = status_bool(status.get("display_sleeping")) is True
-    busy = status_is_busy(status)
+    recording = status_is_recording(status)
+    source_hint = source_hint.strip().lower()
 
     def maybe_wake(reason: str) -> None:
         if display_sleeping and now_s - state.last_wake_at >= SENSOR_WAKE_COOLDOWN_S:
@@ -2137,15 +2180,17 @@ def build_sensor_reaction_actions(
             reasons.append(f"wake:{reason}")
             state.last_wake_at = now_s
 
-    if busy:
+    if recording:
         return actions, reasons
 
     proximity_ready = status_bool(nested_status_value(status, "sensors.ltr553.ready")) is True
     proximity_delta = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
     proximity_raw = status_int_at(status, "sensors.ltr553.proximity_raw", 0)
     proximity_near = status_bool(nested_status_value(status, "sensors.ltr553.near")) is True
+    force_proximity = source_hint == "proximity"
     near_signal = proximity_ready and (
-        proximity_near
+        force_proximity
+        or proximity_near
         or proximity_delta >= SENSOR_PROXIMITY_ON_DELTA
         or proximity_raw >= SENSOR_PROXIMITY_ON_RAW
     )
@@ -2155,6 +2200,8 @@ def build_sensor_reaction_actions(
         and proximity_raw <= SENSOR_PROXIMITY_OFF_RAW
     )
     if near_signal:
+        if force_proximity:
+            state.proximity_seen_count = max(state.proximity_seen_count, SENSOR_PROXIMITY_STABLE_SAMPLES - 1)
         state.proximity_seen_count += 1
         state.proximity_clear_count = 0
     elif clear_signal:
@@ -2178,7 +2225,7 @@ def build_sensor_reaction_actions(
         )
         maybe_wake("proximity")
         actions.extend([
-            {"action": "face", "emotion": "glance_down", "intensity_pct": 62},
+            {"action": "face", "emotion": "glance_down", "intensity_pct": 78},
             {"action": "move", "pitch_target_pct": target_pitch},
         ])
         reasons.append("proximity_near")
@@ -2198,47 +2245,58 @@ def build_sensor_reaction_actions(
     imu_ready = status_bool(nested_status_value(status, "sensors.imu.ready")) is True
     motion_score = status_int_at(status, "sensors.imu.motion_score_pct", 0)
     imu_motion = status_bool(nested_status_value(status, "sensors.imu.motion_active")) is True
+    sideways = imu_ready and sensor_status_is_sideways(status)
+    imu_event = source_hint in {"imu", "orientation"}
+    if source_hint in {"imu", "orientation"} and sideways:
+        state.side_seen_count = max(state.side_seen_count, SENSOR_SIDE_STABLE_SAMPLES - 1)
+    if source_hint == "orientation" and not sideways:
+        state.upright_seen_count = max(state.upright_seen_count, SENSOR_SIDE_STABLE_SAMPLES - 1)
     if (
-        imu_ready
-        and imu_motion
+        imu_event
+        and imu_ready
+        and (imu_motion or source_hint == "imu")
         and motion_score >= SENSOR_SHAKE_SCORE_THRESHOLD
+        and not sideways
         and now_s - state.last_shake_at >= SENSOR_SHAKE_COOLDOWN_S
     ):
         maybe_wake("shake")
-        actions.append({"action": "face", "emotion": "surprise_pop", "intensity_pct": 88})
+        actions.extend([
+            {"action": "face", "emotion": "surprise_pop", "intensity_pct": 90},
+            sensor_shake_motion_action(),
+        ])
         reasons.append("shake")
         state.last_shake_at = now_s
 
-    sideways = imu_ready and sensor_status_is_sideways(status)
-    if sideways:
-        state.side_seen_count += 1
-        state.upright_seen_count = 0
-    else:
-        state.upright_seen_count += 1
-        state.side_seen_count = 0
+    if imu_event:
+        if sideways:
+            state.side_seen_count += 1
+            state.upright_seen_count = 0
+        else:
+            state.upright_seen_count += 1
+            state.side_seen_count = 0
 
-    if (
-        sideways
-        and not state.side_active
-        and state.side_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
-        and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
-    ):
-        maybe_wake("sideways")
-        actions.append({"action": "face", "emotion": "surprised", "intensity_pct": 78})
-        reasons.append("sideways")
-        state.side_active = True
-        state.last_side_at = now_s
+        if (
+            sideways
+            and not state.side_active
+            and state.side_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
+            and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
+        ):
+            maybe_wake("sideways")
+            actions.append({"action": "face", "emotion": "surprised", "intensity_pct": 86})
+            reasons.append("sideways")
+            state.side_active = True
+            state.last_side_at = now_s
 
-    if (
-        state.side_active
-        and not sideways
-        and state.upright_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
-        and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
-    ):
-        actions.append({"action": "face", "emotion": "neutral", "intensity_pct": 60})
-        reasons.append("upright")
-        state.side_active = False
-        state.last_side_at = now_s
+        if (
+            state.side_active
+            and not sideways
+            and state.upright_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
+            and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
+        ):
+            actions.append({"action": "face", "emotion": "neutral", "intensity_pct": 60})
+            reasons.append("upright")
+            state.side_active = False
+            state.last_side_at = now_s
 
     return actions, reasons
 
@@ -3754,6 +3812,8 @@ def watch_sensors(args: argparse.Namespace) -> int:
         ]
         if args.verbose:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {actions}", flush=True)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {len(actions)} action(s)", flush=True)
         publish_action_messages(client, messages, pair)
         if args.once:
             done.set()
@@ -3774,14 +3834,19 @@ def watch_sensors(args: argparse.Namespace) -> int:
             source = source_value.strip() if isinstance(source_value, str) and source_value.strip() else "sensor"
             if args.verbose:
                 print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor event: {json.dumps(payload, ensure_ascii=False)}", flush=True)
-            if isinstance(latest_status, dict) and status_bool(latest_status.get("display_sleeping")) is True:
-                now_s = time.monotonic()
-                if now_s - state.last_wake_at >= SENSOR_WAKE_COOLDOWN_S:
-                    state.last_wake_at = now_s
-                    publish_reactions(
-                        [{"action": "system", "system_action": "display_wake"}],
-                        [f"wake:{source}"],
-                    )
+
+            def react_to_event() -> None:
+                nonlocal latest_status
+                fresh_status = read_latest_status(config, pair, timeout_s=0.6)
+                if isinstance(fresh_status, dict):
+                    latest_status = fresh_status
+                event_status = merge_sensor_event_status(latest_status, payload)
+                actions, reasons = build_sensor_reaction_actions(event_status, state, source_hint=source)
+                publish_reactions(actions, reasons)
+
+            timer = Timer(0.12, react_to_event)
+            timer.daemon = True
+            timer.start()
             return
 
         if message.topic != pair.status_topic:

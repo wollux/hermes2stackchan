@@ -729,6 +729,8 @@ class BridgeConfigTests(unittest.TestCase):
         motion_score_pct: int = 0,
         motion_active: bool = False,
         accel_x: int = 0,
+        accel_y: int = 820,
+        accel_z: int = 540,
     ) -> dict[str, object]:
         return {
             "display_sleeping": display_sleeping,
@@ -739,7 +741,7 @@ class BridgeConfigTests(unittest.TestCase):
             "sensors": {
                 "imu": {
                     "ready": True,
-                    "accel_mg": {"x": accel_x, "y": 0, "z": 1000},
+                    "accel_mg": {"x": accel_x, "y": accel_y, "z": accel_z},
                     "gyro_dps": {"x": 0, "y": 0, "z": 0},
                     "motion_score_pct": motion_score_pct,
                     "motion_active": motion_active,
@@ -794,31 +796,30 @@ class BridgeConfigTests(unittest.TestCase):
         state = SensorReactionState()
         shake = self.sensor_status(motion_score_pct=75, motion_active=True)
 
-        actions, reasons = build_sensor_reaction_actions(shake, state, now_s=30.0)
-        immediate_actions, _ = build_sensor_reaction_actions(shake, state, now_s=30.5)
-        later_actions, later_reasons = build_sensor_reaction_actions(shake, state, now_s=35.0)
+        actions, reasons = build_sensor_reaction_actions(shake, state, now_s=30.0, source_hint="imu")
+        immediate_actions, _ = build_sensor_reaction_actions(shake, state, now_s=30.5, source_hint="imu")
+        later_actions, later_reasons = build_sensor_reaction_actions(shake, state, now_s=35.0, source_hint="imu")
 
         self.assertEqual(reasons, ["shake"])
-        self.assertEqual(actions, [{"action": "face", "emotion": "surprise_pop", "intensity_pct": 88}])
+        self.assertEqual([action["action"] for action in actions], ["face", "motion"])
+        self.assertEqual(actions[0], {"action": "face", "emotion": "surprise_pop", "intensity_pct": 90})
         self.assertEqual(immediate_actions, [])
         self.assertEqual(later_reasons, ["shake"])
         self.assertEqual(later_actions[0]["emotion"], "surprise_pop")
 
-    def test_sensor_reaction_sideways_requires_stable_samples(self) -> None:
+    def test_sensor_reaction_sideways_requires_orientation_event(self) -> None:
         state = SensorReactionState()
         side = self.sensor_status(accel_x=820)
 
         self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.0)[0], [])
-        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.1)[0], [])
-        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.2)
+        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.1, source_hint="orientation")
 
         self.assertEqual(side_reasons, ["sideways"])
-        self.assertEqual(side_actions, [{"action": "face", "emotion": "surprised", "intensity_pct": 78}])
+        self.assertEqual(side_actions, [{"action": "face", "emotion": "surprised", "intensity_pct": 86}])
 
         upright = self.sensor_status(accel_x=0)
         self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.3)[0], [])
-        self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.4)[0], [])
-        upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=41.5)
+        upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=41.4, source_hint="orientation")
 
         self.assertEqual(upright_reasons, ["upright"])
         self.assertEqual(upright_actions, [{"action": "face", "emotion": "neutral", "intensity_pct": 60}])
