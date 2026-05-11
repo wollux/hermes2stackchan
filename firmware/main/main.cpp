@@ -245,6 +245,7 @@ QueueHandle_t g_ui_queue = nullptr;
 enum class FaceExtraMode : uint8_t {
     None,
     VoiceWaveform,
+    ThoughtBubbles,
 };
 
 volatile FaceExtraMode g_face_extra_mode = FaceExtraMode::None;
@@ -1134,10 +1135,23 @@ void draw_voice_waveform_overlay()
     }
 }
 
+void draw_thought_bubbles_overlay()
+{
+    const uint16_t bubble = rgb565(210, 245, 255);
+    const uint16_t glint = rgb565(245, 255, 255);
+
+    draw_ellipse(232, 62, 5, 5, bubble);
+    draw_ellipse(256, 44, 8, 7, bubble);
+    draw_ellipse(286, 28, 14, 10, bubble);
+    draw_ellipse(282, 24, 4, 3, glint);
+}
+
 void draw_face_extras()
 {
     if (g_face_extra_mode == FaceExtraMode::VoiceWaveform) {
         draw_voice_waveform_overlay();
+    } else if (g_face_extra_mode == FaceExtraMode::ThoughtBubbles) {
+        draw_thought_bubbles_overlay();
     }
 }
 
@@ -3973,8 +3987,10 @@ void audio_state_task(void*)
             }
             set_recording_state(false, g_recording_source, "", "voice silence");
             if (wav && actual_pcm_bytes > kAudioSampleRate / 2) {
+                g_face_extra_mode = FaceExtraMode::ThoughtBubbles;
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                g_face_extra_mode = FaceExtraMode::None;
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
                 start_followup_recording_if_pending();
@@ -4000,8 +4016,10 @@ void audio_state_task(void*)
             }
             set_recording_state(false, g_recording_source, "", "max duration");
             if (speech_seen && wav && actual_pcm_bytes > kAudioSampleRate / 2) {
+                g_face_extra_mode = FaceExtraMode::ThoughtBubbles;
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                g_face_extra_mode = FaceExtraMode::None;
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
                 start_followup_recording_if_pending();
