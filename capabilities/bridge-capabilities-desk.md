@@ -61,6 +61,7 @@ Safe firmware limits are enforced locally.
 Allowed directions: `left`, `right`, `up`, `down`, `center`, `straight`.
 
 Also supported: `yaw_delta`, `pitch_delta`, `yaw_target_pct`, `pitch_target_pct`.
+Use `yaw_target_pct` as -100..100. Use `pitch_target_pct` as 0..100, matching the original StackChan pitch range.
 
 ### motion
 
@@ -73,7 +74,7 @@ Rules:
 - `points` is required.
 - Maximum `points`: 48.
 - `yaw_pct`: -100..100, where 0 is the center/start position.
-- `pitch_pct`: -100..100, where 0 is the center/start position.
+- `pitch_pct`: 0..100, matching the original StackChan pitch range. 0 is down, 45 is the normal idle height, 100 is up.
 - `speed_pct`: 1..100. Used when a point has no `duration_ms`.
 - `duration_ms`: 0 or omitted means derive timing from `speed_pct`; otherwise 40..4000 per segment.
 - `hold_ms`: optional pause after a point, 0..4000.
@@ -88,11 +89,11 @@ Path command with per-point speed:
   "curve": "spline",
   "speed_pct": 35,
   "points": [
-    {"yaw_pct": 0, "pitch_pct": 0},
-    {"yaw_pct": 20, "pitch_pct": 15, "speed_pct": 35},
-    {"yaw_pct": 0, "pitch_pct": 30, "speed_pct": 35},
-    {"yaw_pct": -20, "pitch_pct": 15, "speed_pct": 35},
-    {"yaw_pct": 0, "pitch_pct": 0, "speed_pct": 35}
+    {"yaw_pct": 0, "pitch_pct": 45},
+    {"yaw_pct": 20, "pitch_pct": 60, "speed_pct": 35},
+    {"yaw_pct": 0, "pitch_pct": 75, "speed_pct": 35},
+    {"yaw_pct": -20, "pitch_pct": 60, "speed_pct": 35},
+    {"yaw_pct": 0, "pitch_pct": 45, "speed_pct": 35}
   ],
   "request_id": "motion-001"
 }

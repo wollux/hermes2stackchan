@@ -201,7 +201,7 @@ Send a smooth motion path:
 scripts/h2s_bridge.sh send-motion \
   --pair desk \
   --curve spline \
-  --points '[{"yaw_pct":-20,"pitch_pct":4,"duration_ms":900,"speed_pct":25},{"yaw_pct":20,"pitch_pct":4,"duration_ms":1200,"speed_pct":25},{"yaw_pct":0,"pitch_pct":0,"duration_ms":900,"speed_pct":18}]' \
+  --points '[{"yaw_pct":-20,"pitch_pct":50,"duration_ms":900,"speed_pct":25},{"yaw_pct":20,"pitch_pct":50,"duration_ms":1200,"speed_pct":25},{"yaw_pct":0,"pitch_pct":45,"duration_ms":900,"speed_pct":18}]' \
   --wait-ack
 ```
 

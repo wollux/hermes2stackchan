@@ -25,6 +25,10 @@ SCHEMA_VERSION = "1.0"
 POWER_DISPLAY_DURATION_MS = 5000
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
+YAW_TARGET_MIN_PCT = -100
+YAW_TARGET_MAX_PCT = 100
+PITCH_TARGET_MIN_PCT = 0
+PITCH_TARGET_MAX_PCT = 100
 DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
@@ -852,6 +856,18 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["yaw_target_pct"] = action["pan_pct"]
         if "tilt_pct" in action and "pitch_target_pct" not in payload:
             payload["pitch_target_pct"] = action["tilt_pct"]
+        if "yaw_target_pct" in payload:
+            payload["yaw_target_pct"] = clamp_int(
+                parse_int_value(payload["yaw_target_pct"], DEFAULT_IDLE_YAW_PCT, "move.yaw_target_pct"),
+                YAW_TARGET_MIN_PCT,
+                YAW_TARGET_MAX_PCT,
+            )
+        if "pitch_target_pct" in payload:
+            payload["pitch_target_pct"] = clamp_int(
+                parse_int_value(payload["pitch_target_pct"], DEFAULT_IDLE_PITCH_PCT, "move.pitch_target_pct"),
+                PITCH_TARGET_MIN_PCT,
+                PITCH_TARGET_MAX_PCT,
+            )
         if not payload:
             raise ConfigError("move action needs direction, delta, or target percent")
         return pair.move_topic, with_request_id(payload, action_request_id)
@@ -1059,9 +1075,9 @@ def build_power_followup_actions(previous: dict[str, Any] | None, current: dict[
                 "curve": "spline",
                 "speed_pct": 36,
                 "points": [
-                    {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 180, "speed_pct": 35},
-                    {"yaw_pct": 0, "pitch_pct": 26, "duration_ms": 650, "speed_pct": 35},
-                    {"yaw_pct": 0, "pitch_pct": 14, "duration_ms": 420, "speed_pct": 30},
+                    {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 180, "speed_pct": 35},
+                    {"yaw_pct": 0, "pitch_pct": clamp_int(DEFAULT_IDLE_PITCH_PCT + 26, 0, 100), "duration_ms": 650, "speed_pct": 35},
+                    {"yaw_pct": 0, "pitch_pct": clamp_int(DEFAULT_IDLE_PITCH_PCT + 14, 0, 100), "duration_ms": 420, "speed_pct": 30},
                 ],
             },
         ]
@@ -1074,11 +1090,11 @@ def build_power_followup_actions(previous: dict[str, Any] | None, current: dict[
                 "curve": "spline",
                 "speed_pct": 42,
                 "points": [
-                    {"yaw_pct": 0, "pitch_pct": 0, "duration_ms": 120, "speed_pct": 38},
-                    {"yaw_pct": -14, "pitch_pct": -8, "duration_ms": 280, "speed_pct": 45},
-                    {"yaw_pct": 14, "pitch_pct": -12, "duration_ms": 280, "speed_pct": 45},
-                    {"yaw_pct": -8, "pitch_pct": -16, "duration_ms": 260, "speed_pct": 42},
-                    {"yaw_pct": 0, "pitch_pct": -24, "duration_ms": 600, "speed_pct": 34},
+                    {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 120, "speed_pct": 38},
+                    {"yaw_pct": -14, "pitch_pct": clamp_int(DEFAULT_IDLE_PITCH_PCT - 8, 0, 100), "duration_ms": 280, "speed_pct": 45},
+                    {"yaw_pct": 14, "pitch_pct": clamp_int(DEFAULT_IDLE_PITCH_PCT - 12, 0, 100), "duration_ms": 280, "speed_pct": 45},
+                    {"yaw_pct": -8, "pitch_pct": clamp_int(DEFAULT_IDLE_PITCH_PCT - 16, 0, 100), "duration_ms": 260, "speed_pct": 42},
+                    {"yaw_pct": 0, "pitch_pct": clamp_int(DEFAULT_IDLE_PITCH_PCT - 24, 0, 100), "duration_ms": 600, "speed_pct": 34},
                 ],
             },
         ]
@@ -1172,7 +1188,7 @@ def gaze_for_direction(direction: str) -> str:
 def motion_point(yaw_pct: int, pitch_pct: int, duration_ms: int, speed_pct: int, hold_ms: int = 0) -> dict[str, int]:
     point = {
         "yaw_pct": clamp_int(yaw_pct, -90, 90),
-        "pitch_pct": clamp_int(pitch_pct, -30, 60),
+        "pitch_pct": clamp_int(pitch_pct, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT),
         "duration_ms": clamp_int(duration_ms, 120, 2800),
         "speed_pct": clamp_int(speed_pct, 6, 45),
     }
@@ -1312,11 +1328,16 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
     if name == "look_up_think":
         return [
             (0, life_face("glance_up", base_intensity, name)),
+            (180, life_motion([idle_motion_point(0, 18, 1100, 14, 260), idle_motion_point(0, 0, 1200, 12)], 14, variant=name)),
             (520, life_face("question", base_intensity, name)),
             (820, life_face(mood, base_intensity, name)),
         ]
     if name == "look_down_table":
-        return [(0, life_face("glance_down", base_intensity, name)), (700, life_face("mouth_tiny", low, name))]
+        return [
+            (0, life_face("glance_down", base_intensity, name)),
+            (180, life_motion([idle_motion_point(0, -18, 1100, 14, 260), idle_motion_point(0, 0, 1200, 12)], 14, variant=name)),
+            (700, life_face("mouth_tiny", low, name)),
+        ]
     if name == "wink_left":
         return [(0, life_face("wink_left", high, name))]
     if name == "wink_right":
@@ -1869,9 +1890,9 @@ def send_move(args: argparse.Namespace) -> int:
     if args.pitch_delta is not None:
         payload["pitch_delta"] = args.pitch_delta
     if args.yaw_target_pct is not None:
-        payload["yaw_target_pct"] = args.yaw_target_pct
+        payload["yaw_target_pct"] = clamp_int(args.yaw_target_pct, YAW_TARGET_MIN_PCT, YAW_TARGET_MAX_PCT)
     if args.pitch_target_pct is not None:
-        payload["pitch_target_pct"] = args.pitch_target_pct
+        payload["pitch_target_pct"] = clamp_int(args.pitch_target_pct, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT)
     if not payload:
         raise ConfigError("send-move needs a direction, delta, or target percent")
     return send_payload(args, pair.move_topic, with_request_id(payload, args.request_id))
@@ -1938,8 +1959,8 @@ def normalize_motion_points(points: Any, default_speed_pct: int, default_duratio
             raise ConfigError(f"point {index} speed_pct must be numeric")
 
         item = {
-            "yaw_pct": clamp_int(round(yaw), -100, 100),
-            "pitch_pct": clamp_int(round(pitch), -100, 100),
+            "yaw_pct": clamp_int(round(yaw), YAW_TARGET_MIN_PCT, YAW_TARGET_MAX_PCT),
+            "pitch_pct": clamp_int(round(pitch), PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT),
             "speed_pct": clamp_int(round(speed_pct), 1, 100),
         }
         if duration_ms is not None:
@@ -1961,8 +1982,8 @@ def build_motion_profile_points(args: argparse.Namespace) -> list[dict[str, int]
 
     def point(yaw: int, pitch: int, hold_ms: int = 0, duration_ms: int | None = None) -> dict[str, int]:
         item = {
-            "yaw_pct": clamp_int(yaw, -100, 100),
-            "pitch_pct": clamp_int(pitch, -100, 100),
+            "yaw_pct": clamp_int(yaw, YAW_TARGET_MIN_PCT, YAW_TARGET_MAX_PCT),
+            "pitch_pct": clamp_int(pitch, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT),
             "speed_pct": speed_pct,
         }
         if duration_ms is not None:
@@ -1982,51 +2003,52 @@ def build_motion_profile_points(args: argparse.Namespace) -> list[dict[str, int]
         total_steps = clamp_int(steps * loops, 12, 46)
         arc_segment_duration = clamp_int(round(total_duration_ms / total_steps), 50, 4000)
         approach_duration = clamp_int(round(arc_segment_duration * 6), 300, 1200)
+        center_pitch = DEFAULT_IDLE_PITCH_PCT
         points: list[dict[str, int]] = [
-            point(args.yaw_radius_pct, 0, duration_ms=approach_duration),
+            point(args.yaw_radius_pct, center_pitch, duration_ms=approach_duration),
         ]
         for i in range(1, total_steps + 1):
             angle = 2.0 * math.pi * loops * i / total_steps
             points.append(
                 point(
                     round(math.cos(angle) * args.yaw_radius_pct),
-                    round(math.sin(angle) * args.pitch_radius_pct),
+                    center_pitch + round(math.sin(angle) * args.pitch_radius_pct),
                     duration_ms=arc_segment_duration,
                 )
             )
-        points.append(point(0, 0, duration_ms=approach_duration))
+        points.append(point(0, center_pitch, duration_ms=approach_duration))
         return points
 
     if profile in {"nod", "yes"}:
         segment_duration = max(40, total_duration_ms // 5) if total_duration_ms is not None else None
         return [
-            point(0, 0, duration_ms=segment_duration),
-            point(0, 30, duration_ms=segment_duration),
-            point(0, -22, duration_ms=segment_duration),
-            point(0, 28, duration_ms=segment_duration),
-            point(0, 0, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT + 30, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT - 22, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT + 28, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
         ]
 
     if profile in {"shake", "no"}:
         segment_duration = max(40, total_duration_ms // 6) if total_duration_ms is not None else None
         return [
-            point(0, 0, duration_ms=segment_duration),
-            point(-32, 0, duration_ms=segment_duration),
-            point(32, 0, duration_ms=segment_duration),
-            point(-26, 0, duration_ms=segment_duration),
-            point(26, 0, duration_ms=segment_duration),
-            point(0, 0, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(-32, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(32, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(-26, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(26, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
         ]
 
     if profile in {"look_around", "look-around"}:
         segment_duration = max(40, total_duration_ms // 6) if total_duration_ms is not None else None
         return [
-            point(0, 0, duration_ms=segment_duration),
-            point(-38, 8, 120, duration_ms=segment_duration),
-            point(-18, -22, 80, duration_ms=segment_duration),
-            point(36, 12, 120, duration_ms=segment_duration),
-            point(16, -18, 80, duration_ms=segment_duration),
-            point(0, 0, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
+            point(-38, DEFAULT_IDLE_PITCH_PCT + 8, 120, duration_ms=segment_duration),
+            point(-18, DEFAULT_IDLE_PITCH_PCT - 22, 80, duration_ms=segment_duration),
+            point(36, DEFAULT_IDLE_PITCH_PCT + 12, 120, duration_ms=segment_duration),
+            point(16, DEFAULT_IDLE_PITCH_PCT - 18, 80, duration_ms=segment_duration),
+            point(0, DEFAULT_IDLE_PITCH_PCT, duration_ms=segment_duration),
         ]
 
     raise ConfigError(f"unsupported motion profile: {profile}")
@@ -2748,7 +2770,7 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument("--yaw-delta", type=int, default=None, help="Raw yaw delta step, clamped by firmware.")
     move.add_argument("--pitch-delta", type=int, default=None, help="Raw pitch delta step, clamped by firmware.")
     move.add_argument("--yaw-target-pct", type=int, default=None, help="Target yaw percent -100..100.")
-    move.add_argument("--pitch-target-pct", type=int, default=None, help="Target pitch percent -100..100.")
+    move.add_argument("--pitch-target-pct", type=int, default=None, help="Original-style target pitch percent 0..100.")
     move.set_defaults(func=send_move)
 
     motion = subcommands.add_parser("send-motion", help="Send a computed smooth motion path to StackChan.")

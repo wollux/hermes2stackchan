@@ -57,6 +57,10 @@ constexpr int kAudioSampleRate = 16000;
 constexpr size_t kWavHeaderBytes = 44;
 constexpr int kDefaultIdleYawPct = 0;
 constexpr int kDefaultIdlePitchPct = 45;
+constexpr int kYawTargetMinPct = -100;
+constexpr int kYawTargetMaxPct = 100;
+constexpr int kPitchTargetMinPct = 0;
+constexpr int kPitchTargetMaxPct = 100;
 constexpr int kVoiceStartGraceMs = 250;
 constexpr int kVoiceNoSpeechTimeoutMs = 5000;
 constexpr int kVoiceMinSpeechMs = 250;
@@ -2671,8 +2675,8 @@ bool append_motion_point(MotionCommand& command, int yaw_pct, int pitch_pct,
         return false;
     }
     MotionPoint& point = command.points[command.point_count++];
-    point.yaw_pct = clamp_int(yaw_pct, -100, 100);
-    point.pitch_pct = clamp_int(pitch_pct, -100, 100);
+    point.yaw_pct = clamp_int(yaw_pct, kYawTargetMinPct, kYawTargetMaxPct);
+    point.pitch_pct = clamp_int(pitch_pct, kPitchTargetMinPct, kPitchTargetMaxPct);
     point.duration_ms = duration_ms > 0 ? clamp_int(duration_ms, 40, 4000) : 0;
     point.speed_pct = clamp_int(speed_pct, 1, 100);
     point.hold_ms = clamp_int(hold_ms, 0, 4000);
@@ -2958,14 +2962,14 @@ void handle_move_command(const char* data, int len)
             yaw_target_pct = kDefaultIdleYawPct;
             pitch_target_pct = kDefaultIdlePitchPct;
         } else if (std::strcmp(direction, "up") == 0) {
-            pitch_target_pct = 100;
+            pitch_target_pct = kPitchTargetMaxPct;
         } else if (std::strcmp(direction, "down") == 0) {
-            pitch_target_pct = -100;
+            pitch_target_pct = kPitchTargetMinPct;
         }
     }
 
-    const bool has_yaw_target = yaw_target_pct >= -100 && yaw_target_pct <= 100;
-    const bool has_pitch_target = pitch_target_pct >= -100 && pitch_target_pct <= 100;
+    const bool has_yaw_target = yaw_target_pct >= kYawTargetMinPct && yaw_target_pct <= kYawTargetMaxPct;
+    const bool has_pitch_target = pitch_target_pct >= kPitchTargetMinPct && pitch_target_pct <= kPitchTargetMaxPct;
     yaw_delta = clamp_int(yaw_delta, -80, 80);
     pitch_delta = clamp_int(pitch_delta, -80, 80);
 
@@ -2975,19 +2979,19 @@ void handle_move_command(const char* data, int len)
         return;
     }
 
-    const int glance_yaw = has_yaw_target ? clamp_int(yaw_target_pct, -100, 100) - static_cast<int>(g_servo_yaw_pct)
+    const int glance_yaw = has_yaw_target ? clamp_int(yaw_target_pct, kYawTargetMinPct, kYawTargetMaxPct) - static_cast<int>(g_servo_yaw_pct)
                                           : yaw_delta;
-    const int glance_pitch = has_pitch_target ? clamp_int(pitch_target_pct, -100, 100) - static_cast<int>(g_servo_pitch_pct)
+    const int glance_pitch = has_pitch_target ? clamp_int(pitch_target_pct, kPitchTargetMinPct, kPitchTargetMaxPct) - static_cast<int>(g_servo_pitch_pct)
                                               : pitch_delta;
     enqueue_direction_glance(glance_yaw, glance_pitch);
 
     g_pending_yaw_delta += yaw_delta;
     g_pending_pitch_delta += pitch_delta;
     if (has_yaw_target) {
-        g_pending_yaw_target_pct = clamp_int(yaw_target_pct, -100, 100);
+        g_pending_yaw_target_pct = clamp_int(yaw_target_pct, kYawTargetMinPct, kYawTargetMaxPct);
     }
     if (has_pitch_target) {
-        g_pending_pitch_target_pct = clamp_int(pitch_target_pct, -100, 100);
+        g_pending_pitch_target_pct = clamp_int(pitch_target_pct, kPitchTargetMinPct, kPitchTargetMaxPct);
     }
     publish_ack(request_id, "move", "movement queued");
     cJSON_Delete(root);
@@ -3987,8 +3991,8 @@ void hardware_servo_task(void*)
         const int pitch_delta = g_pending_pitch_delta;
         const int yaw_target_pct = g_pending_yaw_target_pct;
         const int pitch_target_pct = g_pending_pitch_target_pct;
-        const bool has_yaw_target = yaw_target_pct >= -100 && yaw_target_pct <= 100;
-        const bool has_pitch_target = pitch_target_pct >= -100 && pitch_target_pct <= 100;
+        const bool has_yaw_target = yaw_target_pct >= kYawTargetMinPct && yaw_target_pct <= kYawTargetMaxPct;
+        const bool has_pitch_target = pitch_target_pct >= kPitchTargetMinPct && pitch_target_pct <= kPitchTargetMaxPct;
 
         if (!has_motion && yaw_delta == 0 && pitch_delta == 0 && !has_yaw_target && !has_pitch_target) {
             vTaskDelay(pdMS_TO_TICKS(120));

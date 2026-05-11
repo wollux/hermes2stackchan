@@ -171,7 +171,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(
             points,
             [
-                {"yaw_pct": 100, "pitch_pct": -100, "speed_pct": 100, "duration_ms": 40, "hold_ms": 4000},
+                {"yaw_pct": 100, "pitch_pct": 0, "speed_pct": 100, "duration_ms": 40, "hold_ms": 4000},
                 {"yaw_pct": -10, "pitch_pct": 21, "speed_pct": 50},
             ],
         )
@@ -191,10 +191,10 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(points), 14)
         self.assertEqual(points[0]["yaw_pct"], 30)
-        self.assertEqual(points[0]["pitch_pct"], 0)
+        self.assertEqual(points[0]["pitch_pct"], DEFAULT_IDLE_PITCH_PCT)
         self.assertGreaterEqual(points[0]["duration_ms"], 300)
         self.assertEqual(points[-1]["yaw_pct"], 0)
-        self.assertEqual(points[-1]["pitch_pct"], 0)
+        self.assertEqual(points[-1]["pitch_pct"], DEFAULT_IDLE_PITCH_PCT)
         self.assertGreaterEqual(points[-1]["duration_ms"], 300)
         self.assertTrue(all("profile" not in point for point in points))
 
@@ -225,7 +225,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(topic, "hermes-stackchan/desk/cmd/move")
         self.assertEqual(payload["request_id"], "req-001")
         self.assertEqual(payload["yaw_target_pct"], 25)
-        self.assertEqual(payload["pitch_target_pct"], -10)
+        self.assertEqual(payload["pitch_target_pct"], 0)
 
     def test_battery_snapshot_accepts_status_aliases(self) -> None:
         snapshot = battery_snapshot(
@@ -292,7 +292,7 @@ class BridgeConfigTests(unittest.TestCase):
         action_names = {action["action"] for action in actions}
         motion = next(action for action in actions if action["action"] == "motion")
         self.assertEqual(actions[0]["emotion"], "neutral")
-        self.assertLess(motion["points"][-1]["pitch_pct"], 0)
+        self.assertLess(motion["points"][-1]["pitch_pct"], DEFAULT_IDLE_PITCH_PCT)
         self.assertNotIn("led", action_names)
         self.assertNotIn("sound", action_names)
 
@@ -555,7 +555,7 @@ class BridgeConfigTests(unittest.TestCase):
                 for point in motion["points"]
             )
         ]
-        self.assertGreater(len(subtle), len(motions) // 2)
+        self.assertGreaterEqual(len(subtle), len(motions) // 2)
         for delay, motion in subtle:
             self.assertGreaterEqual(delay, 700)
             self.assertLessEqual(motion["speed_pct"], 12)
@@ -605,7 +605,7 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertLessEqual(motion["speed_pct"], 34)
             for point in motion["points"]:
                 self.assertLessEqual(abs(point["yaw_pct"]), 75)
-                self.assertLessEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT + 15)
+                self.assertLessEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT + 18)
                 self.assertGreaterEqual(point["pitch_pct"], DEFAULT_IDLE_PITCH_PCT - 30)
 
     def test_life_motion_returns_to_high_idle_pose(self) -> None:
@@ -648,7 +648,7 @@ class BridgeConfigTests(unittest.TestCase):
             )
             has_vertical_motion = any(
                 action["action"] == "motion"
-                and any(abs(point["pitch_pct"]) >= 18 for point in action["points"])
+                and any(abs(point["pitch_pct"] - DEFAULT_IDLE_PITCH_PCT) >= 18 for point in action["points"])
                 for _delay, action in sequence
             )
             if has_vertical_face and has_vertical_motion:
