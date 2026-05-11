@@ -1594,6 +1594,28 @@ def life_motion(points: list[dict[str, int]], speed_pct: int = 18, curve: str = 
     }
 
 
+def motion_action_duration_ms(action: dict[str, Any]) -> int:
+    if action_name(action) != "motion":
+        return 0
+    points = action.get("points")
+    if not isinstance(points, list):
+        return 0
+    total = 0
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        total += clamp_int(parse_int_value(point.get("duration_ms"), 0, "motion.duration_ms"), 0, 5000)
+        total += clamp_int(parse_int_value(point.get("hold_ms"), 0, "motion.hold_ms"), 0, 5000)
+    return total
+
+
+def life_action_settle_delay_s(action: dict[str, Any]) -> float:
+    duration_ms = motion_action_duration_ms(action)
+    if duration_ms <= 0:
+        return 0.0
+    return (duration_ms + 350) / 1000.0
+
+
 def gaze_for_direction(direction: str) -> str:
     return {
         "left": "glance_left",
@@ -1808,27 +1830,27 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
                 140,
                 life_motion(
                     [
-                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 420, 42),
-                        motion_point(56 * side, DEFAULT_IDLE_PITCH_PCT + 11, 70, 45),
-                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 20, 70, 45),
-                        motion_point(-4 * side, DEFAULT_IDLE_PITCH_PCT + 22, 70, 45),
-                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 18, 70, 45),
-                        motion_point(-60 * side, DEFAULT_IDLE_PITCH_PCT + 9, 70, 45),
-                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 3, 70, 45),
-                        motion_point(-50 * side, DEFAULT_IDLE_PITCH_PCT - 14, 70, 45),
-                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 21, 70, 45),
-                        motion_point(13 * side, DEFAULT_IDLE_PITCH_PCT - 22, 70, 45),
-                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 16, 70, 45),
-                        motion_point(63 * side, DEFAULT_IDLE_PITCH_PCT - 6, 70, 45),
-                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 70, 45),
-                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 20, 70, 45),
-                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 18, 70, 45),
-                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 3, 70, 45),
-                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 21, 70, 45),
-                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 16, 70, 45),
-                        motion_point(0, DEFAULT_IDLE_PITCH_PCT, 420, 38),
+                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 480, 30),
+                        motion_point(56 * side, DEFAULT_IDLE_PITCH_PCT + 6, 130, 32),
+                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 11, 130, 32),
+                        motion_point(-4 * side, DEFAULT_IDLE_PITCH_PCT + 12, 130, 32),
+                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 10, 130, 32),
+                        motion_point(-60 * side, DEFAULT_IDLE_PITCH_PCT + 5, 130, 32),
+                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 2, 130, 32),
+                        motion_point(-50 * side, DEFAULT_IDLE_PITCH_PCT - 8, 130, 32),
+                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 11, 130, 32),
+                        motion_point(13 * side, DEFAULT_IDLE_PITCH_PCT - 12, 130, 32),
+                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 8, 130, 32),
+                        motion_point(63 * side, DEFAULT_IDLE_PITCH_PCT - 3, 130, 32),
+                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 130, 32),
+                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 11, 130, 32),
+                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 10, 130, 32),
+                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 2, 130, 32),
+                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 11, 130, 32),
+                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 8, 130, 32),
+                        motion_point(0, DEFAULT_IDLE_PITCH_PCT, 520, 28),
                     ],
-                    45,
+                    32,
                     variant=name,
                 ),
             ),
@@ -2351,11 +2373,19 @@ def animate_life(args: argparse.Namespace) -> int:
                         time.sleep(delay_ms / 1000.0)
                     if life_animation_paused(pair.pair_id):
                         break
+                    if action_name(action) == "motion":
+                        status = read_latest_status(config, pair, args.status_timeout)
+                        if not status_allows_life_animation(status):
+                            print("[bridge] life motion skipped: StackChan is no longer idle on face", flush=True)
+                            break
                     publish_action_messages(
                         client,
                         [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
                         pair,
                     )
+                    settle_delay_s = life_action_settle_delay_s(action)
+                    if settle_delay_s > 0:
+                        time.sleep(settle_delay_s)
                 emitted += 1
                 if args.once:
                     return 0

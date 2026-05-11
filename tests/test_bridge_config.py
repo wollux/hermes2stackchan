@@ -34,6 +34,7 @@ from bridge.hermes2stackchan_bridge import (
     LIFE_VARIANT_NAMES,
     load_config,
     missing_status_paths,
+    motion_action_duration_ms,
     normalize_motion_points,
     pending_reminders,
     reminder_actions,
@@ -213,6 +214,19 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(points[-1]["pitch_pct"], DEFAULT_IDLE_PITCH_PCT)
         self.assertGreaterEqual(points[-1]["duration_ms"], 300)
         self.assertTrue(all("profile" not in point for point in points))
+
+    def test_motion_action_duration_sums_segments_and_holds(self) -> None:
+        duration = motion_action_duration_ms(
+            {
+                "action": "motion",
+                "points": [
+                    {"duration_ms": 1200, "hold_ms": 300},
+                    {"duration_ms": 800},
+                ],
+            }
+        )
+
+        self.assertEqual(duration, 2300)
 
     def test_parse_hermes_action_response_accepts_fenced_json(self) -> None:
         parsed = parse_hermes_action_response(
