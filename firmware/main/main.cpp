@@ -1994,6 +1994,27 @@ void publish_event(const char* event, const char* source, const char* request_id
     publish_json(g_topic_events, payload);
 }
 
+void publish_touch_event(const char* event, uint8_t raw, bool pressed)
+{
+    char payload[640] = {};
+    std::snprintf(payload,
+                  sizeof(payload),
+                  "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
+                  "\"event\":\"%s\",\"source\":\"head_touch\",\"uptime_ms\":%lld,"
+                  "\"touch\":{\"ready\":%s,\"pressed\":%s,\"raw\":%u},"
+                  "\"message\":\"%s\"}",
+                  CONFIG_STACKCHAN_PAIR_ID,
+                  CONFIG_STACKCHAN_STACKCHAN_ID,
+                  event,
+                  static_cast<long long>(esp_timer_get_time() / 1000),
+                  g_head_touch_ready ? "true" : "false",
+                  pressed ? "true" : "false",
+                  static_cast<unsigned>(raw),
+                  pressed ? "head touch pressed" : "head touch released");
+    ESP_LOGI(kTag, "touch event=%s raw=0x%02x pressed=%s", event, raw, pressed ? "true" : "false");
+    publish_json(g_topic_events, payload);
+}
+
 void publish_status()
 {
     int rssi = 0;
@@ -2739,10 +2760,22 @@ void touch_event_task(void*)
     bool last_pressed = false;
     int stable_count = 0;
     bool stable_pressed = false;
+    uint8_t last_debug_raw = 0;
+    int64_t last_debug_ms = 0;
     while (true) {
         uint8_t raw = 0;
         const bool pressed = read_head_touch_pressed(&raw);
         g_touch_raw = raw;
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (raw != last_debug_raw || now_ms - last_debug_ms >= 1000) {
+            ESP_LOGI(kTag, "touch sample raw=0x%02x pressed=%s stable=%s ready=%s",
+                     raw,
+                     pressed ? "true" : "false",
+                     stable_pressed ? "true" : "false",
+                     g_head_touch_ready ? "true" : "false");
+            last_debug_raw = raw;
+            last_debug_ms = now_ms;
+        }
         if (pressed == last_pressed) {
             stable_count++;
         } else {
@@ -2753,10 +2786,7 @@ void touch_event_task(void*)
         if (stable_count >= 2 && pressed != stable_pressed) {
             stable_pressed = pressed;
             g_touch_pressed = pressed;
-            publish_event(pressed ? "touch_down" : "touch_up",
-                          "head_touch",
-                          "",
-                          pressed ? "head touch pressed" : "head touch released");
+            publish_touch_event(pressed ? "touch_down" : "touch_up", raw, pressed);
             publish_status();
         }
         vTaskDelay(pdMS_TO_TICKS(25));

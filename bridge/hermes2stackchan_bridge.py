@@ -1726,21 +1726,38 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
     pair = get_pair(config, args.pair)
     client = create_mqtt_client(config.mqtt)
 
-    def publish_led(payload: dict[str, Any]) -> None:
+    def publish_led(payload: dict[str, Any], event_received_ms: float, event_payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        before_publish_ms = time.monotonic() * 1000
         result = client.publish(pair.led_topic, body, qos=1, retain=False)
         result.wait_for_publish(timeout=2)
-        print(f"[bridge] touch lamp -> {body}", flush=True)
+        after_publish_ms = time.monotonic() * 1000
+        firmware_uptime = event_payload.get("uptime_ms")
+        touch = event_payload.get("touch") if isinstance(event_payload.get("touch"), dict) else {}
+        raw = touch.get("raw") if isinstance(touch, dict) else None
+        pressed = touch.get("pressed") if isinstance(touch, dict) else None
+        print(
+            "[bridge] touch event="
+            f"{event_payload.get('event')} raw={raw} pressed={pressed} "
+            f"fw_uptime_ms={firmware_uptime} "
+            f"rx_to_publish_ms={before_publish_ms - event_received_ms:.1f} "
+            f"publish_wait_ms={after_publish_ms - before_publish_ms:.1f} "
+            f"led={body}",
+            flush=True,
+        )
 
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        event_received_ms = time.monotonic() * 1000
         try:
             data = json.loads(message.payload.decode("utf-8"))
         except json.JSONDecodeError:
+            print(f"[bridge] touch event invalid json topic={message.topic}", flush=True)
             return
+        print(f"[bridge] rx {message.topic}: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}", flush=True)
         request_id = f"touch-led-{uuid.uuid4().hex[:8]}"
         payload = build_touch_lamp_payload(data, request_id)
         if payload is not None:
-            publish_led(payload)
+            publish_led(payload, event_received_ms, data)
 
     client.on_message = on_message
     connect_and_start(client, config.mqtt)

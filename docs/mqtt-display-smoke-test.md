@@ -153,7 +153,21 @@ For a quick head-touch hardware test, run the bridge touch lamp watcher:
 scripts/h2s_bridge.sh watch-touch-lamp --pair desk
 ```
 
-StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. While touch is held, the bridge sets the LEDs to solid green. On release, it turns them off again. This is intentionally bridge-driven so the MQTT event path is visible.
+StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. While touch is held, the bridge sets the LEDs to solid green. On release, it turns them off again. This is intentionally bridge-driven so the MQTT event path is visible. The watcher logs every received touch event, raw touch byte, firmware uptime, and the bridge-side publish timing.
+
+To watch both bridge and firmware logs during a touch test:
+
+```sh
+tail -f touch-lamp.log
+```
+
+For serial firmware logs:
+
+```sh
+cd firmware
+source /Users/wolfgangvieregg/development/esp-idf-v5.5.4/export.sh
+idf.py -p /dev/cu.usbmodem21301 monitor | rg --line-buffered 'touch|SI12T|MQTT|led'
+```
 
 ## Hermes HTTP Adapter
 
