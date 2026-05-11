@@ -421,9 +421,10 @@ def send_payload(
 
 def build_touch_lamp_payload(event_payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any] | None:
     event = optional_string(event_payload.get("event"))
-    if event == "touch_down":
+    recording = event_payload.get("recording")
+    if event in {"touch_down", "recording_started"} or recording is True:
         return with_request_id({"mode": "solid", "r": 0, "g": 255, "b": 0}, request_id)
-    if event == "touch_up":
+    if event == "recording_stopped" or recording is False:
         return with_request_id({"mode": "off", "r": 0, "g": 0, "b": 0}, request_id)
     return None
 
@@ -1727,7 +1728,12 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
     client = create_mqtt_client(config.mqtt)
     green_body = b'{"mode":"solid","r":0,"g":255,"b":0,"schema_version":"1.0"}'
     off_body = b'{"mode":"off","r":0,"g":0,"b":0,"schema_version":"1.0"}'
+    off_delay_s = max(0.0, args.off_delay_ms / 1000)
     last_event = ""
+    led_on = False
+    recording_active = False
+    recording_seen = False
+    pending_off: Timer | None = None
 
     def publish_led(body: bytes, event_received_ms: float, event: str) -> None:
         client.publish(pair.led_topic, body, qos=0, retain=False)
@@ -1735,16 +1741,62 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         if args.verbose:
             print(f"[bridge] fast-touch {event} -> led in {elapsed_ms:.2f}ms", flush=True)
 
+    def cancel_pending_off() -> None:
+        nonlocal pending_off
+        if pending_off is not None:
+            pending_off.cancel()
+            pending_off = None
+
+    def set_green(event_received_ms: float, event: str) -> None:
+        nonlocal led_on
+        cancel_pending_off()
+        if led_on:
+            return
+        led_on = True
+        publish_led(green_body, event_received_ms, event)
+
+    def set_off(event_received_ms: float, event: str) -> None:
+        nonlocal led_on, pending_off
+        pending_off = None
+        if not led_on:
+            return
+        led_on = False
+        publish_led(off_body, event_received_ms, event)
+
+    def schedule_off(event_received_ms: float, event: str) -> None:
+        nonlocal pending_off
+        cancel_pending_off()
+        if off_delay_s <= 0:
+            set_off(event_received_ms, event)
+            return
+        pending_off = Timer(off_delay_s, set_off, args=(event_received_ms, event))
+        pending_off.daemon = True
+        pending_off.start()
+
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
-        nonlocal last_event
+        nonlocal last_event, recording_active, recording_seen
         event_received_ms = time.monotonic() * 1000
         raw_payload = message.payload
         if b'"event":"touch_down"' in raw_payload:
             event = "touch_down"
-            body = green_body
         elif b'"event":"touch_up"' in raw_payload:
             event = "touch_up"
-            body = off_body
+        elif b'"event":"recording_started"' in raw_payload:
+            event = "recording_started"
+        elif b'"event":"recording_stopped"' in raw_payload:
+            event = "recording_stopped"
+        elif message.topic == pair.status_topic:
+            try:
+                data = json.loads(raw_payload.decode("utf-8"))
+            except json.JSONDecodeError:
+                return
+            recording = data.get("recording")
+            if recording is True:
+                event = "status_recording_true"
+            elif recording is False:
+                event = "status_recording_false"
+            else:
+                return
         else:
             try:
                 data = json.loads(raw_payload.decode("utf-8"))
@@ -1753,21 +1805,38 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
                     print(f"[bridge] touch event invalid json topic={message.topic}", flush=True)
                 return
             event = optional_string(data.get("event"))
-            if event == "touch_down":
-                body = green_body
-            elif event == "touch_up":
-                body = off_body
-            else:
+            if event not in {"touch_down", "touch_up", "recording_started", "recording_stopped"}:
                 return
         if event == last_event:
             return
         last_event = event
-        publish_led(body, event_received_ms, event)
+
+        if event in {"touch_down", "recording_started", "status_recording_true"}:
+            if event == "touch_down":
+                recording_seen = False
+            if event in {"recording_started", "status_recording_true"}:
+                recording_active = True
+                recording_seen = True
+            set_green(event_received_ms, event)
+        elif event == "recording_stopped":
+            recording_active = False
+            recording_seen = True
+            schedule_off(event_received_ms, event)
+        elif event == "status_recording_false":
+            if recording_active:
+                recording_active = False
+                schedule_off(event_received_ms, event)
+        elif event == "touch_up" and not recording_active and not recording_seen:
+            schedule_off(event_received_ms, event)
 
     client.on_message = on_message
     connect_and_start(client, config.mqtt)
-    client.subscribe(pair.events_topic, qos=0)
-    print(f"[bridge] fast touch lamp on {pair.events_topic}; target <25ms, touch=green, release=off", flush=True)
+    client.subscribe([(pair.events_topic, 0), (pair.status_topic, 0)])
+    print(
+        f"[bridge] fast touch lamp on {pair.events_topic}; "
+        f"touch=green, off after recording stops + {args.off_delay_ms}ms",
+        flush=True,
+    )
     try:
         while True:
             time.sleep(0.25)
@@ -1926,6 +1995,7 @@ def build_parser() -> argparse.ArgumentParser:
     touch_lamp = subcommands.add_parser("watch-touch-lamp", help="Turn LEDs green while StackChan head touch is held.")
     touch_lamp.add_argument("--pair", default="desk", help="Pair id to watch.")
     touch_lamp.add_argument("--verbose", action="store_true", help="Log per-event touch-to-publish timing.")
+    touch_lamp.add_argument("--off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     touch_lamp.set_defaults(func=watch_touch_lamp)
 
     power = subcommands.add_parser("watch-power", help="React to StackChan battery charge/discharge status changes.")

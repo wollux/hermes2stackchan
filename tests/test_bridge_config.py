@@ -348,13 +348,15 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["wakeword"], "Computer")
         self.assertTrue(payload["enabled"])
 
-    def test_touch_lamp_payload_tracks_touch_down_and_up(self) -> None:
+    def test_touch_lamp_payload_tracks_touch_and_recording_state(self) -> None:
         down = build_touch_lamp_payload({"event": "touch_down"}, "touch-1")
-        up = build_touch_lamp_payload({"event": "touch_up"}, "touch-2")
-        ignored = build_touch_lamp_payload({"event": "recording_started"}, "touch-3")
+        started = build_touch_lamp_payload({"event": "recording_started"}, "touch-2")
+        stopped = build_touch_lamp_payload({"event": "recording_stopped"}, "touch-3")
+        ignored = build_touch_lamp_payload({"event": "touch_up"}, "touch-4")
 
         self.assertEqual(down, {"mode": "solid", "r": 0, "g": 255, "b": 0, "schema_version": "1.0", "request_id": "touch-1"})
-        self.assertEqual(up, {"mode": "off", "r": 0, "g": 0, "b": 0, "schema_version": "1.0", "request_id": "touch-2"})
+        self.assertEqual(started, {"mode": "solid", "r": 0, "g": 255, "b": 0, "schema_version": "1.0", "request_id": "touch-2"})
+        self.assertEqual(stopped, {"mode": "off", "r": 0, "g": 0, "b": 0, "schema_version": "1.0", "request_id": "touch-3"})
         self.assertIsNone(ignored)
 
     def test_life_animation_only_runs_on_idle_face(self) -> None:
