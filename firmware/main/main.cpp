@@ -79,7 +79,7 @@ constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
 constexpr int kInteractionPollIntervalMs = 100;
 constexpr int kInteractionEventCooldownMs = 1500;
-constexpr int kImuIgnoreAfterHeadMotionMs = 4500;
+constexpr int kSensorPauseAfterHeadMotionMs = 50;
 constexpr int kLtr553NearRawThreshold = 120;
 constexpr int kLtr553NearDeltaThreshold = 55;
 constexpr int kImuSideAxisMg = 760;
@@ -3329,6 +3329,13 @@ void end_head_motion_ignore()
     g_last_head_motion_ms = esp_timer_get_time() / 1000;
 }
 
+bool sensors_paused_for_head_motion()
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    return g_head_motion_active ||
+           (now_ms - g_last_head_motion_ms) < kSensorPauseAfterHeadMotionMs;
+}
+
 void copy_cstr(char* destination, size_t destination_len, const char* source)
 {
     if (!destination || destination_len == 0) {
@@ -3430,10 +3437,7 @@ void update_imu_interaction(bool& previous_motion, bool& has_previous,
                                              std::fabs(data.gyro_y),
                                              std::fabs(data.gyro_z)});
             motion_score = clamp_int(static_cast<int>(std::round(acc_diff * 7.0f + gyro_abs * 0.55f)), 0, 100);
-            const int64_t now_ms = esp_timer_get_time() / 1000;
-            const bool own_head_motion = g_head_motion_active ||
-                                         (now_ms - g_last_head_motion_ms) < kImuIgnoreAfterHeadMotionMs;
-            motion = !own_head_motion && (acc_diff >= 1.25f || gyro_abs >= 42.0f);
+            motion = (acc_diff >= 1.25f || gyro_abs >= 42.0f);
         }
 
         previous_ax = data.accel_x;
@@ -3475,19 +3479,27 @@ void sensor_interaction_task(void*)
     bool previous_combined = false;
 
     while (true) {
+        if (sensors_paused_for_head_motion()) {
+            previous_near = false;
+            previous_imu_motion = false;
+            has_previous_imu = false;
+            g_imu_motion_score_pct = 0;
+            g_imu_motion_active = false;
+            g_ltr553_near = false;
+            g_ltr553_light_changed = false;
+            g_interaction_active = g_touch_pressed;
+            vTaskDelay(pdMS_TO_TICKS(kInteractionPollIntervalMs));
+            continue;
+        }
+
         update_ltr553_interaction(previous_near, previous_ambient);
         update_imu_interaction(previous_imu_motion, has_previous_imu,
                                previous_ax, previous_ay, previous_az);
 
-        const int64_t now_ms = esp_timer_get_time() / 1000;
-        const bool own_head_motion = g_head_motion_active ||
-                                     (now_ms - g_last_head_motion_ms) < kImuIgnoreAfterHeadMotionMs;
-        if (!own_head_motion) {
-            const bool sideways = imu_orientation_sideways();
-            if (sideways != previous_sideways) {
-                mark_sensor_interaction("orientation", sideways ? "stackchan sideways" : "stackchan upright");
-                previous_sideways = sideways;
-            }
+        const bool sideways = imu_orientation_sideways();
+        if (sideways != previous_sideways) {
+            mark_sensor_interaction("orientation", sideways ? "stackchan sideways" : "stackchan upright");
+            previous_sideways = sideways;
         }
 
         const bool combined = g_ltr553_near || g_imu_motion_active || g_touch_pressed;
