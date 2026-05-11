@@ -3360,7 +3360,7 @@ def convert_image_to_rgb565le(image_bytes: bytes) -> bytes:
     return bytes(out)
 
 
-def rgb565le_to_jpeg(image_bytes: bytes, width: int, height: int) -> bytes:
+def rgb565_to_jpeg(image_bytes: bytes, width: int, height: int) -> bytes:
     try:
         from PIL import Image
     except ImportError as exc:
@@ -3374,7 +3374,8 @@ def rgb565le_to_jpeg(image_bytes: bytes, width: int, height: int) -> bytes:
     rgb = bytearray(width * height * 3)
     j = 0
     for i in range(0, len(image_bytes), 2):
-        value = image_bytes[i] | (image_bytes[i + 1] << 8)
+        # GC0308 camera frames arrive as big-endian RGB565.
+        value = (image_bytes[i] << 8) | image_bytes[i + 1]
         r = ((value >> 11) & 0x1F) << 3
         g = ((value >> 5) & 0x3F) << 2
         b = (value & 0x1F) << 3
@@ -3549,7 +3550,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 240,
                 "X-H2S-Image-Height",
             )
-            image_bytes = rgb565le_to_jpeg(image_bytes, width, height)
+            image_bytes = rgb565_to_jpeg(image_bytes, width, height)
             content_type = "image/jpeg"
         elif image_format in {"jpeg", "jpg"}:
             content_type = "image/jpeg"

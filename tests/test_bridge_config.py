@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import random
 import sys
 import tempfile
@@ -49,6 +50,7 @@ from bridge.hermes2stackchan_bridge import (
     build_hermes_messages,
     build_hermes_vision_messages,
     image_data_url,
+    rgb565_to_jpeg,
     status_allows_life_animation,
 )
 
@@ -204,6 +206,23 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(messages[1]["content"][0]["text"], "Was siehst du?")
         self.assertTrue(messages[1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
         self.assertEqual(image_data_url(b"x", "image/png"), "data:image/png;base64,eA==")
+
+    @unittest.skipIf(importlib.util.find_spec("PIL") is None, "Pillow not installed")
+    def test_rgb565_camera_conversion_uses_big_endian(self) -> None:
+        import io
+        from PIL import Image
+
+        row = bytes([0xF8, 0x00]) * 8 + bytes([0x07, 0xE0]) * 8 + bytes([0x00, 0x1F]) * 8
+        pixels = row * 8
+        jpeg = rgb565_to_jpeg(pixels, 24, 8)
+        image = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        red = image.getpixel((4, 4))
+        green = image.getpixel((12, 4))
+        blue = image.getpixel((20, 4))
+
+        self.assertGreater(red[0], red[1] + red[2])
+        self.assertGreater(green[1], green[0] + green[2])
+        self.assertGreater(blue[2], blue[0] + blue[1])
 
     def test_multipart_form_data_contains_audio_file(self) -> None:
         body, boundary = build_multipart_form_data(
