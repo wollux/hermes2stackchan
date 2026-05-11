@@ -18,6 +18,7 @@ from bridge.hermes2stackchan_bridge import (
     battery_snapshot,
     bridge_base_url_from_audio_url,
     build_display_payload,
+    build_idle_sleep_payload,
     build_life_sequence,
     build_multipart_form_data,
     build_motion_profile_points,
@@ -52,6 +53,8 @@ from bridge.hermes2stackchan_bridge import (
     image_data_url,
     image_result_aspect_score,
     image_search_queries,
+    command_counts_as_idle_activity,
+    request_id_counts_as_idle_activity,
     rgb565_to_jpeg,
     status_allows_life_animation,
 )
@@ -208,6 +211,25 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("Spandau Berlin Altstadt Havel Zitadelle", queries)
         self.assertIn("Spandau Berlin Altstadt", queries)
         self.assertIn("Spandau", queries)
+
+    def test_idle_sleep_ignores_life_and_its_own_commands(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        self.assertFalse(request_id_counts_as_idle_activity("life-123"))
+        self.assertFalse(request_id_counts_as_idle_activity("idle-sleep-123"))
+        self.assertFalse(command_counts_as_idle_activity(pair, pair.face_topic, {"request_id": "life-123"}))
+        self.assertFalse(command_counts_as_idle_activity(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
+        self.assertTrue(command_counts_as_idle_activity(pair, pair.display_topic, {"text": "Hallo", "request_id": "notify-123"}))
+        self.assertTrue(command_counts_as_idle_activity(pair, pair.system_topic, {"action": "display_wake", "request_id": "reminder-123"}))
+
+    def test_idle_sleep_payload_turns_display_off_only(self) -> None:
+        payload = build_idle_sleep_payload("idle-sleep-test")
+
+        self.assertEqual(payload["request_id"], "idle-sleep-test")
+        self.assertTrue(payload["display_sleep"])
+        self.assertNotIn("display_wake", payload)
+        self.assertNotIn("motion", payload)
 
     def test_hermes_vision_messages_include_data_url(self) -> None:
         config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})

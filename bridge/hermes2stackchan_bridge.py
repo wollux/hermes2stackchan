@@ -46,6 +46,7 @@ DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
+DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
 REMINDER_STORE_LOCK = RLock()
 LIFE_PAUSE_LOCK = RLock()
 LIFE_PAUSED_UNTIL: dict[str, float] = {}
@@ -1646,6 +1647,57 @@ def status_allows_life_animation(status: dict[str, Any] | None) -> bool:
     return True
 
 
+HUMAN_ACTIVITY_EVENTS = {
+    "touch_down",
+    "touch_up",
+    "wakeword_detected",
+    "recording_started",
+    "recording_stopped",
+    "recording_error",
+    "audio_upload_started",
+    "audio_upload_done",
+    "audio_upload_failed",
+    "photo_upload_started",
+    "photo_upload_done",
+    "photo_upload_failed",
+}
+IDLE_SLEEP_IGNORED_REQUEST_PREFIXES = (
+    "life-",
+    "idle-sleep-",
+    "settings-",
+)
+
+
+def request_id_counts_as_idle_activity(request_id: str | None) -> bool:
+    if not request_id:
+        return True
+    return not request_id.startswith(IDLE_SLEEP_IGNORED_REQUEST_PREFIXES)
+
+
+def command_counts_as_idle_activity(pair: PairConfig, topic: str, payload: dict[str, Any]) -> bool:
+    if not topic.startswith(f"{pair.mqtt_prefix}/cmd/"):
+        return False
+    if not request_id_counts_as_idle_activity(optional_string(payload.get("request_id"))):
+        return False
+    if topic == pair.device_topic and payload.get("display_sleep") is True and not payload.get("display_wake"):
+        return False
+    if topic == pair.system_topic and payload.get("action") == "display_sleep":
+        return False
+    return True
+
+
+def status_is_busy(status: dict[str, Any]) -> bool:
+    return (
+        status_bool(status.get("recording")) is True
+        or status_bool(status.get("speaking")) is True
+        or status_bool(nested_status_value(status, "audio.recording")) is True
+    )
+
+
+def build_idle_sleep_payload(request_id: str | None = None) -> dict[str, Any]:
+    return with_request_id({"display_sleep": True}, request_id)
+
+
 def pause_life_animation(pair_id: str, seconds: float, reason: str) -> None:
     until = time.monotonic() + max(0.0, seconds)
     with LIFE_PAUSE_LOCK:
@@ -3135,6 +3187,110 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         client.disconnect()
 
 
+def watch_idle_sleep(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    timeout_s = max(5.0, float(args.timeout_s))
+    poll_s = max(0.2, float(args.poll_s))
+    retry_s = max(5.0, float(args.retry_s))
+    state_lock = RLock()
+    last_activity_at = time.monotonic()
+    last_sleep_sent_at = 0.0
+    sleep_sent = False
+    display_sleeping = False
+    busy = False
+    done = Event()
+
+    def mark_activity(reason: str, log: bool = True) -> None:
+        nonlocal last_activity_at, sleep_sent
+        last_activity_at = time.monotonic()
+        sleep_sent = False
+        if log:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] idle timer reset: {reason}", flush=True)
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        nonlocal display_sleeping, busy, sleep_sent
+        try:
+            payload = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        with state_lock:
+            if message.topic == pair.status_topic:
+                sleeping_value = status_bool(payload.get("display_sleeping"))
+                if sleeping_value is True:
+                    display_sleeping = True
+                    sleep_sent = True
+                elif sleeping_value is False and display_sleeping:
+                    display_sleeping = False
+                    mark_activity("display woke")
+
+                is_busy = status_is_busy(payload)
+                if is_busy:
+                    mark_activity("recording/speaking", log=not busy)
+                elif busy:
+                    mark_activity("recording/speaking stopped")
+                busy = is_busy
+                return
+
+            if message.topic == pair.events_topic:
+                event = optional_string(payload.get("event"))
+                if event in HUMAN_ACTIVITY_EVENTS:
+                    display_sleeping = False
+                    mark_activity(event)
+                return
+
+            if command_counts_as_idle_activity(pair, message.topic, payload):
+                if payload.get("display_wake") is True or payload.get("action") == "display_wake":
+                    display_sleeping = False
+                mark_activity(f"command {message.topic.rsplit('/', 1)[-1]}")
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe([(pair.status_topic, 0), (pair.events_topic, 0), (f"{pair.mqtt_prefix}/cmd/#", 0)])
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [bridge] idle sleep active for {pair.pair_id}: "
+            f"{timeout_s:.0f}s without human/action -> display sleep, no motion",
+            flush=True,
+        )
+        while not done.wait(poll_s):
+            with state_lock:
+                now = time.monotonic()
+                should_sleep = (
+                    not display_sleeping
+                    and not busy
+                    and (now - last_activity_at) >= timeout_s
+                    and (not sleep_sent or (now - last_sleep_sent_at) >= retry_s)
+                )
+                if not should_sleep:
+                    continue
+                request_id = f"idle-sleep-{uuid.uuid4().hex[:10]}"
+                payload = build_idle_sleep_payload(request_id)
+                last_sleep_sent_at = now
+                sleep_sent = True
+
+            pause_life_animation(pair.pair_id, 20.0, "idle sleep")
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            result = client.publish(pair.device_topic, body, qos=1, retain=False)
+            result.wait_for_publish(timeout=5)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [bridge] idle sleep after {timeout_s:.0f}s: {body}",
+                flush=True,
+            )
+            if args.once:
+                done.set()
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
 def build_multipart_form_data(fields: dict[str, str], file_field: str, filename: str, content_type: str, data: bytes) -> tuple[bytes, str]:
     boundary = f"h2s-{uuid.uuid4().hex}"
     chunks: list[bytes] = []
@@ -4395,6 +4551,20 @@ def run_bridge(args: argparse.Namespace) -> int:
                 once=False,
             ),
         ))
+    if not args.no_idle_sleep:
+        workers.append((
+            "idle-sleep",
+            watch_idle_sleep,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                timeout_s=args.idle_sleep_timeout_s,
+                poll_s=args.idle_sleep_poll_s,
+                retry_s=args.idle_sleep_retry_s,
+                once=False,
+            ),
+        ))
     if not args.no_life:
         workers.append((
             "life-animator",
@@ -4648,6 +4818,14 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--once", action="store_true", help="Process retained status briefly and exit.")
     settings.set_defaults(func=watch_device_settings)
 
+    idle_sleep = subcommands.add_parser("watch-idle-sleep", help="Turn the display off after a quiet idle timeout.")
+    idle_sleep.add_argument("--pair", default="desk", help="Pair id to watch.")
+    idle_sleep.add_argument("--timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
+    idle_sleep.add_argument("--poll-s", type=float, default=1.0, help="Idle check interval in seconds.")
+    idle_sleep.add_argument("--retry-s", type=float, default=30.0, help="Retry sleep command after this many seconds if status does not change.")
+    idle_sleep.add_argument("--once", action="store_true", help="Exit after the first emitted sleep command.")
+    idle_sleep.set_defaults(func=watch_idle_sleep)
+
     life = subcommands.add_parser("animate-life", help="Send small idle face and motion impulses so StackChan feels alive.")
     life.add_argument("--pair", default="desk", help="Pair id to animate.")
     life.add_argument("--min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
@@ -4668,6 +4846,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
     run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
     run.add_argument("--no-settings", action="store_true", help="Disable retained device settings restore worker.")
+    run.add_argument("--no-idle-sleep", action="store_true", help="Disable automatic display sleep after quiet idle timeout.")
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
     run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
     run.add_argument("--touch-off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
@@ -4678,6 +4857,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--settings-timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
     run.add_argument("--settings-display-wake", action="store_true", help="Also wake display when restoring retained settings.")
     run.add_argument("--settings-reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
+    run.add_argument("--idle-sleep-timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
+    run.add_argument("--idle-sleep-poll-s", type=float, default=1.0, help="Idle sleep check interval.")
+    run.add_argument("--idle-sleep-retry-s", type=float, default=30.0, help="Retry sleep command if status does not switch to sleeping.")
     run.add_argument("--life-min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
     run.add_argument("--life-max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
     run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")

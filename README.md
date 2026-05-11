@@ -21,6 +21,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Display text commands.
 - Face rendering with eyes, pupils, mouth, blink, breathing, gaze directions, sleep hints, battery states, and simple emotions.
 - Idle life animation from the bridge while StackChan is idle.
+- Automatic idle sleep: after five quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
 - Head movement with soft limits and smooth waypoint paths.
 - Expressive motion commands for nodding, shaking, scans, circles, and Hermes-selected motion profiles.
 - LED/neon commands and recording-level LED feedback.
@@ -274,12 +275,14 @@ The service runs one multithreaded bridge process:
 - Fast touch/recording LED worker.
 - Power watcher.
 - Persistent reminder worker.
+- Idle sleep watcher.
 - Idle life animator.
 
 Disable individual workers for debugging:
 
 ```bash
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-life
+h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-idle-sleep
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-power
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --touch-verbose
 ```

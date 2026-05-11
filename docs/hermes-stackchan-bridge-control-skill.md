@@ -302,6 +302,10 @@ limits, and may ignore unsafe commands.
 StackChan has an idle-life animator in the bridge. It may blink, breathe, glance,
 move its mouth, and occasionally move the head. This should only run when idle and
 must not interrupt recording, speaking, battery overlays, sleep, or errors.
+The bridge also has an idle-sleep watcher: after five quiet minutes without human
+interaction or non-life actions, it sends `cmd/device {"display_sleep":true}` and
+the life animator must stay quiet because the retained status reports
+`display_sleeping:true`.
 
 Normal pitch/rest position is around `45`, not `0`. Yaw can move more freely than
 pitch; pitch must remain conservative.
