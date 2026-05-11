@@ -13,6 +13,21 @@ This public slice supports direct MQTT hardware control. Hermes may request acti
 
 ## Actions
 
+### local spoken shortcuts
+
+Before Hermes is called, the bridge handles simple one-step spoken commands
+locally after STT. These do not consume a Hermes turn and log `hermes=0ms`.
+
+Local shortcuts include absolute and simple relative hardware/status requests:
+
+- `Helligkeit 80 Prozent`, `mach heller`, `mach dunkler`
+- `Lautstaerke 55 Prozent`, `mach lauter`, `mach leiser`
+- `Display aus`, `Bildschirm an`, `geh schlafen`, `wach auf`
+- `Akku`, `Temperatur`, `Sensoren`, `Naehe`, `Seite`, `Bewegung`
+
+Combined tasks, questions needing reasoning, and anything with multiple intents
+still goes to Hermes.
+
 ### response contract
 
 For normal answers, direct messages, reminders, notifications, and command

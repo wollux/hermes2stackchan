@@ -11,6 +11,7 @@ import math
 import mimetypes
 import os
 import random
+import re
 import signal
 import ssl
 import subprocess
@@ -1372,6 +1373,7 @@ def parse_bool_value(value: Any, default: bool) -> bool:
 
 REMINDER_ACTIONS = {"reminder", "notify", "notification", "remind"}
 POST_TTS_SYSTEM_ACTIONS = {"display_sleep", "shutdown", "power_off"}
+STATUS_NOT_PROVIDED = object()
 
 
 def action_name(action: dict[str, Any]) -> str:
@@ -1399,21 +1401,196 @@ def normalize_spoken_command_text(text: str) -> str:
     return " ".join(normalized.split())
 
 
-def direct_system_command_from_transcript(text: str) -> tuple[str, list[dict[str, Any]], str] | None:
-    normalized = normalize_spoken_command_text(text)
-    if not normalized:
-        return None
+def strip_spoken_command_prefixes(normalized: str) -> str:
     command = normalized
     changed = True
     while changed:
         changed = False
-        for prefix in ("bitte ", "computer ", "stackchan ", "stack chan "):
+        for prefix in ("bitte ", "computer ", "stackchan ", "stack chan ", "hermes "):
             if command.startswith(prefix):
                 command = command[len(prefix):].strip()
                 changed = True
-    if any(negative in f" {normalized} " for negative in (" nicht ", " kein ", " keine ")):
+    return command
+
+
+def spoken_command_is_negated(normalized: str) -> bool:
+    return any(negative in f" {normalized} " for negative in (" nicht ", " kein ", " keine "))
+
+
+def spoken_command_is_combined(command: str) -> bool:
+    return any(
+        marker in f" {command} "
+        for marker in (
+            " und ",
+            " dann ",
+            " danach ",
+            " nachdem ",
+            " ausserdem ",
+            " plus ",
+            " wenn ",
+            " sobald ",
+        )
+    )
+
+
+SPOKEN_NUMBER_WORDS = {
+    "null": 0,
+    "zehn": 10,
+    "zwanzig": 20,
+    "dreissig": 30,
+    "vierzig": 40,
+    "fuenfzig": 50,
+    "sechzig": 60,
+    "siebzig": 70,
+    "achtzig": 80,
+    "neunzig": 90,
+    "hundert": 100,
+}
+
+
+def parse_spoken_percent(command: str) -> int | None:
+    match = re.search(r"(?<!\d)(\d{1,3})(?:\s*(?:prozent|percent|%))?", command)
+    if match:
+        return clamp_int(int(match.group(1)), 0, 100)
+    for word, value in SPOKEN_NUMBER_WORDS.items():
+        if re.search(rf"\b{re.escape(word)}\b", command):
+            return value
+    return None
+
+
+def local_command_may_need_status(text: str) -> bool:
+    normalized = normalize_spoken_command_text(text)
+    command = strip_spoken_command_prefixes(normalized)
+    if not command or spoken_command_is_negated(normalized) or spoken_command_is_combined(command):
+        return False
+    return any(
+        token in f" {command} "
+        for token in (
+            " akku ",
+            " akkustand ",
+            " batterie ",
+            " temperatur ",
+            " warm ",
+            " sensor ",
+            " sensoren ",
+            " imu ",
+            " ltr ",
+            " naehe ",
+            " naehesensor ",
+            " proximity ",
+            " finger ",
+            " lichtsensor ",
+            " helligkeit ",
+            " lautstaerke ",
+            " lauter ",
+            " leiser ",
+            " heller ",
+            " dunkler ",
+            " geschuettelt ",
+            " schuetteln ",
+            " bewegung ",
+            " seite ",
+        )
+    )
+
+
+def status_percent(status: dict[str, Any] | None, path: str, fallback: int = 0) -> int:
+    return clamp_int(status_int_at(status, path, fallback), 0, 100)
+
+
+def direct_status_reply_from_transcript(
+    command: str,
+    status: Any = STATUS_NOT_PROVIDED,
+) -> tuple[str, list[dict[str, Any]], str] | None:
+    if status is STATUS_NOT_PROVIDED:
         return None
-    if any(media in f" {normalized} " for media in (" radio ", " musik ", " lautstaerke ", " lampe ", " led ")):
+    if not isinstance(status, dict):
+        if any(
+            token in f" {command} "
+            for token in ("akku", "akkustand", "batterie", "temperatur", "sensor", "sensoren", "helligkeit", "lautstaerke")
+        ):
+            return "Status ist gerade nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
+        return None
+
+    if any(token in f" {command} " for token in ("akku", "akkustand", "batterie")):
+        pct = status_percent(status, "battery_pct", 0)
+        external = status_bool(status.get("external_power")) is True
+        charging = status_bool(status.get("battery_charging")) is True
+        if charging:
+            suffix = "und laedt."
+        elif external:
+            suffix = "und haengt am Strom."
+        else:
+            suffix = "und laeuft auf Akku."
+        return f"Akku {pct} Prozent, {suffix}", [{"action": "face", "emotion": "battery", "intensity_pct": 65}], ""
+
+    if any(token in f" {command} " for token in ("temperatur", "warm")):
+        soc = status_int_at(status, "temperature.soc_c", -1)
+        yaw = status_int_at(status, "temperature.servo_yaw_c", -1)
+        pitch = status_int_at(status, "temperature.servo_pitch_c", -1)
+        parts = []
+        if soc >= 0:
+            parts.append(f"SoC {soc} Grad")
+        if yaw >= 0:
+            parts.append(f"Yaw Servo {yaw} Grad")
+        if pitch >= 0:
+            parts.append(f"Pitch Servo {pitch} Grad")
+        text = ", ".join(parts) if parts else "Temperaturen sind gerade nicht bekannt."
+        return text, [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+
+    if "helligkeit" in command and command.startswith(("wie ", "was ", "sag ", "zeige ")):
+        pct = status_percent(status, "brightness_pct", 0)
+        return f"Helligkeit {pct} Prozent.", [], ""
+
+    if "lautstaerke" in command and command.startswith(("wie ", "was ", "sag ", "zeige ")):
+        pct = status_percent(status, "speaker.volume_pct", status_int_at(status, "volume_pct", 0))
+        return f"Lautstaerke {pct} Prozent.", [], ""
+
+    if any(token in f" {command} " for token in ("naehe", "naehesensor", "proximity", "finger")):
+        near = status_bool(nested_status_value(status, "sensors.ltr553.near")) is True
+        delta = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
+        if near or delta >= SENSOR_PROXIMITY_ON_DELTA:
+            return f"Naehe erkannt, Delta {delta}.", [{"action": "face", "emotion": "glance_down", "intensity_pct": 62}], ""
+        return f"Keine Naehe erkannt, Delta {delta}.", [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+
+    if any(token in f" {command} " for token in ("seite", "liegst", "liegt")):
+        if sensor_status_is_sideways(status):
+            return "Ich liege auf der Seite.", [{"action": "face", "emotion": "surprised", "intensity_pct": 78}], ""
+        return "Ich stehe normal.", [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+
+    if any(token in f" {command} " for token in ("geschuettelt", "schuetteln", "bewegung", "imu")):
+        score = status_int_at(status, "sensors.imu.motion_score_pct", 0)
+        active = status_bool(nested_status_value(status, "sensors.imu.motion_active")) is True
+        if active:
+            return f"Bewegung erkannt, Score {score} Prozent.", [{"action": "face", "emotion": "surprise_pop", "intensity_pct": 75}], ""
+        return f"Keine starke Bewegung, Score {score} Prozent.", [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+
+    if "sensor" in command or "sensoren" in command:
+        imu_ready = status_bool(nested_status_value(status, "sensors.imu.ready")) is True
+        ltr_ready = status_bool(nested_status_value(status, "sensors.ltr553.ready")) is True
+        motion = status_int_at(status, "sensors.imu.motion_score_pct", 0)
+        proximity = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
+        text = (
+            f"IMU {'bereit' if imu_ready else 'nicht bereit'}, "
+            f"LTR553 {'bereit' if ltr_ready else 'nicht bereit'}, "
+            f"Bewegung {motion} Prozent, Naehe Delta {proximity}."
+        )
+        return text, [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+
+    return None
+
+
+def direct_local_command_from_transcript(
+    text: str,
+    status: Any = STATUS_NOT_PROVIDED,
+) -> tuple[str, list[dict[str, Any]], str] | None:
+    normalized = normalize_spoken_command_text(text)
+    if not normalized:
+        return None
+    command = strip_spoken_command_prefixes(normalized)
+    if spoken_command_is_negated(normalized):
+        return None
+    if spoken_command_is_combined(command):
         return None
 
     def is_command_phrase(phrase: str) -> bool:
@@ -1433,6 +1610,15 @@ def direct_system_command_from_transcript(text: str) -> tuple[str, list[dict[str
     )
     if any(is_command_phrase(phrase) for phrase in shutdown_phrases):
         return "Ich fahre jetzt runter.", [], "shutdown"
+
+    reboot_phrases = (
+        "neustart",
+        "neu starten",
+        "starte neu",
+        "reboot",
+    )
+    if any(is_command_phrase(phrase) for phrase in reboot_phrases):
+        return "Ich starte neu.", [{"action": "system", "system_action": "reboot"}], ""
 
     sleep_phrases = (
         "geh schlafen",
@@ -1458,6 +1644,68 @@ def direct_system_command_from_transcript(text: str) -> tuple[str, list[dict[str
     if any(is_command_phrase(phrase) for phrase in wake_phrases):
         return "Bin wach.", [{"action": "system", "system_action": "display_wake"}], ""
 
+    percent = parse_spoken_percent(command)
+    brightness_command = "helligkeit" in command or any(
+        word in f" {command} "
+        for word in (" heller ", " dunkler ")
+    )
+    if brightness_command:
+        if percent is not None:
+            return f"Helligkeit {percent} Prozent.", [{"action": "device", "brightness_pct": percent}], ""
+        if any(word in f" {command} " for word in (" heller ", " hoch ", " hoeher ", " rauf ")):
+            if status is STATUS_NOT_PROVIDED:
+                return None
+            if not isinstance(status, dict):
+                return "Status ist gerade nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
+            current = status_percent(status, "brightness_pct", 70)
+            target = clamp_int(current + 10, 0, 100)
+            return f"Helligkeit {target} Prozent.", [{"action": "device", "brightness_pct": target}], ""
+        if any(word in f" {command} " for word in (" dunkler ", " runter ", " niedriger ")):
+            if status is STATUS_NOT_PROVIDED:
+                return None
+            if not isinstance(status, dict):
+                return "Status ist gerade nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
+            current = status_percent(status, "brightness_pct", 70)
+            target = clamp_int(current - 10, 0, 100)
+            return f"Helligkeit {target} Prozent.", [{"action": "device", "brightness_pct": target}], ""
+
+    if "lautstaerke" in command or command in {"lauter", "leiser"} or command.startswith(("mach lauter", "mach leiser")):
+        if percent is not None:
+            return f"Lautstaerke {percent} Prozent.", [{"action": "device", "volume_pct": percent}], ""
+        if status is STATUS_NOT_PROVIDED:
+            return None
+        if not isinstance(status, dict):
+            return "Status ist gerade nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
+        current = status_percent(status, "speaker.volume_pct", status_int_at(status, "volume_pct", 70))
+        if "leiser" in command or "runter" in command or "niedriger" in command:
+            target = clamp_int(current - 10, 0, 100)
+        elif "lauter" in command or "hoch" in command or "hoeher" in command:
+            target = clamp_int(current + 10, 0, 100)
+        else:
+            target = current
+        return f"Lautstaerke {target} Prozent.", [{"action": "device", "volume_pct": target}], ""
+
+    if any(token in f" {command} " for token in ("led aus", "leds aus", "lampe aus", "lampen aus")):
+        return "LEDs aus.", [{"action": "led", "mode": "off"}], ""
+    if any(token in f" {command} " for token in ("led an", "leds an", "lampe an", "lampen an")):
+        return "LEDs an.", [{"action": "led", "mode": "solid", "r": 40, "g": 120, "b": 255}], ""
+
+    status_reply = direct_status_reply_from_transcript(command, status)
+    if status_reply:
+        return status_reply
+
+    return None
+
+
+def direct_system_command_from_transcript(text: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    result = direct_local_command_from_transcript(text)
+    if result is None:
+        return None
+    display_text, actions, post_tts_system_action = result
+    if post_tts_system_action:
+        return result
+    if all(action_name(action) == "system" for action in actions):
+        return result
     return None
 
 
@@ -4652,23 +4900,30 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 mqtt_ms = 0
                 action_count = 0
             else:
-                direct_command = direct_system_command_from_transcript(transcript)
+                status: dict[str, Any] | None = None
+                status_ms = 0
+                direct_command = direct_local_command_from_transcript(transcript)
+                if direct_command is None and local_command_may_need_status(transcript):
+                    status_started = time.monotonic()
+                    status = read_latest_status(self.server.config, self.server.pair, timeout_s=0.8)
+                    status_ms = round((time.monotonic() - status_started) * 1000)
+                    direct_command = direct_local_command_from_transcript(transcript, status)
                 if direct_command:
                     display_text, actions, post_tts_system_action = direct_command
                     hermes_response = {"reply": display_text, "actions": actions}
                     hermes_ms = 0
-                    status_ms = 0
                     scheduled_reminders = []
                     reminder_errors = []
                     print(
-                        f"[bridge-http] local system command request_id={request_id}: "
+                        f"[bridge-http] local command request_id={request_id}: "
                         f"post_tts={post_tts_system_action or '-'} actions={len(actions)}",
                         flush=True,
                     )
                 else:
-                    status_started = time.monotonic()
-                    status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
-                    status_ms = round((time.monotonic() - status_started) * 1000)
+                    if status is None:
+                        status_started = time.monotonic()
+                        status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
+                        status_ms = round((time.monotonic() - status_started) * 1000)
                     capabilities = read_optional_text(
                         self.server.pair.capabilities_file,
                         self.server.config_path,

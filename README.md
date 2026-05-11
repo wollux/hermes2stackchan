@@ -39,6 +39,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Local voice activity detection: stop after speech plus short silence.
 - HTTP WAV upload from StackChan to the bridge.
 - Groq Whisper STT through the bridge.
+- Local spoken shortcuts before Hermes for simple one-step hardware/status commands like volume, brightness, display on/off, battery, temperature, and sensor questions.
 - Hermes chat call with current StackChan status, capabilities, and personality.
 - Validated Hermes hardware actions dispatched over MQTT.
 - Edge/Katja German TTS generation.
@@ -526,9 +527,10 @@ Then use StackChan:
 3. Wait for the green recording LED to turn off.
 4. StackChan uploads the WAV to the bridge.
 5. Bridge transcribes with Groq.
-6. Bridge asks Hermes.
-7. Bridge generates Edge/Katja TTS.
-8. StackChan downloads and plays the WAV.
+6. Bridge handles simple local commands directly when possible.
+7. Bridge asks Hermes for conversation, combined tasks, and complex requests.
+8. Bridge generates Edge/Katja TTS.
+9. StackChan downloads and plays the WAV.
 
 Useful log lines:
 

@@ -31,6 +31,7 @@ from bridge.hermes2stackchan_bridge import (
     build_touch_lamp_payload,
     command_requests_display_sleep,
     direct_system_command_from_transcript,
+    direct_local_command_from_transcript,
     due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
     DEFAULT_IDLE_YAW_PCT,
@@ -39,6 +40,7 @@ from bridge.hermes2stackchan_bridge import (
     add_reminder,
     LIFE_VARIANT_NAMES,
     load_config,
+    local_command_may_need_status,
     missing_status_paths,
     motion_action_duration_ms,
     mqtt_settle_delay_after_publish_s,
@@ -477,6 +479,62 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIsNone(direct_system_command_from_transcript("Kannst du schlafen?"))
         self.assertIsNone(direct_system_command_from_transcript("Bitte nicht schlafen."))
         self.assertIsNone(direct_system_command_from_transcript("Radio abschalten."))
+
+    def test_direct_local_device_commands_skip_hermes(self) -> None:
+        brightness = direct_local_command_from_transcript("Helligkeit 80 Prozent.")
+        volume = direct_local_command_from_transcript("Computer Lautstaerke auf 55.")
+        display = direct_local_command_from_transcript("Display aus.")
+
+        self.assertEqual(brightness, ("Helligkeit 80 Prozent.", [{"action": "device", "brightness_pct": 80}], ""))
+        self.assertEqual(volume, ("Lautstaerke 55 Prozent.", [{"action": "device", "volume_pct": 55}], ""))
+        self.assertEqual(display[2], "display_sleep")
+
+    def test_direct_local_relative_device_commands_use_status(self) -> None:
+        status = {"brightness_pct": 45, "speaker": {"volume_pct": 80}}
+
+        brighter = direct_local_command_from_transcript("Mach heller.", status)
+        quieter = direct_local_command_from_transcript("Mach leiser.", status)
+
+        self.assertEqual(brighter, ("Helligkeit 55 Prozent.", [{"action": "device", "brightness_pct": 55}], ""))
+        self.assertEqual(quieter, ("Lautstaerke 70 Prozent.", [{"action": "device", "volume_pct": 70}], ""))
+        self.assertIsNone(direct_local_command_from_transcript("Mach leiser."))
+        self.assertTrue(local_command_may_need_status("Mach leiser."))
+
+    def test_direct_local_status_and_sensor_questions_skip_hermes(self) -> None:
+        status = {
+            "battery_pct": 82,
+            "external_power": False,
+            "battery_charging": False,
+            "brightness_pct": 66,
+            "speaker": {"volume_pct": 44},
+            "temperature": {"soc_c": 41, "servo_yaw_c": 30, "servo_pitch_c": 31},
+            "sensors": {
+                "imu": {
+                    "ready": True,
+                    "accel_mg": {"x": 720, "y": 0, "z": 650},
+                    "motion_score_pct": 72,
+                    "motion_active": True,
+                },
+                "ltr553": {
+                    "ready": True,
+                    "proximity_delta": 180,
+                    "near": True,
+                },
+            },
+        }
+
+        self.assertIn("Akku 82 Prozent", direct_local_command_from_transcript("Wie ist dein Akku?", status)[0])
+        self.assertIn("SoC 41 Grad", direct_local_command_from_transcript("Temperatur?", status)[0])
+        self.assertEqual(direct_local_command_from_transcript("Wie ist die Helligkeit?", status)[0], "Helligkeit 66 Prozent.")
+        self.assertEqual(direct_local_command_from_transcript("Wie ist die Lautstaerke?", status)[0], "Lautstaerke 44 Prozent.")
+        self.assertIn("Naehe erkannt", direct_local_command_from_transcript("Ist mein Finger am Sensor?", status)[0])
+        self.assertEqual(direct_local_command_from_transcript("Liegst du auf der Seite?", status)[0], "Ich liege auf der Seite.")
+        self.assertIn("Bewegung erkannt", direct_local_command_from_transcript("Wirst du geschuettelt?", status)[0])
+
+    def test_direct_local_combined_tasks_go_to_hermes(self) -> None:
+        self.assertIsNone(direct_local_command_from_transcript("Helligkeit 80 und sag mir das Wetter."))
+        self.assertIsNone(direct_local_command_from_transcript("Mach den Bildschirm aus und erinnere mich morgen."))
+        self.assertIsNone(direct_local_command_from_transcript("Bitte nicht die Helligkeit aendern."))
 
     def test_split_post_tts_system_actions(self) -> None:
         actions, post_tts = split_post_tts_system_actions(

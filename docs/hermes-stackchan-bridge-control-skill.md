@@ -226,11 +226,17 @@ When StackChan itself records audio:
 1. Wakeword or touch starts recording.
 2. StackChan posts WAV data to `POST /stackchan/audio`.
 3. Bridge transcribes using the configured STT provider.
-4. Bridge asks Hermes.
-5. Hermes returns JSON with top-level `reply` and optional `actions`.
-6. Bridge validates actions and publishes MQTT commands.
-7. Bridge creates TTS for `reply`.
-8. StackChan receives or fetches the TTS WAV and plays it.
+4. Bridge handles simple one-step local commands directly when possible.
+5. Bridge asks Hermes for conversation, combined tasks, and complex requests.
+6. Hermes returns JSON with top-level `reply` and optional `actions`.
+7. Bridge validates actions and publishes MQTT commands.
+8. Bridge creates TTS for `reply`.
+9. StackChan receives or fetches the TTS WAV and plays it.
+
+Local shortcuts include volume, brightness, display sleep/wake, battery,
+temperature, and basic sensor questions. They log `hermes=0ms` and still return
+display/TTS to StackChan. Combined tasks and anything requiring reasoning still
+goes to Hermes.
 
 For this flow Hermes should return JSON:
 
