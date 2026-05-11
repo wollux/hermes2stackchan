@@ -22,6 +22,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Face rendering with eyes, pupils, mouth, blink, breathing, gaze directions, sleep hints, battery states, and simple emotions.
 - Idle life animation from the bridge while StackChan is idle.
 - Automatic idle sleep: after five quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
+- Wake on touch or commanded movement: head touch, display touch, `cmd/move`, and `cmd/motion` wake the display through the CRT wake animation.
 - Head movement with soft limits and smooth waypoint paths.
 - Expressive motion commands for nodding, shaking, scans, circles, and Hermes-selected motion profiles.
 - LED/neon commands and recording-level LED feedback.

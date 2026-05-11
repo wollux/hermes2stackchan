@@ -306,6 +306,8 @@ The bridge also has an idle-sleep watcher: after five quiet minutes without huma
 interaction or non-life actions, it sends `cmd/device {"display_sleep":true}` and
 the life animator must stay quiet because the retained status reports
 `display_sleeping:true`.
+Head touch, display touch, `cmd/move`, and `cmd/motion` wake StackChan through
+the CRT wake animation before continuing with recording or movement.
 
 Normal pitch/rest position is around `45`, not `0`. Yaw can move more freely than
 pitch; pitch must remain conservative.

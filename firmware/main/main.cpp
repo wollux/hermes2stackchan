@@ -3288,6 +3288,7 @@ void handle_move_command(const char* data, int len)
     const int glance_pitch = has_pitch_target ? clamp_int(pitch_target_pct, kPitchTargetMinPct, kPitchTargetMaxPct) - static_cast<int>(g_servo_pitch_pct)
                                               : pitch_delta;
     enqueue_direction_glance(glance_yaw, glance_pitch);
+    wake_display_if_needed();
 
     g_pending_yaw_delta += yaw_delta;
     g_pending_pitch_delta += pitch_delta;
@@ -3327,6 +3328,7 @@ void handle_motion_command(const char* data, int len)
         }
     }
     enqueue_direction_glance(glance_yaw, glance_pitch);
+    wake_display_if_needed();
 
     if (!enqueue_motion_command(command)) {
         publish_error(request_id, "motion", "motion queue full");
@@ -4790,6 +4792,9 @@ void touch_event_task(void*)
         if (stable_count >= 2 && pressed != stable_pressed) {
             stable_pressed = pressed;
             g_touch_pressed = pressed;
+            if (pressed) {
+                wake_display_if_needed();
+            }
             publish_touch_event(pressed ? "touch_down" : "touch_up",
                                 pressed ? source : active_source,
                                 raw,
