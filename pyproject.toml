@@ -5,7 +5,8 @@ description = "Hermes-to-StackChan MQTT bridge."
 requires-python = ">=3.11"
 dependencies = [
   "edge-tts>=7.0.0",
-  "paho-mqtt>=2.1.0"
+  "paho-mqtt>=2.1.0",
+  "Pillow>=10.0.0"
 ]
 
 [project.scripts]

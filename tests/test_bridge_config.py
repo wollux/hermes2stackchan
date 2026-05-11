@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import random
 import sys
 import tempfile
@@ -15,7 +16,9 @@ from bridge.hermes2stackchan_bridge import (
     ConfigError,
     action_to_topic_payload,
     battery_snapshot,
+    bridge_base_url_from_audio_url,
     build_display_payload,
+    build_idle_sleep_payload,
     build_life_sequence,
     build_multipart_form_data,
     build_motion_profile_points,
@@ -23,17 +26,39 @@ from bridge.hermes2stackchan_bridge import (
     build_device_settings_snapshot,
     build_power_change_actions,
     build_power_followup_actions,
+    build_reminder,
     build_touch_lamp_payload,
+    command_requests_display_sleep,
+    direct_system_command_from_transcript,
+    due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
     DEFAULT_IDLE_YAW_PCT,
+    external_reply_actions,
     face_snapshot,
+    add_reminder,
     LIFE_VARIANT_NAMES,
     load_config,
     missing_status_paths,
+    motion_action_duration_ms,
+    mqtt_settle_delay_after_publish_s,
+    notify_actions_from_payload,
+    notify_text_from_payload,
     normalize_motion_points,
+    pending_reminders,
+    reminder_actions,
+    schedule_reminders_from_actions,
+    split_post_tts_system_actions,
     parse_hermes_action_response,
     parse_env_file,
     should_listen_for_followup,
+    build_hermes_messages,
+    build_hermes_vision_messages,
+    image_data_url,
+    image_result_aspect_score,
+    image_search_queries,
+    command_counts_as_idle_activity,
+    request_id_counts_as_idle_activity,
+    rgb565_to_jpeg,
     status_allows_life_animation,
 )
 
@@ -94,6 +119,12 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("bench", config.pairs)
         self.assertEqual(config.pairs["bench"].display_topic, "hermes-stackchan/bench/cmd/display")
 
+    def test_bridge_public_url_can_derive_from_audio_url(self) -> None:
+        self.assertEqual(
+            bridge_base_url_from_audio_url("http://192.168.99.58:8788/stackchan/audio"),
+            "http://192.168.99.58:8788",
+        )
+
     def test_env_overrides_hermes(self) -> None:
         config = load_config(
             Path("config/pairs.example.json"),
@@ -149,6 +180,96 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["text"], "Hallo StackChan")
         self.assertEqual(payload["request_id"], "test-001")
 
+    def test_display_image_action_targets_display_topic(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        topic, payload = action_to_topic_payload(
+            config.pairs["desk"],
+            {
+                "action": "display_image",
+                "url": "http://127.0.0.1:8788/stackchan/images/test.jpg",
+                "caption": "Kamera",
+            },
+            "img-1",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/display")
+        self.assertEqual(payload["mode"], "image")
+        self.assertEqual(payload["format"], "jpeg")
+        self.assertEqual(payload["width"], 320)
+        self.assertEqual(payload["height"], 240)
+        self.assertEqual(payload["request_id"], "img-1")
+
+    def test_image_result_aspect_score_prefers_stackchan_ratio(self) -> None:
+        good = {"width": 1024, "height": 768, "url": "https://example.com/good.jpg"}
+        tall = {"width": 400, "height": 1200, "url": "https://example.com/tall.jpg"}
+        tiny = {"width": 120, "height": 90, "url": "https://example.com/tiny.jpg"}
+
+        self.assertLess(image_result_aspect_score(good), image_result_aspect_score(tall))
+        self.assertLess(image_result_aspect_score(good), image_result_aspect_score(tiny))
+
+    def test_image_search_queries_simplifies_long_photo_requests(self) -> None:
+        queries = image_search_queries("Spandau Berlin Altstadt Havel Zitadelle Foto")
+
+        self.assertEqual(queries[0], "Spandau Berlin Altstadt Havel Zitadelle Foto")
+        self.assertIn("Spandau Berlin Altstadt Havel Zitadelle", queries)
+        self.assertIn("Spandau Berlin Altstadt", queries)
+        self.assertIn("Spandau", queries)
+
+    def test_idle_sleep_ignores_life_and_its_own_commands(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        self.assertFalse(request_id_counts_as_idle_activity("life-123"))
+        self.assertFalse(request_id_counts_as_idle_activity("idle-sleep-123"))
+        self.assertFalse(command_counts_as_idle_activity(pair, pair.face_topic, {"request_id": "life-123"}))
+        self.assertFalse(command_counts_as_idle_activity(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
+        self.assertTrue(command_requests_display_sleep(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
+        self.assertTrue(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_sleep"}))
+        self.assertFalse(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_wake"}))
+        self.assertTrue(command_counts_as_idle_activity(pair, pair.display_topic, {"text": "Hallo", "request_id": "notify-123"}))
+        self.assertTrue(command_counts_as_idle_activity(pair, pair.system_topic, {"action": "display_wake", "request_id": "reminder-123"}))
+
+    def test_idle_sleep_payload_turns_display_off_only(self) -> None:
+        payload = build_idle_sleep_payload("idle-sleep-test")
+
+        self.assertEqual(payload["request_id"], "idle-sleep-test")
+        self.assertTrue(payload["display_sleep"])
+        self.assertNotIn("display_wake", payload)
+        self.assertNotIn("motion", payload)
+
+    def test_hermes_vision_messages_include_data_url(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        messages = build_hermes_vision_messages(
+            config.pairs["desk"],
+            "",
+            "",
+            {},
+            "Was siehst du?",
+            b"fake-image",
+            "image/jpeg",
+        )
+
+        self.assertEqual(messages[1]["content"][0]["text"], "Was siehst du?")
+        self.assertTrue(messages[1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(image_data_url(b"x", "image/png"), "data:image/png;base64,eA==")
+
+    @unittest.skipIf(importlib.util.find_spec("PIL") is None, "Pillow not installed")
+    def test_rgb565_camera_conversion_uses_big_endian(self) -> None:
+        import io
+        from PIL import Image
+
+        row = bytes([0xF8, 0x00]) * 8 + bytes([0x07, 0xE0]) * 8 + bytes([0x00, 0x1F]) * 8
+        pixels = row * 8
+        jpeg = rgb565_to_jpeg(pixels, 24, 8)
+        image = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        red = image.getpixel((4, 4))
+        green = image.getpixel((12, 4))
+        blue = image.getpixel((20, 4))
+
+        self.assertGreater(red[0], red[1] + red[2])
+        self.assertGreater(green[1], green[0] + green[2])
+        self.assertGreater(blue[2], blue[0] + blue[1])
+
     def test_multipart_form_data_contains_audio_file(self) -> None:
         body, boundary = build_multipart_form_data(
             {"model": "whisper-large-v3-turbo", "language": "de"},
@@ -201,6 +322,19 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertGreaterEqual(points[-1]["duration_ms"], 300)
         self.assertTrue(all("profile" not in point for point in points))
 
+    def test_motion_action_duration_sums_segments_and_holds(self) -> None:
+        duration = motion_action_duration_ms(
+            {
+                "action": "motion",
+                "points": [
+                    {"duration_ms": 1200, "hold_ms": 300},
+                    {"duration_ms": 800},
+                ],
+            }
+        )
+
+        self.assertEqual(duration, 2300)
+
     def test_parse_hermes_action_response_accepts_fenced_json(self) -> None:
         parsed = parse_hermes_action_response(
             "```json\n{\"reply\":\"Hallo\",\"actions\":[{\"action\":\"face\",\"emotion\":\"happy\"}]}\n```"
@@ -214,6 +348,83 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(parsed["actions"][0]["action"], "say")
         self.assertEqual(parsed["actions"][0]["text"], "Hallo Wolfgang.")
+
+    def test_hermes_prompt_forbids_say_for_normal_replies(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        messages = build_hermes_messages(pair, "", "", {}, "Sag hallo.")
+        system_text = messages[0]["content"]
+
+        self.assertIn("Do not use action say", system_text)
+        self.assertNotIn("Use action say", system_text)
+        self.assertIn("top-level reply", system_text)
+
+    def test_external_tts_reply_uses_display_instead_of_say(self) -> None:
+        actions = external_reply_actions(
+            [{"action": "say", "text": "Hallo Wolfgang.", "emotion": "speaking"}],
+            "Hallo Wolfgang.",
+            tts_enabled=True,
+        )
+
+        self.assertEqual(actions[0]["action"], "display")
+        self.assertNotIn("say", {action["action"] for action in actions})
+
+    def test_external_non_tts_reply_keeps_say(self) -> None:
+        actions = [{"action": "say", "text": "Hallo Wolfgang.", "emotion": "speaking"}]
+
+        self.assertEqual(external_reply_actions(actions, "Hallo Wolfgang.", tts_enabled=False), actions)
+
+    def test_say_action_is_mapped_to_display_without_beep(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {"action": "say", "text": "Hallo Wolfgang.", "emotion": "speaking", "beep": True},
+            "legacy-say-001",
+        )
+
+        self.assertEqual(topic, pair.display_topic)
+        self.assertEqual(payload["mode"], "text")
+        self.assertEqual(payload["text"], "Hallo Wolfgang.")
+        self.assertNotIn("beep", payload)
+
+    def test_display_payload_is_hard_clamped_for_stackchan(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+        long_text = "Wort " * 200
+
+        _topic, payload = action_to_topic_payload(pair, {"action": "display", "text": long_text}, "display-001")
+
+        self.assertLessEqual(len(payload["text"]), 320)
+
+    def test_notify_payload_extracts_text_and_maps_say_to_display(self) -> None:
+        text = notify_text_from_payload({"reply": "Hallo vom externen Hermes."})
+        actions = notify_actions_from_payload(
+            {"actions": [{"action": "say", "text": "Bitte nicht say."}, {"action": "face", "emotion": "happy"}]},
+            text,
+            tts_enabled=True,
+        )
+
+        self.assertEqual(text, "Hallo vom externen Hermes.")
+        self.assertEqual(actions[0]["action"], "display")
+        self.assertIn("face", {action["action"] for action in actions})
+        self.assertNotIn("say", {action["action"] for action in actions})
+
+    def test_mqtt_settle_delay_spaces_text_before_followup_actions(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        self.assertGreater(
+            mqtt_settle_delay_after_publish_s(pair.say_topic, {"text": "Hallo von Hermes."}, pair),
+            0.8,
+        )
+        self.assertGreater(
+            mqtt_settle_delay_after_publish_s(pair.display_topic, {"text": "Direkte Nachricht"}, pair),
+            0.6,
+        )
+        self.assertEqual(
+            mqtt_settle_delay_after_publish_s(pair.audio_topic, {"action": "play_tts_url"}, pair),
+            0.0,
+        )
 
     def test_followup_listen_detects_explicit_flag(self) -> None:
         self.assertTrue(should_listen_for_followup({"follow_up_listen": True, "actions": []}, "Alles klar."))
@@ -238,6 +449,44 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], "req-001")
         self.assertEqual(payload["yaw_target_pct"], 25)
         self.assertEqual(payload["pitch_target_pct"], 0)
+
+    def test_system_sleep_wake_shutdown_actions_to_topic_payload(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        for action_name in ("display_sleep", "display_wake", "shutdown", "power_off"):
+            topic, payload = action_to_topic_payload(
+                pair,
+                {"action": "system", "system_action": action_name},
+                f"system-{action_name}",
+            )
+            self.assertEqual(topic, "hermes-stackchan/desk/cmd/system")
+            self.assertEqual(payload["request_id"], f"system-{action_name}")
+            self.assertEqual(payload["action"], action_name)
+
+    def test_direct_spoken_system_commands(self) -> None:
+        self.assertEqual(
+            direct_system_command_from_transcript("Geh schlafen.")[:2],
+            ("Ich schlafe jetzt.", []),
+        )
+        self.assertEqual(direct_system_command_from_transcript("Geh schlafen.")[2], "display_sleep")
+        self.assertEqual(direct_system_command_from_transcript("StackChan runterfahren.")[2], "shutdown")
+        self.assertEqual(direct_system_command_from_transcript("Wach auf.")[1][0]["system_action"], "display_wake")
+        self.assertIsNone(direct_system_command_from_transcript("Kannst du schlafen?"))
+        self.assertIsNone(direct_system_command_from_transcript("Bitte nicht schlafen."))
+        self.assertIsNone(direct_system_command_from_transcript("Radio abschalten."))
+
+    def test_split_post_tts_system_actions(self) -> None:
+        actions, post_tts = split_post_tts_system_actions(
+            [
+                {"action": "face", "emotion": "sad"},
+                {"action": "system", "system_action": "shutdown"},
+                {"action": "led", "mode": "off"},
+            ]
+        )
+
+        self.assertEqual(post_tts, "shutdown")
+        self.assertEqual([action["action"] for action in actions], ["face", "led"])
 
     def test_battery_snapshot_accepts_status_aliases(self) -> None:
         snapshot = battery_snapshot(
@@ -408,6 +657,72 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["source"], "push_to_talk")
         self.assertEqual(payload["request_id"], "audio-001")
         self.assertEqual(payload["min_ms"], 5000)
+
+    def test_audio_action_to_topic_payload_play_tts_url(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {"action": "audio", "audio_action": "play_tts_url", "url": "http://example.test/tts.wav"},
+            "tts-001",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/audio")
+        self.assertEqual(payload["action"], "play_tts_url")
+        self.assertEqual(payload["url"], "http://example.test/tts.wav")
+
+    def test_reminder_builds_from_delay_and_fires_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_REMINDER_STORE": str(Path(tmpdir) / "reminders.json")},
+            )
+            pair = config.pairs["desk"]
+            reminder = build_reminder(
+                {"action": "reminder", "text": "Test trinken", "delay_s": 2},
+                pair,
+                "reminder-001",
+                now_ts=1000,
+            )
+            self.assertEqual(reminder["due_ts"], 1002)
+
+            add_reminder(config, reminder)
+            self.assertEqual(len(pending_reminders(config, "desk")), 1)
+            self.assertEqual(due_reminders(config, pair, now_ts=1001), [])
+            fired = due_reminders(config, pair, now_ts=1003)
+            self.assertEqual(fired[0]["text"], "Test trinken")
+            self.assertEqual(pending_reminders(config, "desk"), [])
+
+    def test_reminder_actions_wake_display_without_audio_path(self) -> None:
+        actions = reminder_actions({"id": "rem-1", "text": "Wasser trinken"}, 7000)
+
+        self.assertEqual(actions[0], {"action": "system", "system_action": "display_wake"})
+        self.assertTrue(any(action["action"] == "display" and "Wasser trinken" in action["text"] for action in actions))
+        self.assertNotIn("sound", {action["action"] for action in actions})
+        self.assertNotIn("say", {action["action"] for action in actions})
+
+    def test_schedule_reminders_filters_action_from_mqtt_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_REMINDER_STORE": str(Path(tmpdir) / "reminders.json")},
+            )
+            pair = config.pairs["desk"]
+            dispatch, scheduled, errors = schedule_reminders_from_actions(
+                config,
+                pair,
+                [
+                    {"action": "say", "text": "Mache ich."},
+                    {"action": "reminder", "text": "Kaffee", "delay_s": 120},
+                ],
+                "speech-reminder-test",
+            )
+
+            self.assertEqual(errors, [])
+            self.assertEqual([action["action"] for action in dispatch], ["say"])
+            self.assertEqual(scheduled[0]["text"], "Kaffee")
 
     def test_audio_action_to_topic_payload_set_wakeword(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]

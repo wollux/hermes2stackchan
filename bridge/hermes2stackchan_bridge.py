@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import datetime as dt
+import hashlib
 import http.server
+import io
 import json
 import math
+import mimetypes
 import os
 import random
 import signal
@@ -13,16 +18,24 @@ import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event, Thread, Timer
+from threading import Event, RLock, Thread, Timer
 from typing import Any, Callable
 
 
 SCHEMA_VERSION = "1.0"
 POWER_DISPLAY_DURATION_MS = 5000
+MAX_STACKCHAN_TEXT_CHARS = 700
+MAX_STACKCHAN_DISPLAY_CHARS = 320
+MAX_STACKCHAN_TTS_CHARS = 2500
+STACKCHAN_DISPLAY_ASPECT = 320 / 240
+OPENVERSE_IMAGE_SEARCH_URL = "https://api.openverse.org/v1/images/"
+WIKIMEDIA_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
+HTTP_USER_AGENT = "hermes2stackchan-bridge/1.0 (https://github.com/wollux/hermes2stackchan)"
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
 YAW_TARGET_MIN_PCT = -100
@@ -32,6 +45,11 @@ PITCH_TARGET_MAX_PCT = 100
 DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
+DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
+DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
+REMINDER_STORE_LOCK = RLock()
+LIFE_PAUSE_LOCK = RLock()
+LIFE_PAUSED_UNTIL: dict[str, float] = {}
 
 
 class ConfigError(ValueError):
@@ -138,10 +156,20 @@ class SpeechConfig:
     max_audio_bytes: int = 2 * 1024 * 1024
     archive_dir: str | None = None
     tts_dir: str | None = None
+    image_dir: str | None = None
+    max_image_bytes: int = 8 * 1024 * 1024
     tts_engine: str = "edge"
     edge_tts_python: str = ""
     edge_tts_voice: str = "de-DE-KatjaNeural"
     edge_tts_rate: str = "+8%"
+    bridge_public_url: str = ""
+    display_duration_ms: int = 9000
+
+
+@dataclass(frozen=True)
+class ReminderConfig:
+    store_path: str = DEFAULT_REMINDER_STORE
+    poll_interval_s: float = 1.0
     display_duration_ms: int = 9000
 
 
@@ -151,6 +179,7 @@ class BridgeConfig:
     pairs: dict[str, PairConfig]
     hermes: HermesConfig = field(default_factory=HermesConfig)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
+    reminders: ReminderConfig = field(default_factory=ReminderConfig)
 
 
 LifeSequence = list[tuple[int, dict[str, Any]]]
@@ -222,14 +251,41 @@ def load_config(
         ),
         archive_dir=optional_string(env.get("H2S_WAV_ARCHIVE_DIR") or speech_raw.get("archive_dir")),
         tts_dir=optional_string(env.get("H2S_TTS_DIR") or speech_raw.get("tts_dir")),
+        image_dir=optional_string(env.get("H2S_IMAGE_DIR") or speech_raw.get("image_dir")),
+        max_image_bytes=parse_int(
+            env.get("H2S_MAX_IMAGE_BYTES"),
+            int(speech_raw.get("max_image_bytes", 8 * 1024 * 1024)),
+            "H2S_MAX_IMAGE_BYTES",
+        ),
         tts_engine=env.get("H2S_TTS_ENGINE") or str(speech_raw.get("tts_engine") or "edge"),
         edge_tts_python=env.get("H2S_EDGE_TTS_PYTHON") or str(speech_raw.get("edge_tts_python") or ""),
         edge_tts_voice=env.get("H2S_EDGE_TTS_VOICE") or str(speech_raw.get("edge_tts_voice") or "de-DE-KatjaNeural"),
         edge_tts_rate=env.get("H2S_EDGE_TTS_RATE") or str(speech_raw.get("edge_tts_rate") or "+8%"),
+        bridge_public_url=(
+            env.get("H2S_BRIDGE_PUBLIC_URL")
+            or bridge_base_url_from_audio_url(env.get("H2S_BRIDGE_AUDIO_URL"))
+            or str(speech_raw.get("bridge_public_url") or "")
+        ).rstrip("/"),
         display_duration_ms=parse_int(
             env.get("H2S_TRANSCRIPT_DISPLAY_MS"),
             int(speech_raw.get("display_duration_ms", 9000)),
             "H2S_TRANSCRIPT_DISPLAY_MS",
+        ),
+    )
+    reminder_raw = raw.get("reminders") or {}
+    if not isinstance(reminder_raw, dict):
+        raise ConfigError("reminders must be an object when present")
+    reminders = ReminderConfig(
+        store_path=env.get("H2S_REMINDER_STORE") or str(reminder_raw.get("store_path") or DEFAULT_REMINDER_STORE),
+        poll_interval_s=parse_float(
+            env.get("H2S_REMINDER_POLL_S"),
+            float(reminder_raw.get("poll_interval_s", 1.0)),
+            "H2S_REMINDER_POLL_S",
+        ),
+        display_duration_ms=parse_int(
+            env.get("H2S_REMINDER_DISPLAY_MS"),
+            int(reminder_raw.get("display_duration_ms", 9000)),
+            "H2S_REMINDER_DISPLAY_MS",
         ),
     )
 
@@ -273,7 +329,7 @@ def load_config(
             )
         }
 
-    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech)
+    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech, reminders=reminders)
 
 
 def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -341,6 +397,15 @@ def parse_bool(value: str | None, default: bool, label: str) -> bool:
     raise ConfigError(f"{label} must be true or false")
 
 
+def bridge_base_url_from_audio_url(value: str | None) -> str:
+    if not value:
+        return ""
+    marker = "/stackchan/audio"
+    if marker in value:
+        return value.split(marker, 1)[0].rstrip("/")
+    return value.rstrip("/")
+
+
 def has_pair_env(env: dict[str, str]) -> bool:
     return any(
         key in env
@@ -382,7 +447,7 @@ def clamp_int(value: int, min_value: int, max_value: int) -> int:
 
 
 def build_display_payload(text: str, duration_ms: int, request_id: str | None = None) -> dict[str, Any]:
-    text = text.strip()
+    text = safe_stackchan_text(text)
     if not text:
         raise ConfigError("display text must not be empty")
     if duration_ms < 0:
@@ -878,25 +943,28 @@ def extract_hermes_message_content(response: dict[str, Any]) -> str:
     raise ConfigError("Hermes response has no message content")
 
 
-def build_hermes_messages(
+def build_hermes_system_content(
     pair: PairConfig,
     capabilities: str,
     personality: str,
     status: dict[str, Any] | None,
-    user_text: str,
-) -> list[dict[str, str]]:
+) -> str:
     status_text = json.dumps(status or {}, ensure_ascii=False, sort_keys=True)
     system_parts = [
         f"You are {pair.hermes_id}. You control exactly one StackChan: {pair.stackchan_id}.",
         f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
         "Return JSON only. Do not wrap it in Markdown.",
-        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"say|display|face|move|motion|led|device|sound|system\",...}]}",
-        "This request came from StackChan speech input. Answer in German unless the user explicitly asks for another language.",
-        "Use action say for the spoken/displayed answer. The bridge will synthesize this text as audio for StackChan.",
+        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"display|face|move|motion|led|device|sound|system|reminder\",...}]}",
+        "Answer in German unless the user explicitly asks for another language.",
+        "Put the spoken answer only in the top-level reply field. Do not use action say for normal answers, direct messages, reminders, notifications, or command confirmations.",
+        "Use display only when you want to show extra visible text beyond reply. The bridge will synthesize reply as audio for StackChan when TTS is enabled.",
         "You may add hardware actions when useful, but never invent unsupported parameters. The bridge and firmware enforce limits.",
         "Keep answers concise for spoken interaction unless the user asks for detail.",
         "If your reply asks the user a real follow-up question and you expect an immediate answer, set follow_up_listen to true.",
         "If your reply is only a statement, command confirmation, or rhetorical question, set follow_up_listen to false.",
+        "For reminders or notifications, use action reminder with text and delay_s or due_at. Example: {\"action\":\"reminder\",\"text\":\"Wasser trinken\",\"delay_s\":120}.",
+        "If the user only says 'erinnere mich' without enough time or content, ask what/when and set follow_up_listen to true; do not invent reminder details.",
+        "For explicit StackChan sleep commands use {\"action\":\"system\",\"system_action\":\"display_sleep\"}. For wake/display-on commands use display_wake. For explicit power-off/shutdown/runterfahren/abschalten commands use {\"action\":\"system\",\"system_action\":\"shutdown\"}; never use shutdown for ordinary sleep.",
         "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
         f"Current StackChan status JSON: {status_text}",
     ]
@@ -904,9 +972,46 @@ def build_hermes_messages(
         system_parts.append(f"Bridge capabilities:\n{capabilities}")
     if personality:
         system_parts.append(f"Personality notes:\n{personality}")
+    return "\n\n".join(system_parts)
+
+
+def build_hermes_messages(
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+) -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": "\n\n".join(system_parts)},
+        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status)},
         {"role": "user", "content": user_text},
+    ]
+
+
+def image_data_url(image_bytes: bytes, content_type: str) -> str:
+    content_type = content_type if content_type.startswith("image/") else "image/jpeg"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
+def build_hermes_vision_messages(
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+    image_bytes: bytes,
+    content_type: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status)},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_data_url(image_bytes, content_type)}},
+            ],
+        },
     ]
 
 
@@ -922,6 +1027,38 @@ def ask_hermes_http(
         "model": config.hermes.model,
         "messages": build_hermes_messages(pair, capabilities, personality, status, user_text),
         "temperature": 0.3,
+    }
+    response = http_post_json(
+        hermes_chat_url(config.hermes.base_url),
+        config.hermes.api_key,
+        payload,
+        config.hermes.timeout_s,
+    )
+    return parse_hermes_action_response(extract_hermes_message_content(response))
+
+
+def ask_hermes_vision_http(
+    config: BridgeConfig,
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+    image_bytes: bytes,
+    content_type: str,
+) -> dict[str, Any]:
+    payload = {
+        "model": config.hermes.model,
+        "messages": build_hermes_vision_messages(
+            pair,
+            capabilities,
+            personality,
+            status,
+            user_text,
+            image_bytes,
+            content_type,
+        ),
+        "temperature": 0.2,
     }
     response = http_post_json(
         hermes_chat_url(config.hermes.base_url),
@@ -956,16 +1093,41 @@ def actions_to_topic_payloads(
     actions: list[dict[str, Any]],
     request_id_prefix: str,
     skip_actions: set[str] | None = None,
+    config: BridgeConfig | None = None,
+    handler: http.server.BaseHTTPRequestHandler | None = None,
 ) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
     messages: list[tuple[str, dict[str, Any]]] = []
     errors: list[str] = []
     skip_actions = skip_actions or set()
     for index, action in enumerate(actions):
+        name = ""
         if isinstance(action, dict):
             name = str(action.get("action") or action.get("type") or action.get("name") or "").strip().lower().replace("-", "_")
             if name in skip_actions:
                 continue
         try:
+            if name in {"search_image", "image_search", "web_image", "internet_image", "net_image"}:
+                if config is None:
+                    raise ConfigError("image_search action needs bridge config")
+                query = optional_string(action.get("query") or action.get("q") or action.get("text") or action.get("prompt"))
+                image_bytes, _content_type, meta = search_openverse_image(
+                    query or "",
+                    config.speech,
+                    parse_int_value(action.get("limit"), 20, "image_search.limit"),
+                )
+                image_info = prepare_stackchan_image(config, handler, image_bytes, f"{request_id_prefix}-{index:02d}")
+                caption = optional_string(action.get("caption")) or query or meta.get("title", "")
+                display_action = {
+                    "action": "display_image",
+                    "url": image_info["url"],
+                    "width": image_info["width"],
+                    "height": image_info["height"],
+                    "format": image_info["format"],
+                    "duration_ms": parse_int_value(action.get("duration_ms"), 9000, "image_search.duration_ms"),
+                    "caption": caption,
+                }
+                messages.append(action_to_topic_payload(pair, display_action, f"{request_id_prefix}-{index:02d}"))
+                continue
             messages.append(action_to_topic_payload(pair, action, f"{request_id_prefix}-{index:02d}"))
         except ConfigError as exc:
             errors.append(str(exc))
@@ -976,31 +1138,47 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
     if not isinstance(action, dict):
         raise ConfigError("Hermes action must be an object")
     raw_name = action.get("action") or action.get("type") or action.get("name")
-    if not isinstance(raw_name, str) or not raw_name.strip():
+    name = action_name(action)
+    if not name:
         raise ConfigError("Hermes action needs an action name")
-    name = raw_name.strip().lower().replace("-", "_")
     action_request_id = optional_string(action.get("request_id")) or request_id
 
     if name == "display":
         text = optional_string(action.get("text"))
         if not text:
             raise ConfigError("display action needs text")
+        text = safe_stackchan_text(text, MAX_STACKCHAN_DISPLAY_CHARS)
         payload = build_display_payload(text, parse_int_value(action.get("duration_ms"), 5000, "display.duration_ms"), action_request_id)
         return pair.display_topic, payload
+
+    if name in {"display_image", "image"}:
+        url = optional_string(action.get("url") or action.get("image_url"))
+        if not url:
+            raise ConfigError("display_image action needs url")
+        payload: dict[str, Any] = {
+            "mode": "image",
+            "url": url,
+            "width": clamp_int(parse_int_value(action.get("width"), 320, "display_image.width"), 1, 320),
+            "height": clamp_int(parse_int_value(action.get("height"), 240, "display_image.height"), 1, 240),
+            "format": optional_string(action.get("format")) or "jpeg",
+            "duration_ms": parse_int_value(action.get("duration_ms"), 9000, "display_image.duration_ms"),
+        }
+        caption = optional_string(action.get("caption"))
+        if caption:
+            payload["caption"] = safe_stackchan_text(caption, 80)
+        return pair.display_topic, with_request_id(payload, action_request_id)
 
     if name == "say":
         text = optional_string(action.get("text"))
         if not text:
             raise ConfigError("say action needs text")
-        payload = with_request_id(
-            {
-                "text": text,
-                "emotion": optional_string(action.get("emotion")) or "speaking",
-                "beep": parse_bool_value(action.get("beep"), True),
-            },
+        text = safe_stackchan_text(text, MAX_STACKCHAN_DISPLAY_CHARS)
+        payload = build_display_payload(
+            text,
+            parse_int_value(action.get("duration_ms"), 7000, "say.duration_ms"),
             action_request_id,
         )
-        return pair.say_topic, payload
+        return pair.display_topic, payload
 
     if name == "face":
         payload = with_request_id(
@@ -1079,19 +1257,21 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["volume_pct"] = action["volume_pct"]
         return pair.sound_topic, with_request_id(payload, action_request_id)
 
-    if name in {"audio", "start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"}:
+    if name in {"audio", "start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "play_tts_url"}:
         audio_action = optional_string(action.get("audio_action") or action.get("command"))
         if name != "audio":
             audio_action = name
         if not audio_action:
             raise ConfigError("audio action needs audio_action or command")
         audio_action = audio_action.strip().lower().replace("-", "_")
-        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"}:
+        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "play_tts_url"}:
             raise ConfigError(f"unsupported audio action: {audio_action}")
         payload: dict[str, Any] = {"action": audio_action}
         for key in ("source", "wakeword", "reason"):
             if optional_string(action.get(key)):
                 payload[key] = optional_string(action.get(key))
+        if optional_string(action.get("url")):
+            payload["url"] = optional_string(action.get("url"))
         for key in ("min_ms", "silence_timeout_ms", "max_ms"):
             if action.get(key) is not None:
                 payload[key] = parse_int_value(action.get(key), 0, f"audio.{key}")
@@ -1099,13 +1279,14 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["enabled"] = parse_bool_value(action.get("enabled"), True)
         return pair.audio_topic, with_request_id(payload, action_request_id)
 
-    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake"}:
+    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake", "shutdown", "power_off", "take_photo", "photo", "camera"}:
         system_action = optional_string(action.get("system_action") or action.get("command"))
         if name != "system":
-            system_action = name
+            system_action = "take_photo" if name in {"photo", "camera"} else name
         if not system_action:
             raise ConfigError("system action needs system_action or command")
-        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake"}:
+        system_action = system_action.strip().lower().replace("-", "_")
+        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake", "shutdown", "power_off", "take_photo"}:
             raise ConfigError(f"unsupported system action: {system_action}")
         return pair.system_topic, with_request_id({"action": system_action}, action_request_id)
 
@@ -1140,6 +1321,288 @@ def parse_bool_value(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         return parse_bool(value, default, "boolean value")
     raise ConfigError("boolean value must be true or false")
+
+
+REMINDER_ACTIONS = {"reminder", "notify", "notification", "remind"}
+POST_TTS_SYSTEM_ACTIONS = {"display_sleep", "shutdown", "power_off"}
+
+
+def action_name(action: dict[str, Any]) -> str:
+    raw_name = action.get("action") or action.get("type") or action.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return ""
+    return raw_name.strip().lower().replace("-", "_")
+
+
+def normalize_spoken_command_text(text: str) -> str:
+    translation = str.maketrans(
+        {
+            "ä": "ae",
+            "ö": "oe",
+            "ü": "ue",
+            "ß": "ss",
+            "Ä": "ae",
+            "Ö": "oe",
+            "Ü": "ue",
+        }
+    )
+    normalized = text.translate(translation).lower()
+    for char in ".,!?;:()[]{}\"'`´":
+        normalized = normalized.replace(char, " ")
+    return " ".join(normalized.split())
+
+
+def direct_system_command_from_transcript(text: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    normalized = normalize_spoken_command_text(text)
+    if not normalized:
+        return None
+    command = normalized
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("bitte ", "computer ", "stackchan ", "stack chan "):
+            if command.startswith(prefix):
+                command = command[len(prefix):].strip()
+                changed = True
+    if any(negative in f" {normalized} " for negative in (" nicht ", " kein ", " keine ")):
+        return None
+    if any(media in f" {normalized} " for media in (" radio ", " musik ", " lautstaerke ", " lampe ", " led ")):
+        return None
+
+    def is_command_phrase(phrase: str) -> bool:
+        return command == phrase or command.startswith(f"{phrase} ")
+
+    shutdown_phrases = (
+        "runterfahren",
+        "fahre runter",
+        "fahr runter",
+        "herunterfahren",
+        "abschalten",
+        "ausschalten",
+        "schalte dich ab",
+        "mach dich aus",
+        "power off",
+        "shutdown",
+    )
+    if any(is_command_phrase(phrase) for phrase in shutdown_phrases):
+        return "Ich fahre jetzt runter.", [], "shutdown"
+
+    sleep_phrases = (
+        "geh schlafen",
+        "gehe schlafen",
+        "schlafen",
+        "schlaf ein",
+        "schlafmodus",
+        "bildschirm aus",
+        "display aus",
+        "mach den bildschirm aus",
+    )
+    if any(is_command_phrase(phrase) for phrase in sleep_phrases):
+        return "Ich schlafe jetzt.", [], "display_sleep"
+
+    wake_phrases = (
+        "wach auf",
+        "aufwachen",
+        "weck auf",
+        "bildschirm an",
+        "display an",
+        "mach den bildschirm an",
+    )
+    if any(is_command_phrase(phrase) for phrase in wake_phrases):
+        return "Bin wach.", [{"action": "system", "system_action": "display_wake"}], ""
+
+    return None
+
+
+def split_post_tts_system_actions(actions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    kept: list[dict[str, Any]] = []
+    post_tts_system_action = ""
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        name = action_name(action)
+        system_action = optional_string(action.get("system_action") or action.get("command"))
+        if name != "system":
+            system_action = "shutdown" if name == "power_off" else name
+        system_action = (system_action or "").strip().lower().replace("-", "_")
+        if system_action in POST_TTS_SYSTEM_ACTIONS:
+            post_tts_system_action = "shutdown" if system_action == "power_off" else system_action
+            continue
+        kept.append(action)
+    return kept, post_tts_system_action
+
+
+def reminder_store_path(config: BridgeConfig) -> Path:
+    return Path(config.reminders.store_path).expanduser()
+
+
+def read_reminder_store(config: BridgeConfig) -> dict[str, Any]:
+    path = reminder_store_path(config)
+    if not path.exists():
+        return {"schema_version": SCHEMA_VERSION, "reminders": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"reminder store is invalid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"reminder store must be a JSON object: {path}")
+    reminders = data.get("reminders")
+    if not isinstance(reminders, list):
+        data["reminders"] = []
+    return data
+
+
+def write_reminder_store(config: BridgeConfig, store: dict[str, Any]) -> None:
+    path = reminder_store_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def parse_due_at(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = optional_string(value)
+    if not text:
+        raise ConfigError("reminder due_at must be an ISO timestamp or epoch seconds")
+    normalized = text.replace("Z", "+00:00")
+    try:
+        due = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ConfigError("reminder due_at must be an ISO timestamp") from exc
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=dt.timezone.utc)
+    return due.timestamp()
+
+
+def reminder_due_ts(action: dict[str, Any], now_ts: float | None = None) -> float:
+    now = time.time() if now_ts is None else now_ts
+    for key, scale in (("delay_s", 1.0), ("delay_seconds", 1.0), ("in_s", 1.0), ("delay_ms", 0.001)):
+        if action.get(key) is not None:
+            delay = float(parse_int_value(action.get(key), 0, f"reminder.{key}")) * scale
+            if delay < 0:
+                raise ConfigError("reminder delay must be >= 0")
+            return now + delay
+    if action.get("due_at") is not None:
+        return parse_due_at(action.get("due_at"))
+    if action.get("at") is not None:
+        return parse_due_at(action.get("at"))
+    raise ConfigError("reminder action needs delay_s, delay_ms, or due_at")
+
+
+def build_reminder(action: dict[str, Any], pair: PairConfig, request_id: str, now_ts: float | None = None) -> dict[str, Any]:
+    text = optional_string(action.get("text") or action.get("message") or action.get("title"))
+    if not text:
+        raise ConfigError("reminder action needs text")
+    due_ts = reminder_due_ts(action, now_ts)
+    created_ts = time.time() if now_ts is None else now_ts
+    reminder_id = optional_string(action.get("reminder_id") or action.get("id")) or f"rem-{uuid.uuid4().hex[:12]}"
+    return {
+        "id": reminder_id,
+        "pair_id": pair.pair_id,
+        "stackchan_id": pair.stackchan_id,
+        "request_id": request_id,
+        "text": text[:500],
+        "due_ts": round(due_ts, 3),
+        "created_ts": round(created_ts, 3),
+        "source": optional_string(action.get("source")) or "hermes",
+        "status": "pending",
+    }
+
+
+def add_reminder(config: BridgeConfig, reminder: dict[str, Any]) -> dict[str, Any]:
+    with REMINDER_STORE_LOCK:
+        store = read_reminder_store(config)
+        reminders = [item for item in store.get("reminders", []) if isinstance(item, dict)]
+        reminders.append(reminder)
+        store = {"schema_version": SCHEMA_VERSION, "updated_at": time.time(), "reminders": reminders}
+        write_reminder_store(config, store)
+    return reminder
+
+
+def schedule_reminders_from_actions(
+    config: BridgeConfig,
+    pair: PairConfig,
+    actions: list[dict[str, Any]],
+    request_id_prefix: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    dispatch_actions: list[dict[str, Any]] = []
+    scheduled: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            dispatch_actions.append(action)
+            continue
+        if action_name(action) not in REMINDER_ACTIONS:
+            dispatch_actions.append(action)
+            continue
+        try:
+            scheduled.append(add_reminder(config, build_reminder(action, pair, f"{request_id_prefix}-{index:02d}")))
+        except ConfigError as exc:
+            errors.append(str(exc))
+    return dispatch_actions, scheduled, errors
+
+
+def due_reminders(config: BridgeConfig, pair: PairConfig, now_ts: float | None = None) -> list[dict[str, Any]]:
+    now = time.time() if now_ts is None else now_ts
+    fired: list[dict[str, Any]] = []
+    with REMINDER_STORE_LOCK:
+        store = read_reminder_store(config)
+        reminders = [item for item in store.get("reminders", []) if isinstance(item, dict)]
+        for reminder in reminders:
+            if reminder.get("pair_id") != pair.pair_id or reminder.get("status", "pending") != "pending":
+                continue
+            try:
+                due_ts = float(reminder.get("due_ts", 0))
+            except (TypeError, ValueError):
+                continue
+            if due_ts <= now:
+                reminder["status"] = "fired"
+                reminder["fired_ts"] = round(now, 3)
+                fired.append(dict(reminder))
+        if fired:
+            store["updated_at"] = now
+            store["reminders"] = reminders
+            write_reminder_store(config, store)
+    return fired
+
+
+def pending_reminders(config: BridgeConfig, pair_id: str | None = None) -> list[dict[str, Any]]:
+    with REMINDER_STORE_LOCK:
+        reminders = [item for item in read_reminder_store(config).get("reminders", []) if isinstance(item, dict)]
+    result = [item for item in reminders if item.get("status", "pending") == "pending"]
+    if pair_id:
+        result = [item for item in result if item.get("pair_id") == pair_id]
+    return sorted(result, key=lambda item: float(item.get("due_ts", 0)))
+
+
+def reminder_actions(reminder: dict[str, Any], display_duration_ms: int) -> list[dict[str, Any]]:
+    text = optional_string(reminder.get("text")) or "Erinnerung."
+    return [
+        {"action": "system", "system_action": "display_wake"},
+        {"action": "face", "emotion": "speaking", "intensity_pct": 72},
+        {"action": "display", "text": f"ERINNERUNG: {text}", "duration_ms": display_duration_ms},
+    ]
+
+
+def tts_public_url(config: BridgeConfig, tts_path: str) -> str:
+    if not tts_path:
+        return ""
+    base_url = config.speech.bridge_public_url
+    if not base_url:
+        raise ConfigError("H2S_BRIDGE_PUBLIC_URL or H2S_BRIDGE_AUDIO_URL is required for scheduled TTS playback")
+    return f"{base_url}{tts_path}"
+
+
+def reminder_actions_with_tts(config: BridgeConfig, reminder: dict[str, Any]) -> list[dict[str, Any]]:
+    text = optional_string(reminder.get("text")) or "Erinnerung."
+    spoken_text = f"Erinnerung: {text}"
+    request_id = optional_string(reminder.get("id")) or uuid.uuid4().hex
+    tts_path = make_tts_wav(spoken_text, config.speech, f"reminder-{request_id}")
+    actions = reminder_actions(reminder, config.reminders.display_duration_ms)
+    actions.append({"action": "audio", "audio_action": "play_tts_url", "url": tts_public_url(config, tts_path)})
+    return actions
 
 
 def status_bool(value: Any) -> bool | None:
@@ -1285,6 +1748,82 @@ def status_allows_life_animation(status: dict[str, Any] | None) -> bool:
     return True
 
 
+HUMAN_ACTIVITY_EVENTS = {
+    "touch_down",
+    "touch_up",
+    "wakeword_detected",
+    "recording_started",
+    "recording_stopped",
+    "recording_error",
+    "audio_upload_started",
+    "audio_upload_done",
+    "audio_upload_failed",
+    "photo_upload_started",
+    "photo_upload_done",
+    "photo_upload_failed",
+}
+IDLE_SLEEP_IGNORED_REQUEST_PREFIXES = (
+    "life-",
+    "idle-sleep-",
+    "settings-",
+)
+
+
+def request_id_counts_as_idle_activity(request_id: str | None) -> bool:
+    if not request_id:
+        return True
+    return not request_id.startswith(IDLE_SLEEP_IGNORED_REQUEST_PREFIXES)
+
+
+def command_requests_display_sleep(pair: PairConfig, topic: str, payload: dict[str, Any]) -> bool:
+    return (
+        (topic == pair.device_topic and payload.get("display_sleep") is True and not payload.get("display_wake"))
+        or (topic == pair.system_topic and payload.get("action") == "display_sleep")
+    )
+
+
+def command_counts_as_idle_activity(pair: PairConfig, topic: str, payload: dict[str, Any]) -> bool:
+    if not topic.startswith(f"{pair.mqtt_prefix}/cmd/"):
+        return False
+    if not request_id_counts_as_idle_activity(optional_string(payload.get("request_id"))):
+        return False
+    if command_requests_display_sleep(pair, topic, payload):
+        return False
+    return True
+
+
+def status_is_busy(status: dict[str, Any]) -> bool:
+    return (
+        status_bool(status.get("recording")) is True
+        or status_bool(status.get("speaking")) is True
+        or status_bool(nested_status_value(status, "audio.recording")) is True
+    )
+
+
+def build_idle_sleep_payload(request_id: str | None = None) -> dict[str, Any]:
+    return with_request_id({"display_sleep": True}, request_id)
+
+
+def pause_life_animation(pair_id: str, seconds: float, reason: str) -> None:
+    until = time.monotonic() + max(0.0, seconds)
+    with LIFE_PAUSE_LOCK:
+        LIFE_PAUSED_UNTIL[pair_id] = max(LIFE_PAUSED_UNTIL.get(pair_id, 0.0), until)
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge] life animation paused for {pair_id} "
+        f"{seconds:.1f}s: {reason}",
+        flush=True,
+    )
+
+
+def life_animation_paused(pair_id: str) -> bool:
+    with LIFE_PAUSE_LOCK:
+        until = LIFE_PAUSED_UNTIL.get(pair_id, 0.0)
+        if until <= time.monotonic():
+            LIFE_PAUSED_UNTIL.pop(pair_id, None)
+            return False
+        return True
+
+
 def current_face_action(status: dict[str, Any] | None, default_intensity: int = 60) -> dict[str, Any]:
     if not isinstance(status, dict):
         return {"action": "face", "emotion": "neutral", "intensity_pct": default_intensity}
@@ -1337,6 +1876,28 @@ def life_motion(points: list[dict[str, int]], speed_pct: int = 18, curve: str = 
         "points": points,
         "variant": variant,
     }
+
+
+def motion_action_duration_ms(action: dict[str, Any]) -> int:
+    if action_name(action) != "motion":
+        return 0
+    points = action.get("points")
+    if not isinstance(points, list):
+        return 0
+    total = 0
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        total += clamp_int(parse_int_value(point.get("duration_ms"), 0, "motion.duration_ms"), 0, 5000)
+        total += clamp_int(parse_int_value(point.get("hold_ms"), 0, "motion.hold_ms"), 0, 5000)
+    return total
+
+
+def life_action_settle_delay_s(action: dict[str, Any]) -> float:
+    duration_ms = motion_action_duration_ms(action)
+    if duration_ms <= 0:
+        return 0.0
+    return (duration_ms + 350) / 1000.0
 
 
 def gaze_for_direction(direction: str) -> str:
@@ -1553,27 +2114,27 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
                 140,
                 life_motion(
                     [
-                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 420, 42),
-                        motion_point(56 * side, DEFAULT_IDLE_PITCH_PCT + 11, 70, 45),
-                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 20, 70, 45),
-                        motion_point(-4 * side, DEFAULT_IDLE_PITCH_PCT + 22, 70, 45),
-                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 18, 70, 45),
-                        motion_point(-60 * side, DEFAULT_IDLE_PITCH_PCT + 9, 70, 45),
-                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 3, 70, 45),
-                        motion_point(-50 * side, DEFAULT_IDLE_PITCH_PCT - 14, 70, 45),
-                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 21, 70, 45),
-                        motion_point(13 * side, DEFAULT_IDLE_PITCH_PCT - 22, 70, 45),
-                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 16, 70, 45),
-                        motion_point(63 * side, DEFAULT_IDLE_PITCH_PCT - 6, 70, 45),
-                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 70, 45),
-                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 20, 70, 45),
-                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 18, 70, 45),
-                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 3, 70, 45),
-                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 21, 70, 45),
-                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 16, 70, 45),
-                        motion_point(0, DEFAULT_IDLE_PITCH_PCT, 420, 38),
+                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 480, 30),
+                        motion_point(56 * side, DEFAULT_IDLE_PITCH_PCT + 6, 130, 32),
+                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 11, 130, 32),
+                        motion_point(-4 * side, DEFAULT_IDLE_PITCH_PCT + 12, 130, 32),
+                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 10, 130, 32),
+                        motion_point(-60 * side, DEFAULT_IDLE_PITCH_PCT + 5, 130, 32),
+                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 2, 130, 32),
+                        motion_point(-50 * side, DEFAULT_IDLE_PITCH_PCT - 8, 130, 32),
+                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 11, 130, 32),
+                        motion_point(13 * side, DEFAULT_IDLE_PITCH_PCT - 12, 130, 32),
+                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 8, 130, 32),
+                        motion_point(63 * side, DEFAULT_IDLE_PITCH_PCT - 3, 130, 32),
+                        motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT, 130, 32),
+                        motion_point(30 * side, DEFAULT_IDLE_PITCH_PCT + 11, 130, 32),
+                        motion_point(-37 * side, DEFAULT_IDLE_PITCH_PCT + 10, 130, 32),
+                        motion_point(-64 * side, DEFAULT_IDLE_PITCH_PCT - 2, 130, 32),
+                        motion_point(-22 * side, DEFAULT_IDLE_PITCH_PCT - 11, 130, 32),
+                        motion_point(44 * side, DEFAULT_IDLE_PITCH_PCT - 8, 130, 32),
+                        motion_point(0, DEFAULT_IDLE_PITCH_PCT, 520, 28),
                     ],
-                    45,
+                    32,
                     variant=name,
                 ),
             ),
@@ -1841,6 +2402,54 @@ def ensure_reply_action(response: dict[str, Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def external_reply_actions(actions: list[dict[str, Any]], display_text: str, tts_enabled: bool) -> list[dict[str, Any]]:
+    if not tts_enabled:
+        return actions
+    filtered = [action for action in actions if action_name(action) != "say"]
+    has_display = any(action_name(action) == "display" for action in filtered)
+    if display_text and not has_display:
+        filtered.insert(0, {"action": "display", "text": display_text, "duration_ms": 9000})
+    return filtered
+
+
+def notify_text_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("text", "reply", "message"):
+        text = optional_string(payload.get(key))
+        if text:
+            return text
+    return ""
+
+
+def notify_actions_from_payload(payload: dict[str, Any], display_text: str, tts_enabled: bool) -> list[dict[str, Any]]:
+    actions = payload.get("actions")
+    if actions is None:
+        actions = []
+    elif isinstance(actions, dict):
+        actions = [actions]
+    elif not isinstance(actions, list):
+        actions = []
+    actions = [action for action in actions if isinstance(action, dict)]
+    return external_reply_actions(actions, display_text, tts_enabled)
+
+
+def mqtt_settle_delay_after_publish_s(topic: str, payload: dict[str, Any], pair: PairConfig | None = None) -> float:
+    if pair is None:
+        return 0.0
+    if topic == pair.system_topic and payload.get("action") in {"display_wake", "display_sleep"}:
+        return 0.25
+    if topic == pair.face_topic:
+        return 0.12
+    if topic == pair.display_topic:
+        text = optional_string(payload.get("text")) or ""
+        return min(2.2, 0.7 + len(text) / 420.0)
+    if topic == pair.say_topic:
+        text = optional_string(payload.get("text")) or ""
+        return min(2.6, 0.9 + len(text) / 360.0)
+    if topic == pair.motion_topic:
+        return life_action_settle_delay_s({"action": "motion", "points": payload.get("points")})
+    return 0.0
+
+
 def dispatch_mqtt_actions(
     config: BridgeConfig,
     pair: PairConfig,
@@ -1878,6 +2487,9 @@ def dispatch_mqtt_actions(
             print(f"[bridge] sent {topic}: {body}")
             if topic == pair.device_topic:
                 publish_device_settings_snapshot(client, pair, payload, "dispatch")
+            settle_delay = mqtt_settle_delay_after_publish_s(topic, payload, pair)
+            if settle_delay > 0:
+                time.sleep(settle_delay)
         if not wait_ack or not pending:
             return 0
         deadline = time.monotonic() + timeout_s
@@ -1914,12 +2526,41 @@ def ask_hermes(args: argparse.Namespace) -> int:
     personality = read_optional_text(pair.personality_file, config_path)
     response = ask_hermes_http(config, pair, capabilities, personality, status, user_text)
     actions = ensure_reply_action(response)
+    scheduled_reminders: list[dict[str, Any]] = []
+    reminder_errors: list[str] = []
+    if not args.dry_run:
+        actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+            config,
+            pair,
+            actions,
+            f"hermes-reminder-{uuid.uuid4().hex[:8]}",
+        )
+    spoken_text = speech_text_from_hermes_response(response, user_text)
+    tts_enabled = bool(spoken_text and config.speech.bridge_public_url)
+    actions = external_reply_actions(actions, spoken_text, tts_enabled)
     if args.show_response or args.dry_run:
-        print(json.dumps({"hermes": response, "actions": actions}, ensure_ascii=False, indent=2))
+        print(json.dumps(
+            {"hermes": response, "actions": actions, "scheduled_reminders": scheduled_reminders, "reminder_errors": reminder_errors},
+            ensure_ascii=False,
+            indent=2,
+        ))
     action_messages = [
         action_to_topic_payload(pair, action, f"hermes-{uuid.uuid4().hex[:12]}")
         for action in actions
     ]
+    if tts_enabled:
+        try:
+            tts_request_id = f"hermes-tts-{uuid.uuid4().hex[:12]}"
+            tts_path = make_tts_wav(safe_tts_text(spoken_text), config.speech, tts_request_id)
+            action_messages.append(
+                action_to_topic_payload(
+                    pair,
+                    {"action": "audio", "audio_action": "play_tts_url", "url": tts_public_url(config, tts_path)},
+                    tts_request_id,
+                )
+            )
+        except Exception as exc:
+            print(f"[bridge] TTS skipped for Hermes reply: {exc}", file=sys.stderr, flush=True)
     if args.dry_run:
         print(json.dumps(
             [{"topic": topic, "payload": payload} for topic, payload in action_messages],
@@ -1927,6 +2568,13 @@ def ask_hermes(args: argparse.Namespace) -> int:
             indent=2,
         ))
         return 0
+    for reminder in scheduled_reminders:
+        print(
+            f"[bridge] scheduled reminder {reminder['id']} for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(reminder['due_ts'])))}: {reminder['text']}",
+            flush=True,
+        )
+    for error in reminder_errors:
+        print(f"[bridge] reminder ignored: {error}", file=sys.stderr, flush=True)
     return dispatch_mqtt_actions(config, pair, action_messages, not args.no_wait_ack, args.timeout)
 
 
@@ -1942,6 +2590,9 @@ def publish_action_messages(
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] sent {topic}: {body}", flush=True)
         if pair is not None and topic == pair.device_topic:
             publish_device_settings_snapshot(client, pair, payload, "action")
+        settle_delay = mqtt_settle_delay_after_publish_s(topic, payload, pair)
+        if settle_delay > 0:
+            time.sleep(settle_delay)
 
 
 def watch_power(args: argparse.Namespace) -> int:
@@ -2048,17 +2699,33 @@ def animate_life(args: argparse.Namespace) -> int:
         connect_and_start(client, config.mqtt)
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] life animation active for {pair.pair_id}", flush=True)
         while True:
+            if life_animation_paused(pair.pair_id):
+                if args.once:
+                    print("[bridge] life animation skipped: paused by speech or reminder", file=sys.stderr)
+                    return 2
+                time.sleep(min(1.0, max(0.1, args.min_interval_s)))
+                continue
             status = read_latest_status(config, pair, args.status_timeout)
             sequence = build_life_sequence(status, rng, include_motion=not args.no_motion)
             if sequence:
                 for delay_ms, action in sequence:
                     if delay_ms > 0:
                         time.sleep(delay_ms / 1000.0)
+                    if life_animation_paused(pair.pair_id):
+                        break
+                    if action_name(action) == "motion":
+                        status = read_latest_status(config, pair, args.status_timeout)
+                        if not status_allows_life_animation(status):
+                            print("[bridge] life motion skipped: StackChan is no longer idle on face", flush=True)
+                            break
                     publish_action_messages(
                         client,
                         [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
                         pair,
                     )
+                    settle_delay_s = life_action_settle_delay_s(action)
+                    if settle_delay_s > 0:
+                        time.sleep(settle_delay_s)
                 emitted += 1
                 if args.once:
                     return 0
@@ -2303,6 +2970,22 @@ def build_restore_device_payload(settings: dict[str, Any] | None, display_wake: 
     return payload
 
 
+def safe_stackchan_text(text: str, max_chars: int = MAX_STACKCHAN_TEXT_CHARS) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= max_chars:
+        return value
+    clipped = value[: max(0, max_chars - 4)].rstrip()
+    return f"{clipped} ..."
+
+
+def safe_tts_text(text: str, max_chars: int = MAX_STACKCHAN_TTS_CHARS) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= max_chars:
+        return value
+    clipped = value[: max(0, max_chars - 60)].rstrip()
+    return f"{clipped}. Ich habe den Rest gekuerzt, damit StackChan stabil bleibt."
+
+
 def restore_device_settings(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
@@ -2434,15 +3117,8 @@ def send_audio(args: argparse.Namespace) -> int:
 def send_say(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
-    payload = with_request_id(
-        {
-            "text": args.text,
-            "emotion": args.emotion,
-            "beep": not args.no_beep,
-        },
-        args.request_id,
-    )
-    return send_payload(args, pair.say_topic, payload)
+    payload = build_display_payload(safe_stackchan_text(args.text, MAX_STACKCHAN_DISPLAY_CHARS), 7000, args.request_id)
+    return send_payload(args, pair.display_topic, payload)
 
 
 def send_system(args: argparse.Namespace) -> int:
@@ -2617,6 +3293,116 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         client.disconnect()
 
 
+def watch_idle_sleep(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    timeout_s = max(5.0, float(args.timeout_s))
+    poll_s = max(0.2, float(args.poll_s))
+    retry_s = max(5.0, float(args.retry_s))
+    state_lock = RLock()
+    last_activity_at = time.monotonic()
+    last_sleep_sent_at = 0.0
+    sleep_sent = False
+    display_sleeping = False
+    busy = False
+    done = Event()
+
+    def mark_activity(reason: str, log: bool = True) -> None:
+        nonlocal last_activity_at, sleep_sent
+        last_activity_at = time.monotonic()
+        sleep_sent = False
+        if log:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] idle timer reset: {reason}", flush=True)
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        nonlocal display_sleeping, busy, sleep_sent
+        try:
+            payload = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        with state_lock:
+            if message.topic == pair.status_topic:
+                sleeping_value = status_bool(payload.get("display_sleeping"))
+                if sleeping_value is True:
+                    display_sleeping = True
+                    sleep_sent = True
+                elif sleeping_value is False and display_sleeping:
+                    display_sleeping = False
+                    mark_activity("display woke")
+
+                is_busy = status_is_busy(payload)
+                if is_busy:
+                    mark_activity("recording/speaking", log=not busy)
+                elif busy:
+                    mark_activity("recording/speaking stopped")
+                busy = is_busy
+                return
+
+            if message.topic == pair.events_topic:
+                event = optional_string(payload.get("event"))
+                if event in HUMAN_ACTIVITY_EVENTS:
+                    display_sleeping = False
+                    mark_activity(event)
+                return
+
+            if command_requests_display_sleep(pair, message.topic, payload):
+                display_sleeping = True
+                sleep_sent = True
+                pause_life_animation(pair.pair_id, 12.0, "display sleep command")
+                return
+
+            if command_counts_as_idle_activity(pair, message.topic, payload):
+                if payload.get("display_wake") is True or payload.get("action") == "display_wake":
+                    display_sleeping = False
+                mark_activity(f"command {message.topic.rsplit('/', 1)[-1]}")
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe([(pair.status_topic, 0), (pair.events_topic, 0), (f"{pair.mqtt_prefix}/cmd/#", 0)])
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [bridge] idle sleep active for {pair.pair_id}: "
+            f"{timeout_s:.0f}s without human/action -> display sleep, no motion",
+            flush=True,
+        )
+        while not done.wait(poll_s):
+            with state_lock:
+                now = time.monotonic()
+                should_sleep = (
+                    not display_sleeping
+                    and not busy
+                    and (now - last_activity_at) >= timeout_s
+                    and (not sleep_sent or (now - last_sleep_sent_at) >= retry_s)
+                )
+                if not should_sleep:
+                    continue
+                request_id = f"idle-sleep-{uuid.uuid4().hex[:10]}"
+                payload = build_idle_sleep_payload(request_id)
+                last_sleep_sent_at = now
+                sleep_sent = True
+
+            pause_life_animation(pair.pair_id, 20.0, "idle sleep")
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            result = client.publish(pair.device_topic, body, qos=1, retain=False)
+            result.wait_for_publish(timeout=5)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [bridge] idle sleep after {timeout_s:.0f}s: {body}",
+                flush=True,
+            )
+            if args.once:
+                done.set()
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
 def build_multipart_form_data(fields: dict[str, str], file_field: str, filename: str, content_type: str, data: bytes) -> tuple[bytes, str]:
     boundary = f"h2s-{uuid.uuid4().hex}"
     chunks: list[bytes] = []
@@ -2773,6 +3559,359 @@ def make_tts_wav(text: str, speech: SpeechConfig, request_id: str) -> str:
     return f"/stackchan/tts/{out_path.name}"
 
 
+def image_dir_for(speech: SpeechConfig) -> Path:
+    path = Path(speech.image_dir or Path.home() / ".hermes" / "stackchan_images").expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_asset_id(request_id: str) -> str:
+    return "".join(char for char in request_id if char.isalnum() or char in {"-", "_"})[:48] or uuid.uuid4().hex[:16]
+
+
+def bridge_public_url_for_request(config: BridgeConfig, handler: http.server.BaseHTTPRequestHandler | None = None) -> str:
+    if config.speech.bridge_public_url:
+        return config.speech.bridge_public_url.rstrip("/")
+    if handler is not None:
+        host = handler.headers.get("Host") or f"{handler.server.server_address[0]}:{handler.server.server_address[1]}"
+        return f"http://{host}"
+    raise ConfigError("H2S_BRIDGE_PUBLIC_URL or request Host is required")
+
+
+def content_type_from_filename(path: str, fallback: str = "image/jpeg") -> str:
+    guessed = mimetypes.guess_type(path)[0]
+    return guessed if guessed and guessed.startswith("image/") else fallback
+
+
+def parse_data_url(data_url: str) -> tuple[bytes, str]:
+    header, separator, payload = data_url.partition(",")
+    if not separator or not header.startswith("data:"):
+        raise ConfigError("invalid image data_url")
+    content_type = header[5:].split(";", 1)[0] or "image/jpeg"
+    if ";base64" not in header:
+        raise ConfigError("image data_url must be base64 encoded")
+    return base64.b64decode(payload, validate=True), content_type
+
+
+def download_image_bytes(url: str, max_bytes: int, timeout_s: float = 12.0) -> tuple[bytes, str]:
+    request = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        content_type = response.headers.get_content_type() or content_type_from_filename(url)
+        data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ConfigError(f"image too large; max {max_bytes} bytes")
+    if not content_type.startswith("image/"):
+        content_type = content_type_from_filename(url)
+    return data, content_type
+
+
+def image_result_aspect_score(result: dict[str, Any], target_aspect: float = STACKCHAN_DISPLAY_ASPECT) -> float:
+    width = parse_int(result.get("width"), 0, "image.width")
+    height = parse_int(result.get("height"), 0, "image.height")
+    if width <= 0 or height <= 0:
+        return 500.0
+    aspect = width / height
+    aspect_penalty = abs(math.log(max(aspect, 0.01) / target_aspect)) * 100.0
+    size_penalty = 0.0
+    if width < 320 or height < 240:
+        size_penalty += 60.0
+    if width < 160 or height < 120:
+        size_penalty += 120.0
+    url = optional_string(result.get("url")) or ""
+    if not re_like_image_url(url):
+        size_penalty += 12.0
+    return aspect_penalty + size_penalty
+
+
+def re_like_image_url(url: str) -> bool:
+    clean = urllib.parse.urlsplit(url).path.lower()
+    return clean.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+
+IMAGE_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "aus",
+    "bild",
+    "der",
+    "die",
+    "ein",
+    "eine",
+    "einen",
+    "en",
+    "foto",
+    "from",
+    "image",
+    "im",
+    "in",
+    "mir",
+    "of",
+    "photo",
+    "photograph",
+    "picture",
+    "show",
+    "the",
+    "von",
+    "zeig",
+}
+
+
+def image_search_queries(query: str) -> list[str]:
+    words = [word.strip(" ,.;:!?()[]{}\"'").strip() for word in query.split()]
+    words = [word for word in words if word]
+    clean_words = [word for word in words if word.lower() not in IMAGE_QUERY_STOPWORDS]
+    variants: list[str] = []
+
+    def add(value: str) -> None:
+        value = " ".join(value.split()).strip()
+        if value and value.lower() not in {item.lower() for item in variants}:
+            variants.append(value)
+
+    add(query)
+    if clean_words and clean_words != words:
+        add(" ".join(clean_words))
+    if len(clean_words) > 3:
+        add(" ".join(clean_words[:3]))
+        add(" ".join(clean_words[-3:]))
+    if len(clean_words) > 1:
+        add(" ".join(clean_words[:2]))
+    if clean_words:
+        add(clean_words[0])
+    return variants
+
+
+def wikimedia_commons_candidates(query: str, speech: SpeechConfig, limit: int) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode(
+        {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 6,
+            "gsrlimit": clamp_int(limit, 1, 20),
+            "prop": "imageinfo",
+            "iiprop": "url|size|mime|extmetadata",
+            "format": "json",
+        }
+    )
+    request = urllib.request.Request(
+        f"{WIKIMEDIA_COMMONS_API_URL}?{params}",
+        headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=speech.timeout_s) as response:
+        payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    pages = ((payload.get("query") or {}).get("pages") or {}) if isinstance(payload, dict) else {}
+    if not isinstance(pages, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for page in pages.values():
+        if not isinstance(page, dict):
+            continue
+        image_info = page.get("imageinfo") or []
+        if not image_info or not isinstance(image_info[0], dict):
+            continue
+        info = image_info[0]
+        mime = optional_string(info.get("mime")) or ""
+        if mime and not mime.startswith("image/"):
+            continue
+        title = optional_string(page.get("title")) or ""
+        if title.lower().endswith((".svg", ".gif", ".pdf", ".tif", ".tiff")):
+            continue
+        candidates.append(
+            {
+                "url": optional_string(info.get("url")) or "",
+                "title": title.removeprefix("File:"),
+                "width": parse_int(info.get("width"), 0, "commons.width"),
+                "height": parse_int(info.get("height"), 0, "commons.height"),
+                "mime": mime,
+                "foreign_landing_url": optional_string(info.get("descriptionurl")) or "",
+                "creator": "",
+                "license": "",
+                "license_url": "",
+                "provider": "wikimedia-commons",
+            }
+        )
+    return [item for item in candidates if optional_string(item.get("url"))]
+
+
+def openverse_candidates(query: str, speech: SpeechConfig, limit: int) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode({
+        "q": query,
+        "page_size": clamp_int(limit, 1, 20),
+        "mature": "false",
+    })
+    request = urllib.request.Request(
+        f"{OPENVERSE_IMAGE_SEARCH_URL}?{params}",
+        headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=speech.timeout_s) as response:
+        payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    results = payload.get("results") if isinstance(payload, dict) else []
+    if not isinstance(results, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict) or not optional_string(item.get("url")):
+            continue
+        normalized = dict(item)
+        normalized["provider"] = "openverse"
+        candidates.append(normalized)
+    return candidates
+
+
+def search_openverse_image(query: str, speech: SpeechConfig, limit: int = 20) -> tuple[bytes, str, dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        raise ConfigError("image search needs query")
+    errors: list[str] = []
+    searched: list[str] = []
+    for variant in image_search_queries(query):
+        candidates: list[dict[str, Any]] = []
+        for provider, loader in (("openverse", openverse_candidates), ("wikimedia-commons", wikimedia_commons_candidates)):
+            try:
+                found = loader(variant, speech, limit)
+                for item in found:
+                    item["provider"] = optional_string(item.get("provider")) or provider
+                    candidates.append(item)
+            except Exception as exc:
+                errors.append(f"{provider} {variant!r}: {exc}")
+        searched.append(variant)
+        if not candidates:
+            continue
+        candidates.sort(key=image_result_aspect_score)
+        for item in candidates:
+            for url_key in ("url", "thumbnail"):
+                image_url = optional_string(item.get(url_key))
+                if not image_url:
+                    continue
+                try:
+                    data, content_type = download_image_bytes(image_url, speech.max_image_bytes, speech.timeout_s)
+                    if not content_type.startswith("image/"):
+                        raise ConfigError(f"not an image: {content_type}")
+                    meta = {
+                        "provider": optional_string(item.get("provider")) or "openverse",
+                        "query": query,
+                        "matched_query": variant,
+                        "searched_queries": searched,
+                        "title": optional_string(item.get("title")) or "",
+                        "source_url": image_url,
+                        "foreign_landing_url": optional_string(item.get("foreign_landing_url")) or "",
+                        "creator": optional_string(item.get("creator")) or "",
+                        "license": optional_string(item.get("license")) or "",
+                        "license_url": optional_string(item.get("license_url")) or "",
+                        "width": parse_int(item.get("width"), 0, "image.width"),
+                        "height": parse_int(item.get("height"), 0, "image.height"),
+                        "aspect_score": round(image_result_aspect_score(item), 3),
+                    }
+                    return data, content_type, meta
+                except Exception as exc:
+                    errors.append(f"{image_url}: {exc}")
+                    continue
+    reason = "; ".join(errors[:4])
+    if reason:
+        raise ConfigError(f"no downloadable image search result for {query!r}; tried {searched}; {reason}")
+    raise ConfigError(f"no image search results for {query!r}; tried {searched}")
+
+
+def image_bytes_from_payload(payload: dict[str, Any], speech: SpeechConfig) -> tuple[bytes, str, str]:
+    data_url = optional_string(payload.get("data_url") or payload.get("image_data_url"))
+    if data_url:
+        data, content_type = parse_data_url(data_url)
+        source = "data_url"
+    elif optional_string(payload.get("image_base64") or payload.get("base64")):
+        encoded = optional_string(payload.get("image_base64") or payload.get("base64")) or ""
+        data = base64.b64decode(encoded, validate=True)
+        content_type = optional_string(payload.get("content_type") or payload.get("mime_type")) or "image/jpeg"
+        source = "base64"
+    else:
+        url = optional_string(payload.get("image_url") or payload.get("url"))
+        if not url:
+            raise ConfigError("image payload needs image_url, url, data_url, or image_base64")
+        data, content_type = download_image_bytes(url, speech.max_image_bytes, speech.timeout_s)
+        source = url
+    if len(data) > speech.max_image_bytes:
+        raise ConfigError(f"image too large; max {speech.max_image_bytes} bytes")
+    if not content_type.startswith("image/"):
+        content_type = "image/jpeg"
+    return data, content_type, source
+
+
+def convert_image_to_display_jpeg(image_bytes: bytes) -> bytes:
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise ConfigError("Pillow is required for image display. Install with: pip install -e .") from exc
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((320, 240), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (320, 240), (0, 0, 0))
+        x = (320 - image.width) // 2
+        y = (240 - image.height) // 2
+        if image.mode in {"RGBA", "LA"} or ("transparency" in image.info):
+            canvas.paste(image.convert("RGBA"), (x, y), image.convert("RGBA"))
+        else:
+            canvas.paste(image.convert("RGB"), (x, y))
+        out = io.BytesIO()
+        canvas.save(out, format="JPEG", quality=88, optimize=True)
+        return out.getvalue()
+
+
+def rgb565_to_jpeg(image_bytes: bytes, width: int, height: int) -> bytes:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ConfigError("Pillow is required for camera RGB565 conversion. Install with: pip install -e .") from exc
+
+    width = clamp_int(width, 1, 640)
+    height = clamp_int(height, 1, 480)
+    expected = width * height * 2
+    if len(image_bytes) != expected:
+        raise ConfigError(f"rgb565 image has {len(image_bytes)} bytes, expected {expected}")
+    rgb = bytearray(width * height * 3)
+    j = 0
+    for i in range(0, len(image_bytes), 2):
+        # GC0308 camera frames arrive as big-endian RGB565.
+        value = (image_bytes[i] << 8) | image_bytes[i + 1]
+        r = ((value >> 11) & 0x1F) << 3
+        g = ((value >> 5) & 0x3F) << 2
+        b = (value & 0x1F) << 3
+        rgb[j] = r | (r >> 5)
+        rgb[j + 1] = g | (g >> 6)
+        rgb[j + 2] = b | (b >> 5)
+        j += 3
+    image = Image.frombytes("RGB", (width, height), bytes(rgb))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=88)
+    return out.getvalue()
+
+
+def prepare_stackchan_image(
+    config: BridgeConfig,
+    handler: http.server.BaseHTTPRequestHandler | None,
+    image_bytes: bytes,
+    request_id: str,
+) -> dict[str, Any]:
+    image_id = f"{safe_asset_id(request_id)}-{hashlib.sha256(image_bytes).hexdigest()[:10]}"
+    image_dir = image_dir_for(config.speech)
+    raw_path = image_dir / f"{image_id}.source"
+    display_path = image_dir / f"{image_id}.jpg"
+    raw_path.write_bytes(image_bytes)
+    display_bytes = convert_image_to_display_jpeg(image_bytes)
+    display_path.write_bytes(display_bytes)
+    return {
+        "id": image_id,
+        "path": str(display_path),
+        "url_path": f"/stackchan/images/{display_path.name}",
+        "url": f"{bridge_public_url_for_request(config, handler)}/stackchan/images/{display_path.name}",
+        "width": 320,
+        "height": 240,
+        "format": "jpeg",
+        "sha256": hashlib.sha256(display_bytes).hexdigest(),
+        "bytes": len(display_bytes),
+    }
+
+
 class SpeechHttpServer(http.server.ThreadingHTTPServer):
     config: BridgeConfig
     config_path: Path
@@ -2794,6 +3933,336 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def read_json_body(self, request_id: str, max_bytes: int = 65536) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.send_json(400, {"ok": False, "error": "invalid content length", "request_id": request_id})
+            return None
+        if length <= 0:
+            self.send_json(400, {"ok": False, "error": "missing json body", "request_id": request_id})
+            return None
+        if length > max_bytes:
+            self.send_json(413, {"ok": False, "error": "json body too large", "request_id": request_id})
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"ok": False, "error": f"invalid json: {exc}", "request_id": request_id})
+            return None
+        if not isinstance(payload, dict):
+            self.send_json(400, {"ok": False, "error": "json body must be an object", "request_id": request_id})
+            return None
+        return payload
+
+    def public_tts_url(self, tts_path: str) -> str:
+        if not tts_path:
+            return ""
+        try:
+            return tts_public_url(self.server.config, tts_path)
+        except ConfigError:
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            return f"http://{host}{tts_path}"
+
+    def publish_image_to_stackchan(
+        self,
+        image_info: dict[str, Any],
+        request_id: str,
+        caption: str = "",
+        duration_ms: int = 9000,
+    ) -> None:
+        action = {
+            "action": "display_image",
+            "url": image_info["url"],
+            "width": image_info["width"],
+            "height": image_info["height"],
+            "format": image_info["format"],
+            "duration_ms": duration_ms,
+        }
+        if caption:
+            action["caption"] = caption
+        publish_action_messages(
+            self.server.mqtt_client,
+            [action_to_topic_payload(self.server.pair, action, request_id)],
+            self.server.pair,
+        )
+
+    def handle_display_image_post(self, request_id: str) -> None:
+        payload = self.read_json_body(request_id, self.server.config.speech.max_image_bytes + 65536)
+        if payload is None:
+            return
+        started = time.monotonic()
+        request_id = optional_string(payload.get("request_id")) or request_id
+        pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+
+        try:
+            image_bytes, content_type, source = image_bytes_from_payload(payload, self.server.config.speech)
+            image_info = prepare_stackchan_image(self.server.config, self, image_bytes, request_id)
+            caption = safe_stackchan_text(optional_string(payload.get("caption")) or "", 80)
+            duration_ms = parse_int_value(payload.get("duration_ms"), 9000, "display_image.duration_ms")
+            pause_life_animation(self.server.pair.pair_id, max(12.0, duration_ms / 1000.0 + 4.0), f"image display {request_id}")
+            self.publish_image_to_stackchan(image_info, f"image-{request_id}", caption, duration_ms)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] display-image request_id={request_id} source={source} "
+                f"type={content_type} bytes={len(image_bytes)} total={total_ms}ms",
+                flush=True,
+            )
+            self.send_json(200, {"ok": True, "request_id": request_id, "image": image_info, "total_ms": total_ms})
+        except Exception as exc:
+            print(f"[bridge-http] display-image error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
+    def handle_search_image_post(self, request_id: str) -> None:
+        payload = self.read_json_body(request_id, 65536)
+        if payload is None:
+            return
+        started = time.monotonic()
+        request_id = optional_string(payload.get("request_id")) or request_id
+        pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+        query = optional_string(payload.get("query") or payload.get("q") or payload.get("text") or payload.get("prompt"))
+        if not query:
+            self.send_json(400, {"ok": False, "error": "search-image needs query", "request_id": request_id})
+            return
+
+        try:
+            image_bytes, content_type, meta = search_openverse_image(
+                query,
+                self.server.config.speech,
+                parse_int_value(payload.get("limit"), 20, "search-image.limit"),
+            )
+            image_info = prepare_stackchan_image(self.server.config, self, image_bytes, f"search-{request_id}")
+            caption = safe_stackchan_text(optional_string(payload.get("caption")) or query, 80)
+            duration_ms = parse_int_value(payload.get("duration_ms"), 9000, "search-image.duration_ms")
+            pause_life_animation(self.server.pair.pair_id, max(12.0, duration_ms / 1000.0 + 4.0), f"image search {request_id}")
+            self.publish_image_to_stackchan(image_info, f"search-image-{request_id}", caption, duration_ms)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] search-image request_id={request_id} query={query!r} "
+                f"type={content_type} source={meta.get('source_url', '')} total={total_ms}ms",
+                flush=True,
+            )
+            self.send_json(
+                200,
+                {"ok": True, "request_id": request_id, "query": query, "image": image_info, "source": meta, "total_ms": total_ms},
+            )
+        except Exception as exc:
+            print(f"[bridge-http] search-image error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
+    def handle_photo_post(self, request_id: str) -> None:
+        started = time.monotonic()
+        pair_id = (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.send_json(400, {"ok": False, "error": "invalid content length", "request_id": request_id})
+            return
+        if length <= 0:
+            self.send_json(400, {"ok": False, "error": "missing image body", "request_id": request_id})
+            return
+        if length > self.server.config.speech.max_image_bytes:
+            self.send_json(413, {"ok": False, "error": "image too large", "request_id": request_id})
+            return
+        image_bytes = self.rfile.read(length)
+        content_type = self.headers.get_content_type() or "image/jpeg"
+        image_format = (self.headers.get("X-H2S-Image-Format") or self.headers.get("X-StackChan-Image-Format") or "").strip().lower()
+        if image_format == "rgb565":
+            width = parse_int(
+                self.headers.get("X-H2S-Image-Width") or self.headers.get("X-StackChan-Image-Width"),
+                320,
+                "X-H2S-Image-Width",
+            )
+            height = parse_int(
+                self.headers.get("X-H2S-Image-Height") or self.headers.get("X-StackChan-Image-Height"),
+                240,
+                "X-H2S-Image-Height",
+            )
+            image_bytes = rgb565_to_jpeg(image_bytes, width, height)
+            content_type = "image/jpeg"
+        elif image_format in {"jpeg", "jpg"}:
+            content_type = "image/jpeg"
+        elif image_format == "png":
+            content_type = "image/png"
+        if not content_type.startswith("image/"):
+            self.send_json(415, {"ok": False, "error": "expected image content type or X-H2S-Image-Format", "request_id": request_id})
+            return
+
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        prompt = (
+            self.headers.get("X-H2S-Photo-Prompt")
+            or (query.get("prompt", [""])[0] if query else "")
+            or "Beschreibe kurz auf Deutsch, was auf diesem StackChan-Kamerabild zu sehen ist. "
+               "Wenn es eine sinnvolle Aktion gibt, schlage sie knapp vor."
+        )
+        try:
+            pause_life_animation(self.server.pair.pair_id, 60.0, f"photo {request_id}")
+            image_info = prepare_stackchan_image(self.server.config, self, image_bytes, f"photo-{request_id}")
+            self.publish_image_to_stackchan(image_info, f"photo-preview-{request_id}", "KAMERA", 2500)
+            status_started = time.monotonic()
+            status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
+            status_ms = round((time.monotonic() - status_started) * 1000)
+            capabilities = read_optional_text(self.server.pair.capabilities_file, self.server.config_path)
+            personality = read_optional_text(self.server.pair.personality_file, self.server.config_path)
+            hermes_started = time.monotonic()
+            hermes_response = ask_hermes_vision_http(
+                self.server.config,
+                self.server.pair,
+                capabilities,
+                personality,
+                status,
+                prompt,
+                image_bytes,
+                content_type,
+            )
+            hermes_ms = round((time.monotonic() - hermes_started) * 1000)
+            display_text = speech_text_from_hermes_response(hermes_response, "Ich habe das Bild bekommen.")
+            actions = ensure_reply_action(hermes_response)
+            actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+                self.server.config,
+                self.server.pair,
+                actions,
+                f"photo-reminder-{request_id}",
+            )
+            action_messages, action_errors = actions_to_topic_payloads(
+                self.server.pair,
+                actions,
+                f"photo-{request_id}",
+                skip_actions={"say"},
+                config=self.server.config,
+                handler=self,
+            )
+            action_errors.extend(reminder_errors)
+            if display_text and not any(
+                optional_string(action.get("action")).lower() in {"display", "display_image", "image"}
+                for action in actions
+            ):
+                action_messages.insert(
+                    0,
+                    (
+                        self.server.pair.display_topic,
+                        build_display_payload(display_text, 9000, f"photo-display-{request_id}"),
+                    ),
+                )
+            tts_started = time.monotonic()
+            tts_path = make_tts_wav(display_text, self.server.config.speech, f"photo-{request_id}") if display_text else ""
+            tts_ms = round((time.monotonic() - tts_started) * 1000) if tts_path else 0
+            tts_url = self.public_tts_url(tts_path)
+            if tts_url:
+                action_messages.append(action_to_topic_payload(
+                    self.server.pair,
+                    {"action": "audio", "audio_action": "play_tts_url", "url": tts_url},
+                    f"photo-tts-{request_id}",
+                ))
+            publish_started = time.monotonic()
+            publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+            mqtt_ms = round((time.monotonic() - publish_started) * 1000)
+            for reminder in scheduled_reminders:
+                print(f"[bridge-http] scheduled reminder from photo {reminder['id']}: {reminder['text']}", flush=True)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] photo request_id={request_id} bytes={len(image_bytes)} "
+                f"status={status_ms}ms hermes={hermes_ms}ms tts={tts_ms}ms mqtt={mqtt_ms}ms total={total_ms}ms",
+                flush=True,
+            )
+            if action_errors:
+                print(f"[bridge-http] photo ignored invalid actions request_id={request_id}: {action_errors}", flush=True)
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "request_id": request_id,
+                    "reply": display_text[:240],
+                    "image": image_info,
+                    "tts_url": tts_url,
+                    "hermes_ms": hermes_ms,
+                    "tts_ms": tts_ms,
+                    "total_ms": total_ms,
+                    "action_errors": action_errors,
+                },
+            )
+        except Exception as exc:
+            print(f"[bridge-http] photo error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
+    def handle_notify_post(self, request_id: str) -> None:
+        payload = self.read_json_body(request_id)
+        if payload is None:
+            return
+        request_id = optional_string(payload.get("request_id")) or request_id
+        pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+
+        started = time.monotonic()
+        display_text = safe_stackchan_text(notify_text_from_payload(payload), MAX_STACKCHAN_DISPLAY_CHARS)
+        spoken_text = safe_tts_text(notify_text_from_payload(payload))
+        if not spoken_text:
+            self.send_json(400, {"ok": False, "error": "notify needs text, reply, or message", "request_id": request_id})
+            return
+
+        pause_life_animation(self.server.pair.pair_id, 45.0, f"external notify {request_id}")
+        time.sleep(0.45)
+        try:
+            tts_started = time.monotonic()
+            tts_path = make_tts_wav(spoken_text, self.server.config.speech, f"notify-{request_id}")
+            tts_ms = round((time.monotonic() - tts_started) * 1000)
+            tts_url = self.public_tts_url(tts_path)
+            actions = notify_actions_from_payload(payload, display_text, bool(tts_url))
+            action_messages, action_errors = actions_to_topic_payloads(
+                self.server.pair,
+                actions,
+                f"notify-{request_id}",
+                config=self.server.config,
+                handler=self,
+            )
+            action_messages.append(
+                action_to_topic_payload(
+                    self.server.pair,
+                    {"action": "audio", "audio_action": "play_tts_url", "url": tts_url},
+                    f"notify-tts-{request_id}",
+                )
+            )
+            publish_started = time.monotonic()
+            publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+            mqtt_ms = round((time.monotonic() - publish_started) * 1000)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] notify request_id={request_id} chars={len(spoken_text)} "
+                f"actions={len(action_messages)} mqtt={mqtt_ms}ms tts={tts_ms}ms total={total_ms}ms",
+                flush=True,
+            )
+            if action_errors:
+                print(f"[bridge-http] notify ignored invalid actions request_id={request_id}: {action_errors}", flush=True)
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "request_id": request_id,
+                    "reply": display_text,
+                    "tts_path": tts_path,
+                    "tts_url": tts_url,
+                    "tts_ms": tts_ms,
+                    "mqtt_ms": mqtt_ms,
+                    "total_ms": total_ms,
+                    "actions_published": len(action_messages),
+                    "action_errors": action_errors,
+                },
+            )
+        except Exception as exc:
+            print(f"[bridge-http] notify error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/health":
@@ -2812,10 +4281,59 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path.startswith("/stackchan/images/") and (path.endswith(".jpg") or path.endswith(".jpeg")):
+            filename = Path(path).name
+            image_path = image_dir_for(self.server.config.speech) / filename
+            if not image_path.exists():
+                self.send_json(404, {"ok": False, "error": "image not found"})
+                return
+            body = image_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-H2S-Image-Width", "320")
+            self.send_header("X-H2S-Image-Height", "240")
+            self.send_header("X-H2S-Image-Format", "jpeg")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path in {"/stackchan/notify", "/hermes/notify"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_notify_post(request_id)
+            return
+        if path in {"/stackchan/display-image", "/hermes/display-image"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_display_image_post(request_id)
+            return
+        if path in {"/stackchan/search-image", "/hermes/search-image"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_search_image_post(request_id)
+            return
+        if path in {"/stackchan/photo", "/hermes/photo"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_photo_post(request_id)
+            return
         if path != "/stackchan/audio":
             self.send_json(404, {"ok": False, "error": "not found"})
             return
@@ -2849,11 +4367,13 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if archive_path:
             print(f"[bridge-http] archived wav: {archive_path}", flush=True)
         print(f"[bridge-http] received {len(audio)} bytes in {read_ms}ms request_id={request_id}", flush=True)
+        pause_life_animation(self.server.pair.pair_id, 75.0, f"speech request {request_id}")
 
         try:
             stt_started = time.monotonic()
             transcript, backend = transcribe_audio_bytes(audio, self.server.config.speech)
             stt_ms = round((time.monotonic() - stt_started) * 1000)
+            post_tts_system_action = ""
             if not transcript:
                 display_text = "NICHTS VERSTANDEN"
                 hermes_response: dict[str, Any] = {"reply": display_text, "actions": [{"action": "say", "text": display_text, "emotion": "question"}]}
@@ -2863,38 +4383,68 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 mqtt_ms = 0
                 action_count = 0
             else:
-                status_started = time.monotonic()
-                status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
-                status_ms = round((time.monotonic() - status_started) * 1000)
-                capabilities = read_optional_text(
-                    self.server.pair.capabilities_file,
-                    self.server.config_path,
-                )
-                personality = read_optional_text(
-                    self.server.pair.personality_file,
-                    self.server.config_path,
-                )
-                hermes_started = time.monotonic()
-                hermes_response = ask_hermes_http(
-                    self.server.config,
-                    self.server.pair,
-                    capabilities,
-                    personality,
-                    status,
-                    transcript,
-                )
-                hermes_ms = round((time.monotonic() - hermes_started) * 1000)
-                actions = ensure_reply_action(hermes_response)
+                direct_command = direct_system_command_from_transcript(transcript)
+                if direct_command:
+                    display_text, actions, post_tts_system_action = direct_command
+                    hermes_response = {"reply": display_text, "actions": actions}
+                    hermes_ms = 0
+                    status_ms = 0
+                    scheduled_reminders = []
+                    reminder_errors = []
+                    print(
+                        f"[bridge-http] local system command request_id={request_id}: "
+                        f"post_tts={post_tts_system_action or '-'} actions={len(actions)}",
+                        flush=True,
+                    )
+                else:
+                    status_started = time.monotonic()
+                    status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
+                    status_ms = round((time.monotonic() - status_started) * 1000)
+                    capabilities = read_optional_text(
+                        self.server.pair.capabilities_file,
+                        self.server.config_path,
+                    )
+                    personality = read_optional_text(
+                        self.server.pair.personality_file,
+                        self.server.config_path,
+                    )
+                    hermes_started = time.monotonic()
+                    hermes_response = ask_hermes_http(
+                        self.server.config,
+                        self.server.pair,
+                        capabilities,
+                        personality,
+                        status,
+                        transcript,
+                    )
+                    hermes_ms = round((time.monotonic() - hermes_started) * 1000)
+                    actions = ensure_reply_action(hermes_response)
+                    actions, post_tts_system_action = split_post_tts_system_actions(actions)
+                    actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+                        self.server.config,
+                        self.server.pair,
+                        actions,
+                        f"speech-reminder-{request_id}",
+                    )
                 action_messages, action_errors = actions_to_topic_payloads(
                     self.server.pair,
                     actions,
                     f"speech-{request_id}",
                     skip_actions={"say"},
+                    config=self.server.config,
+                    handler=self,
                 )
+                action_errors.extend(reminder_errors)
                 publish_started = time.monotonic()
                 publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
                 mqtt_ms = round((time.monotonic() - publish_started) * 1000)
                 action_count = len(action_messages)
+                for reminder in scheduled_reminders:
+                    print(
+                        f"[bridge-http] scheduled reminder {reminder['id']} "
+                        f"for {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(reminder['due_ts'])))}: {reminder['text']}",
+                        flush=True,
+                    )
                 display_text = speech_text_from_hermes_response(hermes_response, transcript)
             follow_up_listen = should_listen_for_followup(hermes_response, display_text)
 
@@ -2915,23 +4465,23 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     f"[bridge-http] ignored invalid Hermes actions request_id={request_id}: {action_errors}",
                     flush=True,
                 )
-            self.send_json(
-                200,
-                {
-                    "ok": bool(display_text),
-                    "request_id": request_id,
-                    "tts_path": tts_path,
-                    "tts_url": tts_url,
-                    "reply": display_text[:240],
-                    "follow_up_listen": follow_up_listen,
-                    "follow_up_source": "hermes_question" if follow_up_listen else "",
-                    "stt_ms": stt_ms,
-                    "hermes_ms": hermes_ms,
-                    "tts_ms": tts_ms,
-                    "total_ms": total_ms,
-                    "actions_published": action_count,
-                },
-            )
+            response_payload = {
+                "ok": bool(display_text),
+                "request_id": request_id,
+                "tts_path": tts_path,
+                "tts_url": tts_url,
+                "reply": display_text[:240],
+                "follow_up_listen": follow_up_listen,
+                "follow_up_source": "hermes_question" if follow_up_listen else "",
+                "stt_ms": stt_ms,
+                "hermes_ms": hermes_ms,
+                "tts_ms": tts_ms,
+                "total_ms": total_ms,
+                "actions_published": action_count,
+            }
+            if post_tts_system_action:
+                response_payload["post_tts_system_action"] = post_tts_system_action
+            self.send_json(200, response_payload)
         except Exception as exc:
             error_text = f"SPRACHBRIDGE FEHLER: {exc}"
             print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
@@ -2961,6 +4511,10 @@ def serve_audio(args: argparse.Namespace) -> int:
     server.mqtt_client = client
     print(f"[bridge-http] listening on http://{args.host}:{args.port}", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/audio (audio/wav)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/notify (application/json)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/display-image (application/json)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/search-image (application/json)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/photo (image/*)", flush=True)
     print(f"[bridge-http] Hermes API: {hermes_chat_url(config.hermes.base_url)}", flush=True)
     print(f"[bridge-http] dispatch Hermes actions to {pair.mqtt_prefix}/cmd/*", flush=True)
     try:
@@ -2970,6 +4524,73 @@ def serve_audio(args: argparse.Namespace) -> int:
         return 0
     finally:
         server.server_close()
+        client.loop_stop()
+        client.disconnect()
+
+
+def add_reminder_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    action: dict[str, Any] = {"action": "reminder", "text": args.text}
+    if args.delay_s is not None:
+        action["delay_s"] = args.delay_s
+    if args.due_at:
+        action["due_at"] = args.due_at
+    reminder = add_reminder(config, build_reminder(action, pair, args.request_id or f"cli-{uuid.uuid4().hex[:10]}"))
+    print(json.dumps(reminder, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def list_reminders_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    reminders = pending_reminders(config, args.pair)
+    if args.json:
+        print(json.dumps(reminders, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if not reminders:
+        print("[bridge] no pending reminders")
+        return 0
+    for reminder in reminders:
+        due_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(reminder.get("due_ts", 0))))
+        print(f"{reminder.get('id')} {due_text} {reminder.get('pair_id')}: {reminder.get('text')}")
+    return 0
+
+
+def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder: dict[str, Any]) -> None:
+    duration_s = config.reminders.display_duration_ms / 1000.0
+    pause_life_animation(pair.pair_id, max(12.0, duration_s + 8.0), f"reminder {reminder.get('id')}")
+    messages = [
+        action_to_topic_payload(pair, action, f"reminder-{reminder.get('id', uuid.uuid4().hex[:8])}-{index:02d}")
+        for index, action in enumerate(reminder_actions_with_tts(config, reminder))
+    ]
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge] firing reminder {reminder.get('id')}: {reminder.get('text')}",
+        flush=True,
+    )
+    publish_action_messages(client, messages)
+
+
+def watch_reminders(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    poll_s = max(0.2, float(args.poll_s if args.poll_s is not None else config.reminders.poll_interval_s))
+    try:
+        connect_and_start(client, config.mqtt)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [bridge] watching reminders "
+            f"store={reminder_store_path(config)} pair={pair.pair_id} poll={poll_s:.1f}s",
+            flush=True,
+        )
+        while True:
+            for reminder in due_reminders(config, pair):
+                fire_reminder(client, pair, config, reminder)
+                if args.once:
+                    return 0
+            if args.once:
+                return 0
+            time.sleep(poll_s)
+    finally:
         client.loop_stop()
         client.disconnect()
 
@@ -3032,6 +4653,18 @@ def run_bridge(args: argparse.Namespace) -> int:
                 no_restore_face=args.power_no_restore_face,
             ),
         ))
+    if not args.no_reminders:
+        workers.append((
+            "reminders",
+            watch_reminders,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                poll_s=args.reminder_poll_s,
+                once=False,
+            ),
+        ))
     if not args.no_settings:
         workers.append((
             "device-settings",
@@ -3043,6 +4676,20 @@ def run_bridge(args: argparse.Namespace) -> int:
                 timeout=args.settings_timeout,
                 display_wake=args.settings_display_wake,
                 reboot_drop_ms=args.settings_reboot_drop_ms,
+                once=False,
+            ),
+        ))
+    if not args.no_idle_sleep:
+        workers.append((
+            "idle-sleep",
+            watch_idle_sleep,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                timeout_s=args.idle_sleep_timeout_s,
+                poll_s=args.idle_sleep_poll_s,
+                retry_s=args.idle_sleep_retry_s,
                 once=False,
             ),
         ))
@@ -3213,7 +4860,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     system = subcommands.add_parser("send-system", help="Send a system action.")
     add_common_send_options(system)
-    system.add_argument("--action", required=True, choices=["ping", "status", "reboot", "display_sleep", "display_wake"])
+    system.add_argument(
+        "--action",
+        required=True,
+        choices=["ping", "status", "reboot", "display_sleep", "display_wake", "shutdown", "power_off"],
+    )
     system.set_defaults(func=send_system)
 
     raw = subcommands.add_parser("send-raw", help="Send a raw JSON payload to a cmd/* topic inside the pair namespace.")
@@ -3272,6 +4923,25 @@ def build_parser() -> argparse.ArgumentParser:
     power.add_argument("--no-restore-face", action="store_true", help="Do not run the delayed face/motion reaction after the short battery overlay.")
     power.set_defaults(func=watch_power)
 
+    add_reminder_parser = subcommands.add_parser("add-reminder", help="Persist a reminder that StackChan will fire later.")
+    add_reminder_parser.add_argument("--pair", default="desk", help="Pair id to notify.")
+    add_reminder_parser.add_argument("--text", required=True, help="Reminder text.")
+    add_reminder_parser.add_argument("--delay-s", type=int, default=None, help="Delay in seconds.")
+    add_reminder_parser.add_argument("--due-at", default=None, help="ISO timestamp or epoch seconds.")
+    add_reminder_parser.add_argument("--request-id", default=None, help="Optional request id.")
+    add_reminder_parser.set_defaults(func=add_reminder_cli)
+
+    list_reminders_parser = subcommands.add_parser("list-reminders", help="List pending reminders.")
+    list_reminders_parser.add_argument("--pair", default=None, help="Optional pair id filter.")
+    list_reminders_parser.add_argument("--json", action="store_true", help="Print JSON.")
+    list_reminders_parser.set_defaults(func=list_reminders_cli)
+
+    reminders = subcommands.add_parser("watch-reminders", help="Fire due persistent reminders.")
+    reminders.add_argument("--pair", default="desk", help="Pair id to notify.")
+    reminders.add_argument("--poll-s", type=float, default=None, help="Poll interval in seconds.")
+    reminders.add_argument("--once", action="store_true", help="Check once and exit.")
+    reminders.set_defaults(func=watch_reminders)
+
     settings = subcommands.add_parser("watch-device-settings", help="Keep retained device settings and restore them on boot/reconnect.")
     settings.add_argument("--pair", default="desk", help="Pair id to watch.")
     settings.add_argument("--timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
@@ -3279,6 +4949,14 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
     settings.add_argument("--once", action="store_true", help="Process retained status briefly and exit.")
     settings.set_defaults(func=watch_device_settings)
+
+    idle_sleep = subcommands.add_parser("watch-idle-sleep", help="Turn the display off after a quiet idle timeout.")
+    idle_sleep.add_argument("--pair", default="desk", help="Pair id to watch.")
+    idle_sleep.add_argument("--timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
+    idle_sleep.add_argument("--poll-s", type=float, default=1.0, help="Idle check interval in seconds.")
+    idle_sleep.add_argument("--retry-s", type=float, default=30.0, help="Retry sleep command after this many seconds if status does not change.")
+    idle_sleep.add_argument("--once", action="store_true", help="Exit after the first emitted sleep command.")
+    idle_sleep.set_defaults(func=watch_idle_sleep)
 
     life = subcommands.add_parser("animate-life", help="Send small idle face and motion impulses so StackChan feels alive.")
     life.add_argument("--pair", default="desk", help="Pair id to animate.")
@@ -3298,16 +4976,22 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-audio", action="store_true", help="Disable the HTTP audio/STT/TTS worker.")
     run.add_argument("--no-touch-lamp", action="store_true", help="Disable the fast touch/recording LED worker.")
     run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
+    run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
     run.add_argument("--no-settings", action="store_true", help="Disable retained device settings restore worker.")
+    run.add_argument("--no-idle-sleep", action="store_true", help="Disable automatic display sleep after quiet idle timeout.")
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
     run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
     run.add_argument("--touch-off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     run.add_argument("--power-debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
     run.add_argument("--power-announce-initial", action="store_true", help="Also show the current power state immediately.")
     run.add_argument("--power-no-restore-face", action="store_true", help="Do not run delayed face/motion reaction after battery overlay.")
+    run.add_argument("--reminder-poll-s", type=float, default=None, help="Reminder worker poll interval in seconds.")
     run.add_argument("--settings-timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
     run.add_argument("--settings-display-wake", action="store_true", help="Also wake display when restoring retained settings.")
     run.add_argument("--settings-reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
+    run.add_argument("--idle-sleep-timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
+    run.add_argument("--idle-sleep-poll-s", type=float, default=1.0, help="Idle sleep check interval.")
+    run.add_argument("--idle-sleep-retry-s", type=float, default=30.0, help="Retry sleep command if status does not switch to sleeping.")
     run.add_argument("--life-min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
     run.add_argument("--life-max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
     run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")

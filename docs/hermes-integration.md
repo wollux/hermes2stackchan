@@ -24,15 +24,26 @@ This is the reproducible V1.0 integration path for one Hermes and one StackChan.
 {
   "reply": "Mache ich.",
   "actions": [
-    {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 70}
   ]
 }
 ```
 
-8. Bridge publishes valid actions to MQTT.
-9. Bridge creates TTS for `reply` and returns `tts_url`.
+8. Bridge publishes valid hardware/display actions to MQTT.
+9. Bridge creates TTS for `reply` and returns or sends a `tts_url`.
 10. StackChan plays the returned WAV.
+
+For messages that do not start on StackChan, for example a Telegram command to
+Hermes, Hermes must call the push endpoint:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8788/stackchan/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"reply":"Hallo Wolfgang, diese Nachricht kommt von Hermes.","actions":[{"action":"face","emotion":"happy","intensity_pct":70}]}'
+```
+
+This endpoint creates TTS in the bridge and pushes display plus audio to StackChan.
+Publishing MQTT display text alone will not produce spoken audio.
 
 ## Required `.env`
 

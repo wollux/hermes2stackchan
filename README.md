@@ -21,11 +21,13 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Display text commands.
 - Face rendering with eyes, pupils, mouth, blink, breathing, gaze directions, sleep hints, battery states, and simple emotions.
 - Idle life animation from the bridge while StackChan is idle.
+- Automatic idle sleep: after five quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
+- Wake on touch or commanded movement: head touch, display touch, `cmd/move`, and `cmd/motion` wake the display through the CRT wake animation.
 - Head movement with soft limits and smooth waypoint paths.
 - Expressive motion commands for nodding, shaking, scans, circles, and Hermes-selected motion profiles.
 - LED/neon commands and recording-level LED feedback.
 - Speaker volume and local tone test commands.
-- Display brightness, display sleep, display wake, reboot, ping, and status commands.
+- Display brightness, display sleep, display wake, shutdown, reboot, ping, and status commands.
 - Battery and power status in retained MQTT state.
 - Power watcher reactions for plug/unplug without taking over LEDs.
 - Temperature fields for SoC and servos where available.
@@ -40,6 +42,10 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Edge/Katja German TTS generation.
 - TTS WAV returned to StackChan and played through the speaker.
 - Follow-up listening mode: when Hermes asks a real question, StackChan speaks first and then starts recording again.
+- Bridge image display endpoint: Hermes can send an image URL/base64/data URL and the bridge converts it for the StackChan display.
+- Bridge internet image search: Hermes can ask for `image_search`; the bridge searches Openverse, picks a display-friendly 4:3 result, converts it to JPEG, and shows it on StackChan.
+- Bridge camera upload endpoint: StackChan photos can be posted to Hermes vision and answered through display/TTS/audio.
+- Physical StackChan camera capture: `system take_photo` captures QVGA RGB565, uploads it to the bridge, previews it as firmware-decoded JPEG on the display, sends it to Hermes vision, then speaks/displays the answer.
 - Debug cockpit script for bridge log plus serial monitor.
 - Raspberry Pi service installer for the unified bridge.
 
@@ -47,8 +53,6 @@ Still intentionally not part of v1.0:
 
 - Radio playback. It was tested in the prototype and interfered with the wakeword/audio loop.
 - Multi-StackChan group control.
-- Camera capture and image-to-Hermes flow.
-- Displaying images from Hermes.
 - Custom trained wakewords.
 - Production-grade CI for firmware builds.
 
@@ -209,6 +213,7 @@ H2S_MQTT_TLS=false
 
 H2S_BRIDGE_HTTP_HOST=0.0.0.0
 H2S_BRIDGE_HTTP_PORT=8788
+H2S_BRIDGE_PUBLIC_URL=http://192.168.99.58:8788
 
 H2S_STT_PROVIDER=groq
 H2S_GROQ_API_KEY=put-your-groq-key-here
@@ -216,6 +221,8 @@ H2S_STT_MODEL=whisper-large-v3-turbo
 H2S_STT_LANGUAGE=de
 H2S_STT_TIMEOUT_S=30
 H2S_WAV_ARCHIVE_DIR=/home/wollux/.hermes/stackchan_wavs
+H2S_IMAGE_DIR=/home/wollux/.hermes/stackchan_images
+H2S_MAX_IMAGE_BYTES=8388608
 
 H2S_TTS_ENGINE=edge
 H2S_EDGE_TTS_VOICE=de-DE-KatjaNeural
@@ -226,6 +233,10 @@ H2S_HERMES_BASE_URL=http://127.0.0.1:8642
 H2S_HERMES_MODEL=default
 H2S_HERMES_API_KEY=put-your-hermes-key-here-if-needed
 H2S_HERMES_TIMEOUT_S=30
+
+H2S_REMINDER_STORE=~/.hermes/hermes2stackchan/reminders.json
+H2S_REMINDER_POLL_S=1
+H2S_REMINDER_DISPLAY_MS=9000
 ```
 
 Install Python package:
@@ -264,12 +275,15 @@ The service runs one multithreaded bridge process:
 - HTTP audio endpoint.
 - Fast touch/recording LED worker.
 - Power watcher.
+- Persistent reminder worker.
+- Idle sleep watcher.
 - Idle life animator.
 
 Disable individual workers for debugging:
 
 ```bash
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-life
+h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-idle-sleep
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-power
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --touch-verbose
 ```
@@ -388,8 +402,13 @@ scripts/h2s_bridge.sh send-led --pair desk --mode party --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --volume-pct 80 --brightness-pct 70 --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --display-sleep --wait-ack
 scripts/h2s_bridge.sh send-device --pair desk --display-wake --wait-ack
+scripts/h2s_bridge.sh send-system --pair desk --action shutdown --wait-ack
 scripts/h2s_bridge.sh send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
 ```
+
+`display_sleep` only turns the display/backlight off and keeps StackChan alive.
+`display_wake` wakes the display. `shutdown` is a real power-off request through
+the AXP2101 PMIC, so use it only when you really want StackChan to turn off.
 
 Retained device settings:
 
@@ -427,7 +446,6 @@ Expected Hermes JSON shape:
   "reply": "Hallo, ich bin bereit.",
   "follow_up_listen": false,
   "actions": [
-    {"action": "say", "text": "Hallo, ich bin bereit.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 70}
   ]
 }
@@ -446,6 +464,34 @@ When Hermes asks a real follow-up question, it should set:
 ```
 
 StackChan will speak the question first and then automatically start a follow-up recording.
+
+Hermes can also schedule reminders:
+
+```json
+{
+  "reply": "Mache ich. Ich melde mich in zwei Minuten.",
+  "follow_up_listen": false,
+  "actions": [
+    {"action": "reminder", "text": "Bei Wolfgang melden", "delay_s": 120}
+  ]
+}
+```
+
+The bridge stores pending reminders persistently in `H2S_REMINDER_STORE`. When a
+reminder is due, the unified bridge wakes StackChan, shows the reminder, sets a
+speaking face, generates TTS on the bridge, and sends StackChan a TTS URL to
+play. Set `H2S_BRIDGE_PUBLIC_URL` to the bridge URL reachable from StackChan,
+for example `http://192.168.99.58:8788`. If the user only says "erinnere mich"
+without time or content, Hermes should ask what/when and set `follow_up_listen:
+true`.
+
+Reminder CLI:
+
+```bash
+scripts/h2s_bridge.sh add-reminder --pair desk --text "Test" --delay-s 120
+scripts/h2s_bridge.sh list-reminders --pair desk
+scripts/h2s_bridge.sh watch-reminders --pair desk
+```
 
 ## 8: Test Speech End To End
 

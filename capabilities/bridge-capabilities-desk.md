@@ -13,6 +13,111 @@ This public slice supports direct MQTT hardware control. Hermes may request acti
 
 ## Actions
 
+### response contract
+
+For normal answers, direct messages, reminders, notifications, and command
+confirmations, put the spoken text in the top-level `reply` field.
+
+Do not use `say` for normal replies. The bridge handles `reply` by showing text
+and generating TTS when TTS is enabled. Use `display` only for extra visible text
+that should appear in addition to the spoken `reply`.
+
+For messages that originate outside StackChan, for example Telegram asking Hermes
+to notify the device, call the bridge notify endpoint instead of publishing MQTT
+directly:
+
+```http
+POST http://127.0.0.1:8788/stackchan/notify
+Content-Type: application/json
+```
+
+```json
+{
+  "reply": "Ich lese diese Nachricht auf StackChan vor.",
+  "actions": [
+    {"action": "face", "emotion": "happy", "intensity_pct": 70}
+  ]
+}
+```
+
+The notify endpoint creates TTS, publishes `cmd/display`, publishes `cmd/audio`,
+and returns a `tts_url`. Do not use legacy `say` for proactive speech; `say` is
+treated as display-only compatibility.
+
+### images and camera
+
+Hermes can show images on StackChan through the bridge endpoint. Send normal image
+URLs, data URLs, or base64 JSON to the bridge; the bridge converts the image to
+the firmware display format and publishes a safe `display_image` command.
+
+```http
+POST http://127.0.0.1:8788/stackchan/display-image
+Content-Type: application/json
+```
+
+```json
+{
+  "image_url": "https://example.com/image.jpg",
+  "caption": "Kamera",
+  "duration_ms": 9000
+}
+```
+
+If the user asks for an image from the internet and does not provide a URL, use
+the bridge image search action. The bridge searches Openverse, prefers results
+close to StackChan's 4:3 display ratio, converts the chosen result to a 320x240
+JPEG preview, and sends it to StackChan. If a long search phrase returns no
+result, the bridge automatically tries shorter variants and can fall back to
+Wikimedia Commons.
+
+Hermes action:
+
+```json
+{
+  "action": "image_search",
+  "query": "polar lights over iceland",
+  "caption": "Polarlicht",
+  "duration_ms": 9000
+}
+```
+
+Direct HTTP endpoint:
+
+```http
+POST http://127.0.0.1:8788/stackchan/search-image
+Content-Type: application/json
+```
+
+```json
+{
+  "query": "polar lights over iceland",
+  "caption": "Polarlicht",
+  "duration_ms": 9000
+}
+```
+
+StackChan camera uploads use:
+
+```http
+POST http://127.0.0.1:8788/stackchan/photo
+Content-Type: image/jpeg
+```
+
+The bridge sends the uploaded photo to Hermes vision/chat, then returns Hermes'
+answer through the same display/TTS/audio path as speech. Firmware can also
+capture directly from the onboard camera by sending a system command:
+
+```json
+{
+  "action": "system",
+  "system_action": "take_photo",
+  "prompt": "Beschreibe kurz auf Deutsch, was du siehst.",
+  "request_id": "photo-001"
+}
+```
+
+Only request a photo when status reports `camera_available:true`.
+
 ### display
 
 Publishes to `hermes-stackchan/desk/cmd/display`.
@@ -26,6 +131,21 @@ Payload:
   "text": "Hello from Hermes2StackChan",
   "duration_ms": 5000,
   "request_id": "test-001"
+}
+```
+
+Image display payload:
+
+```json
+{
+  "schema_version": "1.0",
+  "mode": "image",
+  "url": "http://127.0.0.1:8788/stackchan/images/example.jpg",
+  "width": 320,
+  "height": 240,
+  "format": "jpeg",
+  "duration_ms": 9000,
+  "request_id": "image-001"
 }
 ```
 
@@ -209,14 +329,14 @@ Bridge processing:
 5. Publish valid actions to `hermes-stackchan/desk/cmd/*`.
 6. Generate TTS for the final reply and return `tts_url` to StackChan.
 
-Hermes must return JSON only:
+Hermes must return JSON only. Put the answer in `reply`; do not use `say` for
+the spoken answer:
 
 ```json
 {
   "reply": "Mache ich.",
   "follow_up_listen": false,
   "actions": [
-    {"action": "say", "text": "Mache ich.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 65},
     {"action": "move", "pitch_target_pct": 55}
   ]
@@ -225,11 +345,44 @@ Hermes must return JSON only:
 
 Use `follow_up_listen: true` only when the reply is a real question and Hermes expects the user to answer immediately. StackChan will play the TTS answer first and then start a short follow-up recording.
 
+### reminder / notify
+
+Schedules a persistent reminder on the bridge host. Use this when the user says
+things like "erinnere mich in zwei Minuten" or "benachrichtige mich morgen".
+The bridge stores the reminder outside git and later wakes StackChan via MQTT.
+When it fires, the bridge generates TTS, sets a fitting speaking face, shows the
+reminder on the display, and sends StackChan a TTS URL to play.
+
+Parameters:
+
+- `text`: required reminder text.
+- `delay_s`: seconds from now, or
+- `due_at`: ISO timestamp with timezone.
+
+Example:
+
+```json
+{
+  "action": "reminder",
+  "text": "Wasser trinken",
+  "delay_s": 120
+}
+```
+
+When the user only says "erinnere mich" without time or content, do not create
+a reminder. Ask what and when, set `follow_up_listen: true`, and wait for the
+answer.
+
 ### system
 
 Publishes to `hermes-stackchan/desk/cmd/system`.
 
-Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`.
+Supported actions: `ping`, `status`, `display_sleep`, `display_wake`, `reboot`, `shutdown`, `power_off`.
+
+Use `display_sleep` when the user wants StackChan to sleep or turn only the
+screen off. Use `display_wake` for wake/display-on commands. Use `shutdown`
+only for explicit power-off/runterfahren/abschalten commands; it asks the
+AXP2101 PMIC to turn StackChan off after any voice reply has finished.
 
 ## Status
 
@@ -297,7 +450,6 @@ Hermes HTTP responses consumed by the bridge must be JSON:
 {
   "reply": "Kurz und freundlich antworten.",
   "actions": [
-    {"action": "say", "text": "Kurz und freundlich antworten.", "emotion": "speaking"},
     {"action": "face", "emotion": "happy", "intensity_pct": 70}
   ]
 }

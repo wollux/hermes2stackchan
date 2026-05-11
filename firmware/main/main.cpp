@@ -16,6 +16,7 @@
 #include "driver/temperature_sensor.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_camera.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -33,6 +34,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "jpeg_decoder.h"
 #include "model_path.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
@@ -64,14 +66,21 @@ constexpr int kYawTargetMinPct = -100;
 constexpr int kYawTargetMaxPct = 100;
 constexpr int kPitchTargetMinPct = 0;
 constexpr int kPitchTargetMaxPct = 100;
+constexpr int kSleepHeadPitchPct = kPitchTargetMinPct;
+constexpr int kSleepHeadMoveDelayMs = 1900;
 constexpr int kVoiceStartGraceMs = 250;
 constexpr int kVoiceNoSpeechTimeoutMs = 5000;
 constexpr int kVoiceMinSpeechMs = 250;
 constexpr int kVoiceSilenceAvgThreshold = 260;
 constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
+constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
+constexpr int kMaxTextPayloadBytes = 1600;
+constexpr int kMaxDisplayedWords = 80;
+constexpr uint32_t kMqttTaskStackBytes = 8192;
+constexpr uint32_t kUiTaskStackBytes = 12288;
 constexpr gpio_num_t kAudioMclk = GPIO_NUM_0;
 constexpr gpio_num_t kAudioBclk = GPIO_NUM_34;
 constexpr gpio_num_t kAudioWs = GPIO_NUM_33;
@@ -118,6 +127,7 @@ volatile bool g_battery_charging_done = false;
 volatile bool g_battery_known = false;
 volatile bool g_usb_power_present = false;
 volatile int g_battery_current_direction = -1;
+volatile bool g_camera_available = false;
 volatile int g_led_mode = 0;
 volatile int g_led_r = 0;
 volatile int g_led_g = 0;
@@ -130,10 +140,19 @@ volatile int g_pending_yaw_delta = 0;
 volatile int g_pending_pitch_delta = 0;
 volatile int g_pending_yaw_target_pct = 101;
 volatile int g_pending_pitch_target_pct = 101;
+volatile bool g_sleep_pose_saved = false;
+volatile int g_pre_sleep_yaw_pct = kDefaultIdleYawPct;
+volatile int g_pre_sleep_pitch_pct = kDefaultIdlePitchPct;
 char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
+bool play_wav_url(const char* url);
+void play_wav_url_task(void* arg);
+bool init_camera();
+bool capture_and_send_photo(const char* request_id, const char* prompt);
+void camera_init_task(void* arg);
+void photo_capture_task(void* arg);
 volatile bool g_audio_input_ready = false;
 volatile bool g_tts_playing = false;
 volatile bool g_wakeword_enabled = true;
@@ -220,8 +239,21 @@ struct WavPlaybackState {
     bool has_pending_byte = false;
 };
 
+struct ImageDownloadState {
+    uint8_t* data = nullptr;
+    int capacity = 0;
+    int len = 0;
+    bool overflow = false;
+};
+
+struct PhotoTaskArgs {
+    char request_id[64];
+    char prompt[192];
+};
+
 enum class UiCommandType : uint8_t {
     Display,
+    Image,
     Face,
     Say,
 };
@@ -229,9 +261,12 @@ enum class UiCommandType : uint8_t {
 struct UiCommand {
     UiCommandType type;
     char text[768];
+    char url[256];
     char emotion[24];
     int intensity_pct;
     int duration_ms;
+    int image_width;
+    int image_height;
     bool beep;
     uint16_t accent;
 };
@@ -243,6 +278,7 @@ QueueHandle_t g_ui_queue = nullptr;
 enum class FaceExtraMode : uint8_t {
     None,
     VoiceWaveform,
+    ThoughtBubbles,
 };
 
 volatile FaceExtraMode g_face_extra_mode = FaceExtraMode::None;
@@ -931,6 +967,10 @@ void flush_frame()
 }
 
 void draw_face_extras();
+void draw_tv_off_animation();
+void draw_tv_on_animation();
+void draw_face(const char* emotion, int intensity_pct);
+bool enqueue_motion_command(const MotionCommand& command);
 
 struct FrameGuard {
     bool active;
@@ -959,6 +999,53 @@ struct FaceFrameGuard {
     }
 };
 
+void queue_sleep_head_pose()
+{
+    if (!g_sleep_pose_saved) {
+        g_pre_sleep_yaw_pct = clamp_int(static_cast<int>(g_servo_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct);
+        g_pre_sleep_pitch_pct = clamp_int(static_cast<int>(g_servo_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct);
+        if (g_pre_sleep_pitch_pct <= kPitchTargetMinPct + 4) {
+            g_pre_sleep_pitch_pct = kDefaultIdlePitchPct;
+        }
+        g_sleep_pose_saved = true;
+    }
+
+    const int yaw_pct = clamp_int(static_cast<int>(g_servo_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct);
+    MotionCommand command = {};
+    command.curve = 1;
+    command.point_count = 2;
+    command.points[0] = {yaw_pct, clamp_int(static_cast<int>(g_servo_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct), 200, 18, 0};
+    command.points[1] = {yaw_pct, kSleepHeadPitchPct, 1200, 18, 0};
+    if (!enqueue_motion_command(command)) {
+        g_pending_pitch_target_pct = kSleepHeadPitchPct;
+    }
+}
+
+void queue_wake_head_pose_restore()
+{
+    if (!g_sleep_pose_saved) {
+        return;
+    }
+
+    const int yaw_pct = clamp_int(static_cast<int>(g_pre_sleep_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct);
+    const int pitch_pct = clamp_int(static_cast<int>(g_pre_sleep_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct);
+    g_sleep_pose_saved = false;
+
+    MotionCommand command = {};
+    command.curve = 1;
+    command.point_count = 2;
+    command.points[0] = {clamp_int(static_cast<int>(g_servo_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct),
+                         clamp_int(static_cast<int>(g_servo_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct),
+                         180,
+                         20,
+                         0};
+    command.points[1] = {yaw_pct, pitch_pct, 950, 22, 0};
+    if (!enqueue_motion_command(command)) {
+        g_pending_yaw_target_pct = yaw_pct;
+        g_pending_pitch_target_pct = pitch_pct;
+    }
+}
+
 void set_lcd_sleep(bool sleeping)
 {
     if (!g_panel || !g_panel_io) {
@@ -969,6 +1056,10 @@ void set_lcd_sleep(bool sleeping)
     }
 
     if (sleeping) {
+        draw_face("sleep", 60);
+        queue_sleep_head_pose();
+        vTaskDelay(pdMS_TO_TICKS(kSleepHeadMoveDelayMs));
+        draw_tv_off_animation();
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(g_panel_io, 0x28, nullptr, 0));
         vTaskDelay(pdMS_TO_TICKS(30));
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(g_panel_io, 0x10, nullptr, 0));
@@ -982,6 +1073,9 @@ void set_lcd_sleep(bool sleeping)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(g_panel, true));
         set_backlight_brightness(g_display_brightness_pct);
         g_display_sleeping = false;
+        draw_tv_on_animation();
+        draw_face(g_face_emotion, g_face_intensity_pct);
+        queue_wake_head_pose_restore();
     }
 }
 
@@ -989,6 +1083,49 @@ void wake_display_if_needed()
 {
     if (g_display_sleeping) {
         set_lcd_sleep(false);
+    }
+}
+
+void shutdown_stackchan()
+{
+    ESP_LOGI(kTag, "stackchan shutdown requested; asking AXP2101 PMIC to power off");
+    g_wakeword_enabled = false;
+    g_recording = false;
+    g_tts_playing = false;
+    std::snprintf(g_ui_mode, sizeof(g_ui_mode), "shutdown");
+    g_face_extra_mode = FaceExtraMode::None;
+
+    set_neon_range(0, 12, 0, 0, 0);
+    show_neon_pixels();
+    draw_face("sad", 65);
+    vTaskDelay(pdMS_TO_TICKS(450));
+    set_lcd_sleep(true);
+    set_servo_vm_power(false);
+
+    if (!g_pmic) {
+        ESP_LOGW(kTag, "AXP2101 power off requested but PMIC is not available");
+        draw_face("error", 55);
+        return;
+    }
+
+    uint8_t reg10 = 0;
+    esp_err_t err = g_pmic->try_read_reg(0x10, reg10);
+    if (err == ESP_OK) {
+        ESP_LOGI(kTag, "AXP2101 power off: reg10 0x%02x -> 0x%02x", reg10, reg10 | 0x01);
+        err = g_pmic->try_write_reg(0x10, reg10 | 0x01);
+    } else {
+        ESP_LOGW(kTag, "AXP2101 power off requested but reg10 read failed: %s", esp_err_to_name(err));
+        err = g_pmic->try_write_reg(0x10, 0x01);
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "AXP2101 power off write failed: %s", esp_err_to_name(err));
+        draw_face("error", 55);
+        return;
+    }
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -1077,6 +1214,96 @@ void clear(uint16_t color)
     draw_rect(0, 0, kWidth, kHeight, color);
 }
 
+void draw_tv_off_animation()
+{
+    if (!g_panel || !g_framebuffer) {
+        return;
+    }
+
+    const uint16_t background = kBlack;
+    const uint16_t flash = rgb565(235, 250, 255);
+    const uint16_t accent = rgb565(20, 180, 255);
+
+    {
+        FrameGuard frame;
+        clear(flash);
+    }
+    vTaskDelay(pdMS_TO_TICKS(55));
+
+    for (int step = 0; step <= 16; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int strip_h = std::max(2, (kHeight * (16 - step)) / 16);
+            const int y = (kHeight - strip_h) / 2;
+            draw_rect(0, y, kWidth, strip_h, flash);
+            draw_rect(0, y, kWidth, 2, accent);
+            draw_rect(0, y + strip_h - 2, kWidth, 2, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(24));
+    }
+
+    for (int step = 0; step <= 22; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int line_w = std::max(0, (kWidth * (22 - step)) / 22);
+            draw_rect((kWidth - line_w) / 2, kHeight / 2 - 1, line_w, 3, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(28));
+    }
+
+    {
+        FrameGuard frame;
+        clear(background);
+    }
+}
+
+void draw_tv_on_animation()
+{
+    if (!g_panel || !g_framebuffer) {
+        return;
+    }
+
+    const uint16_t background = kBlack;
+    const uint16_t flash = rgb565(220, 245, 255);
+    const uint16_t accent = rgb565(20, 180, 255);
+
+    {
+        FrameGuard frame;
+        clear(background);
+    }
+    vTaskDelay(pdMS_TO_TICKS(35));
+
+    for (int step = 0; step <= 18; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int line_w = std::max(3, (kWidth * step) / 18);
+            draw_rect((kWidth - line_w) / 2, kHeight / 2 - 1, line_w, 3, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(24));
+    }
+
+    for (int step = 0; step <= 14; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int strip_h = std::max(3, (kHeight * step) / 14);
+            const int y = (kHeight - strip_h) / 2;
+            draw_rect(0, y, kWidth, strip_h, flash);
+            draw_rect(0, y, kWidth, 2, accent);
+            draw_rect(0, y + strip_h - 2, kWidth, 2, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(22));
+    }
+
+    {
+        FrameGuard frame;
+        clear(flash);
+    }
+}
+
 void reset_voice_meter()
 {
     g_voice_level_pct = 0;
@@ -1132,10 +1359,23 @@ void draw_voice_waveform_overlay()
     }
 }
 
+void draw_thought_bubbles_overlay()
+{
+    const uint16_t bubble = rgb565(210, 245, 255);
+    const uint16_t glint = rgb565(245, 255, 255);
+
+    draw_ellipse(232, 62, 5, 5, bubble);
+    draw_ellipse(256, 44, 8, 7, bubble);
+    draw_ellipse(286, 28, 14, 10, bubble);
+    draw_ellipse(282, 24, 4, 3, glint);
+}
+
 void draw_face_extras()
 {
     if (g_face_extra_mode == FaceExtraMode::VoiceWaveform) {
         draw_voice_waveform_overlay();
+    } else if (g_face_extra_mode == FaceExtraMode::ThoughtBubbles) {
+        draw_thought_bubbles_overlay();
     }
 }
 
@@ -1307,12 +1547,12 @@ void draw_word_message(const char* title, const char* word, int index, int total
 
 void draw_word_sequence(const char* title, const char* text, int duration_ms, uint16_t accent)
 {
-    const int total = std::max(1, count_words(text));
+    const int total = clamp_int(count_words(text), 1, kMaxDisplayedWords);
     const int per_word_ms = clamp_int(duration_ms / total, 360, 1150);
     const char* cursor = text;
     int index = 0;
 
-    while (cursor && *cursor) {
+    while (cursor && *cursor && index < kMaxDisplayedWords) {
         while (*cursor && std::isspace(static_cast<unsigned char>(*cursor))) {
             ++cursor;
         }
@@ -2694,7 +2934,7 @@ void publish_status()
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
                   "\"ui\":{\"mode\":\"%s\"},"
                   "\"speaker\":{\"ready\":%s,\"volume_pct\":%d},"
-                  "\"camera_available\":false,"
+                  "\"camera_available\":%s,"
                   "\"firmware\":\"1.0.0-mqtt-hardware\","
                   "\"firmware_version\":\"1.0.0-mqtt-hardware\"}",
                   CONFIG_STACKCHAN_PAIR_ID,
@@ -2755,8 +2995,32 @@ void publish_status()
                   g_face_intensity_pct,
                   g_ui_mode,
                   g_audio_output_ready ? "true" : "false",
-                  g_speaker_volume_pct);
+                  g_speaker_volume_pct,
+                  g_camera_available ? "true" : "false");
     publish_json(g_topic_status, payload, 1, 1);
+}
+
+void execute_post_tts_system_action(const char* action)
+{
+    if (!action || !*action) {
+        return;
+    }
+    if (std::strcmp(action, "display_sleep") == 0) {
+        set_lcd_sleep(true);
+        publish_status();
+    } else if (std::strcmp(action, "display_wake") == 0) {
+        set_lcd_sleep(false);
+        publish_status();
+    } else if (std::strcmp(action, "shutdown") == 0 || std::strcmp(action, "power_off") == 0) {
+        publish_status();
+        shutdown_stackchan();
+    } else if (std::strcmp(action, "reboot") == 0) {
+        publish_status();
+        vTaskDelay(pdMS_TO_TICKS(250));
+        esp_restart();
+    } else {
+        ESP_LOGW(kTag, "unsupported post-tts system action: %s", action);
+    }
 }
 
 bool append_motion_point(MotionCommand& command, int yaw_pct, int pitch_pct,
@@ -3003,9 +3267,43 @@ void handle_display_command(const char* data, int len)
 
     const char* request_id = json_string(root, "request_id");
     const char* mode = json_string(root, "mode");
+    if (std::strcmp(mode, "image") == 0) {
+        const char* url = json_string(root, "url");
+        const char* format = json_string(root, "format", "jpeg");
+        const int width = clamp_int(json_int(root, "width", kWidth), 1, kWidth);
+        const int height = clamp_int(json_int(root, "height", kHeight), 1, kHeight);
+        if (!url || !*url || (std::strcmp(format, "jpeg") != 0 && std::strcmp(format, "jpg") != 0)) {
+            publish_error(request_id, "display", "expected image url and format jpeg");
+            cJSON_Delete(root);
+            return;
+        }
+
+        UiCommand command = {};
+        command.type = UiCommandType::Image;
+        command.duration_ms = clamp_int(json_int(root, "duration_ms", 9000), 500, 20000);
+        command.image_width = width;
+        command.image_height = height;
+        copy_cstr(command.url, sizeof(command.url), url);
+        copy_display_text(command.emotion, sizeof(command.emotion), json_string(root, "caption"));
+        ESP_LOGI(kTag, "image display command queued: %dx%d url=%s request_id=%s",
+                 width,
+                 height,
+                 command.url,
+                 request_id && *request_id ? request_id : "");
+        if (!enqueue_ui_command(command)) {
+            publish_error(request_id, "display", "ui queue full");
+            cJSON_Delete(root);
+            return;
+        }
+
+        publish_ack(request_id, "display", "image queued");
+        cJSON_Delete(root);
+        return;
+    }
+
     const char* text = json_string(root, "text");
     if (std::strcmp(mode, "text") != 0 || !text || !*text) {
-        publish_error(request_id, "display", "expected mode text and non-empty text");
+        publish_error(request_id, "display", "expected mode text/image and valid payload");
         cJSON_Delete(root);
         return;
     }
@@ -3017,6 +3315,10 @@ void handle_display_command(const char* data, int len)
     copy_display_text(command.text, sizeof(command.text), text);
     copy_cstr(command.emotion, sizeof(command.emotion), "neutral");
     command.intensity_pct = g_face_intensity_pct;
+    ESP_LOGI(kTag, "display command queued: bytes=%d duration=%d request_id=%s",
+             static_cast<int>(std::strlen(command.text)),
+             command.duration_ms,
+             request_id && *request_id ? request_id : "");
     if (!enqueue_ui_command(command)) {
         publish_error(request_id, "display", "ui queue full");
         cJSON_Delete(root);
@@ -3109,6 +3411,7 @@ void handle_move_command(const char* data, int len)
     const int glance_pitch = has_pitch_target ? clamp_int(pitch_target_pct, kPitchTargetMinPct, kPitchTargetMaxPct) - static_cast<int>(g_servo_pitch_pct)
                                               : pitch_delta;
     enqueue_direction_glance(glance_yaw, glance_pitch);
+    wake_display_if_needed();
 
     g_pending_yaw_delta += yaw_delta;
     g_pending_pitch_delta += pitch_delta;
@@ -3148,6 +3451,7 @@ void handle_motion_command(const char* data, int len)
         }
     }
     enqueue_direction_glance(glance_yaw, glance_pitch);
+    wake_display_if_needed();
 
     if (!enqueue_motion_command(command)) {
         publish_error(request_id, "motion", "motion queue full");
@@ -3280,6 +3584,11 @@ void handle_say_command(const char* data, int len)
     command.beep = json_bool(root, "beep", true);
     copy_display_text(command.text, sizeof(command.text), text);
     copy_cstr(command.emotion, sizeof(command.emotion), emotion);
+    ESP_LOGI(kTag, "say command queued: bytes=%d duration=%d beep=%s request_id=%s",
+             static_cast<int>(std::strlen(command.text)),
+             command.duration_ms,
+             command.beep ? "true" : "false",
+             request_id && *request_id ? request_id : "");
     if (!enqueue_ui_command(command)) {
         publish_error(request_id, "say", "ui queue full");
         cJSON_Delete(root);
@@ -3401,6 +3710,39 @@ void handle_audio_command(const char* data, int len)
         g_wakeword_enabled = true;
         set_recording_state(true, "wakeword", request_id, "wakeword detected");
         publish_ack(request_id, "audio", "wakeword simulated");
+    } else if (std::strcmp(action, "play_tts_url") == 0) {
+        const char* url = json_string(root, "url");
+        if (!url || !*url) {
+            publish_error(request_id, "audio", "url is required");
+            cJSON_Delete(root);
+            return;
+        }
+        if (!g_audio_output_ready || !g_audio_output) {
+            publish_error(request_id, "audio", "speaker not ready");
+            cJSON_Delete(root);
+            return;
+        }
+        if (g_tts_playing) {
+            publish_error(request_id, "audio", "tts already playing");
+            cJSON_Delete(root);
+            return;
+        }
+        char* task_url = static_cast<char*>(std::malloc(std::strlen(url) + 1));
+        if (!task_url) {
+            publish_error(request_id, "audio", "url allocation failed");
+            cJSON_Delete(root);
+            return;
+        }
+        std::strcpy(task_url, url);
+        const BaseType_t ok = xTaskCreate(play_wav_url_task, "tts_url", 8192, task_url, 3, nullptr);
+        if (ok != pdPASS) {
+            std::free(task_url);
+            publish_error(request_id, "audio", "tts task failed");
+            cJSON_Delete(root);
+            return;
+        }
+        publish_ack(request_id, "audio", "tts playback started");
+        publish_status();
     } else {
         publish_error(request_id, "audio", "unsupported action");
     }
@@ -3417,7 +3759,9 @@ void handle_system_command(const char* data, int len)
     const char* request_id = json_string(root, "request_id");
     const char* action = json_string(root, "action");
 
-    if (std::strcmp(action, "ping") == 0) {
+    if (!action || !*action) {
+        publish_error(request_id, "system", "action is required");
+    } else if (std::strcmp(action, "ping") == 0) {
         publish_ack(request_id, "system", "pong");
     } else if (std::strcmp(action, "status") == 0) {
         publish_ack(request_id, "system", "status published");
@@ -3435,6 +3779,34 @@ void handle_system_command(const char* data, int len)
     } else if (std::strcmp(action, "display_wake") == 0) {
         set_lcd_sleep(false);
         publish_ack(request_id, "system", "display awake");
+        publish_status();
+    } else if (std::strcmp(action, "shutdown") == 0 || std::strcmp(action, "power_off") == 0) {
+        publish_ack(request_id, "system", "shutting down");
+        publish_status();
+        cJSON_Delete(root);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        shutdown_stackchan();
+        return;
+    } else if (std::strcmp(action, "take_photo") == 0) {
+        auto* args = static_cast<PhotoTaskArgs*>(std::malloc(sizeof(PhotoTaskArgs)));
+        if (!args) {
+            publish_error(request_id, "system", "photo task allocation failed");
+            cJSON_Delete(root);
+            return;
+        }
+        std::memset(args, 0, sizeof(PhotoTaskArgs));
+        copy_cstr(args->request_id, sizeof(args->request_id), request_id);
+        copy_display_text(args->prompt,
+                          sizeof(args->prompt),
+                          json_string(root, "prompt", "Beschreibe kurz, was du auf dem StackChan-Kamerabild siehst."));
+        const BaseType_t ok = xTaskCreate(photo_capture_task, "photo", 12288, args, 3, nullptr);
+        if (ok != pdPASS) {
+            std::free(args);
+            publish_error(request_id, "system", "photo task failed");
+            cJSON_Delete(root);
+            return;
+        }
+        publish_ack(request_id, "system", "photo capture started");
         publish_status();
     } else {
         publish_error(request_id, "system", "unsupported action");
@@ -3545,7 +3917,207 @@ bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request
     } else {
         ESP_LOGW(kTag, "voice upload response has no tts_url");
     }
+    char post_tts_system_action[32] = {};
+    if (extract_json_string(response->data,
+                            "post_tts_system_action",
+                            post_tts_system_action,
+                            sizeof(post_tts_system_action))) {
+        execute_post_tts_system_action(post_tts_system_action);
+    }
     return true;
+}
+
+void build_bridge_photo_url(char* out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (std::strlen(CONFIG_STACKCHAN_BRIDGE_PHOTO_URL) > 0) {
+        copy_cstr(out, out_len, CONFIG_STACKCHAN_BRIDGE_PHOTO_URL);
+        return;
+    }
+    const char* suffix = std::strstr(CONFIG_STACKCHAN_BRIDGE_AUDIO_URL, "/stackchan/audio");
+    if (!suffix) {
+        return;
+    }
+    const size_t prefix_len = static_cast<size_t>(suffix - CONFIG_STACKCHAN_BRIDGE_AUDIO_URL);
+    const size_t copy_len = std::min(prefix_len, out_len - 1);
+    std::memcpy(out, CONFIG_STACKCHAN_BRIDGE_AUDIO_URL, copy_len);
+    out[copy_len] = '\0';
+    std::strncat(out, "/stackchan/photo", out_len - std::strlen(out) - 1);
+}
+
+bool init_camera()
+{
+    if (g_camera_available) {
+        return true;
+    }
+    camera_config_t config = {};
+    config.pin_pwdn = GPIO_NUM_NC;
+    config.pin_reset = GPIO_NUM_NC;
+    config.pin_xclk = GPIO_NUM_NC;
+    config.pin_sccb_sda = GPIO_NUM_NC;
+    config.pin_sccb_scl = GPIO_NUM_NC;
+    config.pin_d7 = GPIO_NUM_47;
+    config.pin_d6 = GPIO_NUM_48;
+    config.pin_d5 = GPIO_NUM_16;
+    config.pin_d4 = GPIO_NUM_15;
+    config.pin_d3 = GPIO_NUM_42;
+    config.pin_d2 = GPIO_NUM_41;
+    config.pin_d1 = GPIO_NUM_40;
+    config.pin_d0 = GPIO_NUM_39;
+    config.pin_vsync = GPIO_NUM_46;
+    config.pin_href = GPIO_NUM_38;
+    config.pin_pclk = GPIO_NUM_45;
+    config.sccb_i2c_port = I2C_NUM_1;
+    config.xclk_freq_hz = 20000000;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+    const esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "camera init failed: %s", esp_err_to_name(err));
+        g_camera_available = false;
+        publish_status();
+        return false;
+    }
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor) {
+        sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+        sensor->set_hmirror(sensor, 0);
+        sensor->set_vflip(sensor, 0);
+    }
+    g_camera_available = true;
+    ESP_LOGI(kTag, "camera ready");
+    publish_status();
+    return true;
+}
+
+bool capture_and_send_photo(const char* request_id, const char* prompt)
+{
+    char photo_url[256] = {};
+    build_bridge_photo_url(photo_url, sizeof(photo_url));
+    if (photo_url[0] == '\0') {
+        publish_error(request_id, "system", "bridge photo url missing");
+        return false;
+    }
+    if (!init_camera()) {
+        publish_error(request_id, "system", "camera unavailable");
+        return false;
+    }
+    if (!wait_for_wifi(pdMS_TO_TICKS(5000))) {
+        publish_error(request_id, "system", "wifi not connected");
+        return false;
+    }
+
+    draw_wrapped_message("KAMERA", "FOTO...", rgb565(0, 220, 230));
+    camera_fb_t* fb = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        fb = esp_camera_fb_get();
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+    if (!fb || !fb->buf || fb->len == 0) {
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        publish_error(request_id, "system", "camera capture failed");
+        draw_face("error", 55);
+        return false;
+    }
+
+    auto response = std::make_unique<HttpResponseBuffer>();
+    esp_http_client_config_t config = {};
+    config.url = photo_url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 90000;
+    config.disable_auto_redirect = true;
+    config.event_handler = http_event_handler;
+    config.user_data = response.get();
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        esp_camera_fb_return(fb);
+        publish_error(request_id, "system", "photo http init failed");
+        return false;
+    }
+
+    char value[32] = {};
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Content-Type", "application/octet-stream"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Pair-Id", CONFIG_STACKCHAN_PAIR_ID));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-StackChan-Id", CONFIG_STACKCHAN_STACKCHAN_ID));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Request-Id", request_id && *request_id ? request_id : ""));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Photo-Prompt", prompt && *prompt ? prompt : "Was siehst du auf diesem Bild?"));
+    std::snprintf(value, sizeof(value), "%d", fb->width);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Image-Width", value));
+    std::snprintf(value, sizeof(value), "%d", fb->height);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Image-Height", value));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Image-Format", fb->format == PIXFORMAT_JPEG ? "jpeg" : "rgb565"));
+
+    ESP_LOGI(kTag, "photo upload start: %dx%d len=%u fmt=%d -> %s request_id=%s",
+             fb->width,
+             fb->height,
+             static_cast<unsigned>(fb->len),
+             fb->format,
+             photo_url,
+             request_id && *request_id ? request_id : "");
+    publish_event("photo_upload_started", "camera", request_id, "posting photo to bridge");
+    esp_err_t err = esp_http_client_set_post_field(client,
+                                                   reinterpret_cast<const char*>(fb->buf),
+                                                   static_cast<int>(fb->len));
+    const int64_t started_us = esp_timer_get_time();
+    if (err == ESP_OK) {
+        err = esp_http_client_perform(client);
+    }
+    const int elapsed_ms = static_cast<int>((esp_timer_get_time() - started_us) / 1000);
+    const int status = esp_http_client_get_status_code(client);
+    esp_camera_fb_return(fb);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(kTag, "photo upload failed: err=%s status=%d elapsed=%dms response=%s",
+                 esp_err_to_name(err),
+                 status,
+                 elapsed_ms,
+                 response->data);
+        publish_event("photo_upload_failed", "camera", request_id, "bridge photo upload failed");
+        draw_face("error", 55);
+        return false;
+    }
+    ESP_LOGI(kTag, "photo upload done: status=%d elapsed=%dms response=%s", status, elapsed_ms, response->data);
+    publish_event("photo_upload_done", "camera", request_id, "bridge accepted photo");
+    return true;
+}
+
+void photo_capture_task(void* arg)
+{
+    auto* args = static_cast<PhotoTaskArgs*>(arg);
+    char request_id[64] = {};
+    char prompt[192] = {};
+    if (args) {
+        copy_cstr(request_id, sizeof(request_id), args->request_id);
+        copy_cstr(prompt, sizeof(prompt), args->prompt);
+        std::free(args);
+    }
+    capture_and_send_photo(request_id, prompt);
+    publish_status();
+    vTaskDelete(nullptr);
+}
+
+void camera_init_task(void*)
+{
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    init_camera();
+    publish_status();
+    vTaskDelete(nullptr);
 }
 
 void write_aligned_pcm16(WavPlaybackState& state, const uint8_t* data, int len)
@@ -3612,6 +4184,167 @@ esp_err_t wav_playback_http_event_handler(esp_http_client_event_t* evt)
     return ESP_OK;
 }
 
+esp_err_t image_http_event_handler(esp_http_client_event_t* evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->user_data || !evt->data || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    auto* state = static_cast<ImageDownloadState*>(evt->user_data);
+    const int space = state->capacity - state->len;
+    if (space <= 0) {
+        state->overflow = true;
+        return ESP_OK;
+    }
+    const int copy = std::min(space, evt->data_len);
+    if (copy < evt->data_len) {
+        state->overflow = true;
+    }
+    std::memcpy(state->data + state->len, evt->data, copy);
+    state->len += copy;
+    return ESP_OK;
+}
+
+bool download_binary_image(const char* url, uint8_t* target, int capacity, int* downloaded_len)
+{
+    if (downloaded_len) {
+        *downloaded_len = 0;
+    }
+    if (!url || !*url || !target || capacity <= 0) {
+        return false;
+    }
+    if (!wait_for_wifi(pdMS_TO_TICKS(5000))) {
+        ESP_LOGW(kTag, "image download skipped: wifi not connected");
+        return false;
+    }
+    ImageDownloadState state = {};
+    state.data = target;
+    state.capacity = capacity;
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = 20000;
+    config.disable_auto_redirect = true;
+    config.event_handler = image_http_event_handler;
+    config.user_data = &state;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return false;
+    }
+    ESP_LOGI(kTag, "image download start: %s", url);
+    const esp_err_t err = esp_http_client_perform(client);
+    const int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    ESP_LOGI(kTag,
+             "image download done: status=%d err=%s bytes=%d/%d overflow=%s",
+             status,
+             esp_err_to_name(err),
+             state.len,
+             capacity,
+             state.overflow ? "true" : "false");
+    if (downloaded_len) {
+        *downloaded_len = state.len;
+    }
+    return err == ESP_OK && status >= 200 && status < 300 && !state.overflow && state.len > 0;
+}
+
+void draw_image_from_url(const char* url, int width, int height, const char* caption, int duration_ms)
+{
+    wake_display_if_needed();
+    copy_ui_mode("image");
+    publish_status();
+
+    width = clamp_int(width, 1, kWidth);
+    height = clamp_int(height, 1, kHeight);
+    uint8_t* jpg = static_cast<uint8_t*>(heap_caps_malloc(kMaxDisplayJpegBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!jpg) {
+        jpg = static_cast<uint8_t*>(heap_caps_malloc(kMaxDisplayJpegBytes, MALLOC_CAP_8BIT));
+    }
+    if (!jpg) {
+        ESP_LOGW(kTag, "image display failed: no memory for jpeg buffer");
+        draw_wrapped_message("BILD", "SPEICHER FEHLT", rgb565(255, 50, 50));
+        vTaskDelay(pdMS_TO_TICKS(1800));
+        copy_ui_mode("face");
+        return;
+    }
+
+    int jpg_len = 0;
+    const bool ok = download_binary_image(url, jpg, kMaxDisplayJpegBytes, &jpg_len);
+    if (ok) {
+        esp_jpeg_image_cfg_t jpeg_cfg = {};
+        jpeg_cfg.indata = jpg;
+        jpeg_cfg.indata_size = static_cast<uint32_t>(jpg_len);
+        jpeg_cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
+        jpeg_cfg.out_scale = JPEG_IMAGE_SCALE_0;
+        jpeg_cfg.flags.swap_color_bytes = 1;
+
+        esp_jpeg_image_output_t info = {};
+        esp_err_t jpeg_err = esp_jpeg_get_image_info(&jpeg_cfg, &info);
+        if (jpeg_err != ESP_OK || info.output_len == 0 || info.width == 0 || info.height == 0) {
+            ESP_LOGW(kTag, "image jpeg info failed: %s", esp_err_to_name(jpeg_err));
+            draw_wrapped_message("BILD", "DECODE FEHLER", rgb565(255, 50, 50));
+            heap_caps_free(jpg);
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            copy_ui_mode("face");
+            return;
+        }
+
+        uint8_t* pixels = static_cast<uint8_t*>(heap_caps_malloc(info.output_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!pixels) {
+            pixels = static_cast<uint8_t*>(heap_caps_malloc(info.output_len, MALLOC_CAP_8BIT));
+        }
+        if (!pixels) {
+            ESP_LOGW(kTag, "image display failed: no decode buffer %u", static_cast<unsigned>(info.output_len));
+            draw_wrapped_message("BILD", "SPEICHER FEHLT", rgb565(255, 50, 50));
+            heap_caps_free(jpg);
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            copy_ui_mode("face");
+            return;
+        }
+
+        jpeg_cfg.outbuf = pixels;
+        jpeg_cfg.outbuf_size = static_cast<uint32_t>(info.output_len);
+        jpeg_cfg.priv.read = 0;
+        esp_jpeg_image_output_t decoded = {};
+        jpeg_err = esp_jpeg_decode(&jpeg_cfg, &decoded);
+        heap_caps_free(jpg);
+        if (jpeg_err != ESP_OK) {
+            ESP_LOGW(kTag, "image jpeg decode failed: %s", esp_err_to_name(jpeg_err));
+            draw_wrapped_message("BILD", "DECODE FEHLER", rgb565(255, 50, 50));
+            heap_caps_free(pixels);
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            copy_ui_mode("face");
+            return;
+        }
+
+        const int draw_w = std::min<int>(decoded.width, width);
+        const int draw_h = std::min<int>(decoded.height, height);
+        const int x = (kWidth - draw_w) / 2;
+        const int y = (kHeight - draw_h) / 2;
+        if (g_display_mutex) {
+            xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(250));
+        }
+        if (draw_w < kWidth || draw_h < kHeight) {
+            clear(kBlack);
+        }
+        draw_bitmap_dma(x, y, draw_w, draw_h, reinterpret_cast<const uint16_t*>(pixels));
+        if (g_display_mutex) {
+            xSemaphoreGive(g_display_mutex);
+        }
+        if (caption && *caption) {
+            ESP_LOGI(kTag, "image caption: %s", caption);
+        }
+        ESP_LOGI(kTag, "image jpeg shown: %ux%u bytes=%d", decoded.width, decoded.height, jpg_len);
+        heap_caps_free(pixels);
+        vTaskDelay(pdMS_TO_TICKS(clamp_int(duration_ms, 500, 20000)));
+    } else {
+        draw_wrapped_message("BILD", "DOWNLOAD FEHLER", rgb565(255, 50, 50));
+        vTaskDelay(pdMS_TO_TICKS(1800));
+        heap_caps_free(jpg);
+    }
+    copy_ui_mode("face");
+}
+
 bool play_wav_url(const char* url)
 {
     if (!url || !*url || !g_audio_output_ready || !g_audio_output) {
@@ -3647,9 +4380,21 @@ bool play_wav_url(const char* url)
     return err == ESP_OK && status >= 200 && status < 300;
 }
 
+void play_wav_url_task(void* arg)
+{
+    char* url = static_cast<char*>(arg);
+    play_wav_url(url);
+    std::free(url);
+    vTaskDelete(nullptr);
+}
+
 void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, int data_len)
 {
     if (topic_matches(topic, topic_len, g_topic_display)) {
+        if (data_len > kMaxTextPayloadBytes) {
+            publish_error("", "display", "display payload too large");
+            return;
+        }
         handle_display_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_system)) {
         handle_system_command(data, data_len);
@@ -3668,6 +4413,10 @@ void dispatch_mqtt_payload(const char* topic, int topic_len, const char* data, i
     } else if (topic_matches(topic, topic_len, g_topic_device)) {
         handle_device_command(data, data_len);
     } else if (topic_matches(topic, topic_len, g_topic_say)) {
+        if (data_len > kMaxTextPayloadBytes) {
+            publish_error("", "say", "say payload too large");
+            return;
+        }
         handle_say_command(data, data_len);
     }
 }
@@ -3735,7 +4484,7 @@ void sound_task(void*)
 
 void ui_task(void*)
 {
-    UiCommand command = {};
+    static UiCommand command = {};
     while (true) {
         if (xQueueReceive(g_ui_queue, &command, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -3743,6 +4492,14 @@ void ui_task(void*)
 
         if (command.type == UiCommandType::Display) {
             draw_word_sequence("HERMES", command.text, command.duration_ms, command.accent);
+            publish_status();
+            draw_face(g_face_emotion, g_face_intensity_pct);
+        } else if (command.type == UiCommandType::Image) {
+            draw_image_from_url(command.url,
+                                command.image_width > 0 ? command.image_width : kWidth,
+                                command.image_height > 0 ? command.image_height : kHeight,
+                                command.emotion,
+                                command.duration_ms);
             publish_status();
             draw_face(g_face_emotion, g_face_intensity_pct);
         } else if (command.type == UiCommandType::Face) {
@@ -3930,8 +4687,10 @@ void audio_state_task(void*)
             }
             set_recording_state(false, g_recording_source, "", "voice silence");
             if (wav && actual_pcm_bytes > kAudioSampleRate / 2) {
-                draw_wrapped_message("SPRACHE", "SENDE ZUR BRIDGE", rgb565(0, 220, 230));
+                g_face_extra_mode = FaceExtraMode::ThoughtBubbles;
+                draw_face(g_face_emotion, g_face_intensity_pct);
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                g_face_extra_mode = FaceExtraMode::None;
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
                 start_followup_recording_if_pending();
@@ -3957,8 +4716,10 @@ void audio_state_task(void*)
             }
             set_recording_state(false, g_recording_source, "", "max duration");
             if (speech_seen && wav && actual_pcm_bytes > kAudioSampleRate / 2) {
-                draw_wrapped_message("SPRACHE", "SENDE ZUR BRIDGE", rgb565(0, 220, 230));
+                g_face_extra_mode = FaceExtraMode::ThoughtBubbles;
+                draw_face(g_face_emotion, g_face_intensity_pct);
                 post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                g_face_extra_mode = FaceExtraMode::None;
                 draw_face(g_face_emotion, g_face_intensity_pct);
                 publish_status();
                 start_followup_recording_if_pending();
@@ -4170,6 +4931,9 @@ void touch_event_task(void*)
         if (stable_count >= 2 && pressed != stable_pressed) {
             stable_pressed = pressed;
             g_touch_pressed = pressed;
+            if (pressed) {
+                wake_display_if_needed();
+            }
             publish_touch_event(pressed ? "touch_down" : "touch_up",
                                 pressed ? source : active_source,
                                 raw,
@@ -4523,6 +5287,7 @@ bool init_mqtt()
 
     esp_mqtt_client_config_t config = {};
     config.broker.address.uri = CONFIG_STACKCHAN_MQTT_URI;
+    config.task.stack_size = kMqttTaskStackBytes;
     g_mqtt_client = esp_mqtt_client_init(&config);
     ESP_ERROR_CHECK(esp_mqtt_client_register_event(g_mqtt_client, MQTT_EVENT_ANY,
                                                    mqtt_event_handler, nullptr));
@@ -4572,7 +5337,7 @@ void init_nvs()
 
 extern "C" void app_main()
 {
-    ESP_LOGI(kTag, "starting MQTT hardware firmware");
+    ESP_LOGI(kTag, "starting MQTT hardware firmware reset_reason=%d", static_cast<int>(esp_reset_reason()));
     build_topics();
     init_nvs();
     load_device_settings();
@@ -4590,12 +5355,13 @@ extern "C" void app_main()
         xTaskCreate(sound_task, "sound", 4096, nullptr, 3, nullptr);
     }
     if (g_ui_queue) {
-        xTaskCreate(ui_task, "ui", 6144, nullptr, 3, nullptr);
+        xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
+    xTaskCreate(camera_init_task, "camera_init", 12288, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;

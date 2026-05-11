@@ -13,7 +13,7 @@ This is the first Hermes2StackChan V1.0 hardware slice: the bridge sends MQTT co
 - Audio command: `hermes-stackchan/desk/cmd/audio`
 - LED command: `hermes-stackchan/desk/cmd/led`
 - Device command: `hermes-stackchan/desk/cmd/device`
-- Say command: `hermes-stackchan/desk/cmd/say`
+- Legacy say command: `hermes-stackchan/desk/cmd/say` exists in older firmware, but the bridge maps `say` to `display` and does not send beeps for normal Hermes replies.
 - Status: `hermes-stackchan/desk/status`
 - ACK: `hermes-stackchan/desk/ack`
 - Error: `hermes-stackchan/desk/error`
@@ -204,7 +204,7 @@ scripts/h2s_bridge.sh ask-hermes \
   --show-response
 ```
 
-Hermes is instructed to return JSON only. If it still returns plain text, the bridge falls back to a `say` action so StackChan can show the answer instead of doing nothing.
+Hermes is instructed to return JSON only and put the spoken answer in the top-level `reply` field. For external Hermes-triggered messages the bridge shows `reply` with `display` and then sends TTS, so Hermes should not use `say` for normal answers.
 
 ## Firmware Setup
 
