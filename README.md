@@ -40,6 +40,8 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Edge/Katja German TTS generation.
 - TTS WAV returned to StackChan and played through the speaker.
 - Follow-up listening mode: when Hermes asks a real question, StackChan speaks first and then starts recording again.
+- Bridge image display endpoint: Hermes can send an image URL/base64/data URL and the bridge converts it for the StackChan display.
+- Bridge camera upload endpoint: StackChan photos can be posted to Hermes vision and answered through display/TTS/audio.
 - Debug cockpit script for bridge log plus serial monitor.
 - Raspberry Pi service installer for the unified bridge.
 
@@ -47,8 +49,7 @@ Still intentionally not part of v1.0:
 
 - Radio playback. It was tested in the prototype and interfered with the wakeword/audio loop.
 - Multi-StackChan group control.
-- Camera capture and image-to-Hermes flow.
-- Displaying images from Hermes.
+- Physical camera capture in firmware. The bridge endpoint exists; firmware still reports `camera_available:false` until the camera driver is wired.
 - Custom trained wakewords.
 - Production-grade CI for firmware builds.
 
@@ -217,6 +218,8 @@ H2S_STT_MODEL=whisper-large-v3-turbo
 H2S_STT_LANGUAGE=de
 H2S_STT_TIMEOUT_S=30
 H2S_WAV_ARCHIVE_DIR=/home/wollux/.hermes/stackchan_wavs
+H2S_IMAGE_DIR=/home/wollux/.hermes/stackchan_images
+H2S_MAX_IMAGE_BYTES=8388608
 
 H2S_TTS_ENGINE=edge
 H2S_EDGE_TTS_VOICE=de-DE-KatjaNeural

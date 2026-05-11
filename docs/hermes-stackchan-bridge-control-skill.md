@@ -54,6 +54,8 @@ Use this skill for:
 - "Sag X auf StackChan"
 - "Schick mir ueber StackChan ..."
 - "Lies mir ueber StackChan ..."
+- "Zeig dieses Bild auf StackChan ..."
+- "Mach ein Foto mit StackChan ..." when camera firmware is available
 - "Benachrichtige mich auf StackChan ..."
 - StackChan reminders, direct notifications, status checks, TTS tests, wake/audio
   debugging, MQTT hardware control, face/motion/display/audio/LED/device checks.
@@ -93,6 +95,48 @@ Expected success:
 - Bridge log contains `GET /stackchan/tts/...wav` from StackChan
 
 This is the tested working path for Telegram-to-StackChan voice.
+
+## Image Display Endpoint
+
+For images coming from Hermes, Telegram, or another channel, do not publish binary
+data over MQTT. Call the bridge and let it convert the image for StackChan:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8788/stackchan/display-image \
+  -H 'Content-Type: application/json' \
+  -d '{"image_url":"https://example.com/picture.jpg","caption":"Bild","duration_ms":9000}'
+```
+
+Accepted JSON fields:
+
+- `image_url` or `url`
+- `data_url`
+- `image_base64` plus optional `content_type`
+- `caption`
+- `duration_ms`
+
+Expected success:
+
+- HTTP JSON contains `"ok": true`
+- JSON contains `image.url` under `/stackchan/images/...rgb565`
+- Bridge log contains `POST /stackchan/display-image`
+- Bridge publishes `cmd/display` with `mode:"image"`
+- StackChan fetches `/stackchan/images/...rgb565` and shows the image.
+
+## Camera Photo Endpoint
+
+The bridge side is ready for camera uploads:
+
+```bash
+curl -fsS -X POST 'http://127.0.0.1:8788/stackchan/photo?prompt=Was%20siehst%20du%3F' \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @photo.jpg
+```
+
+The bridge sends the image to Hermes vision/chat, creates TTS for the reply, and
+publishes display/audio actions back to StackChan. Current firmware may still
+report `camera_available:false`; in that case `system take_photo` is rejected by
+the firmware until the actual camera driver is wired.
 
 ## Why Text-Only Happens
 
@@ -182,6 +226,7 @@ HTTP.
 Use these through Hermes JSON actions or through bridge helper commands:
 
 - `display`: show short text or UI state
+- `display_image`: show an image via bridge-converted RGB565 URL
 - `face`: set emotion/face, for example `neutral`, `happy`, `sad`, `question`,
   `speaking`, `sleep`, `battery`, `charging`, `blink`, `wink_left`,
   `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`,
@@ -193,6 +238,7 @@ Use these through Hermes JSON actions or through bridge helper commands:
   supported
 - `audio`: play a TTS URL
 - `system`: restart/reset/sleep style commands when implemented
+- `system take_photo`: request a StackChan photo when camera firmware is available
 - `reminder` or `notify`: schedule bridge reminders if the user asks for them
 
 The bridge and firmware are authoritative. They validate actions, clamp servo
@@ -310,4 +356,3 @@ run correctly. Do not confuse that warning with StackChan notify audio failure.
   fetched the TTS WAV.
 - Prefer short spoken messages; long text can stress the display/audio path.
 - Keep StackChan hardware safe: bridge/firmware limits win over Hermes wishes.
-

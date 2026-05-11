@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
+import hashlib
 import http.server
+import io
 import json
 import math
+import mimetypes
 import os
 import random
 import signal
@@ -14,6 +18,7 @@ import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -146,6 +151,8 @@ class SpeechConfig:
     max_audio_bytes: int = 2 * 1024 * 1024
     archive_dir: str | None = None
     tts_dir: str | None = None
+    image_dir: str | None = None
+    max_image_bytes: int = 8 * 1024 * 1024
     tts_engine: str = "edge"
     edge_tts_python: str = ""
     edge_tts_voice: str = "de-DE-KatjaNeural"
@@ -239,6 +246,12 @@ def load_config(
         ),
         archive_dir=optional_string(env.get("H2S_WAV_ARCHIVE_DIR") or speech_raw.get("archive_dir")),
         tts_dir=optional_string(env.get("H2S_TTS_DIR") or speech_raw.get("tts_dir")),
+        image_dir=optional_string(env.get("H2S_IMAGE_DIR") or speech_raw.get("image_dir")),
+        max_image_bytes=parse_int(
+            env.get("H2S_MAX_IMAGE_BYTES"),
+            int(speech_raw.get("max_image_bytes", 8 * 1024 * 1024)),
+            "H2S_MAX_IMAGE_BYTES",
+        ),
         tts_engine=env.get("H2S_TTS_ENGINE") or str(speech_raw.get("tts_engine") or "edge"),
         edge_tts_python=env.get("H2S_EDGE_TTS_PYTHON") or str(speech_raw.get("edge_tts_python") or ""),
         edge_tts_voice=env.get("H2S_EDGE_TTS_VOICE") or str(speech_raw.get("edge_tts_voice") or "de-DE-KatjaNeural"),
@@ -925,13 +938,12 @@ def extract_hermes_message_content(response: dict[str, Any]) -> str:
     raise ConfigError("Hermes response has no message content")
 
 
-def build_hermes_messages(
+def build_hermes_system_content(
     pair: PairConfig,
     capabilities: str,
     personality: str,
     status: dict[str, Any] | None,
-    user_text: str,
-) -> list[dict[str, str]]:
+) -> str:
     status_text = json.dumps(status or {}, ensure_ascii=False, sort_keys=True)
     system_parts = [
         f"You are {pair.hermes_id}. You control exactly one StackChan: {pair.stackchan_id}.",
@@ -954,9 +966,46 @@ def build_hermes_messages(
         system_parts.append(f"Bridge capabilities:\n{capabilities}")
     if personality:
         system_parts.append(f"Personality notes:\n{personality}")
+    return "\n\n".join(system_parts)
+
+
+def build_hermes_messages(
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+) -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": "\n\n".join(system_parts)},
+        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status)},
         {"role": "user", "content": user_text},
+    ]
+
+
+def image_data_url(image_bytes: bytes, content_type: str) -> str:
+    content_type = content_type if content_type.startswith("image/") else "image/jpeg"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
+def build_hermes_vision_messages(
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+    image_bytes: bytes,
+    content_type: str,
+) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status)},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_data_url(image_bytes, content_type)}},
+            ],
+        },
     ]
 
 
@@ -972,6 +1021,38 @@ def ask_hermes_http(
         "model": config.hermes.model,
         "messages": build_hermes_messages(pair, capabilities, personality, status, user_text),
         "temperature": 0.3,
+    }
+    response = http_post_json(
+        hermes_chat_url(config.hermes.base_url),
+        config.hermes.api_key,
+        payload,
+        config.hermes.timeout_s,
+    )
+    return parse_hermes_action_response(extract_hermes_message_content(response))
+
+
+def ask_hermes_vision_http(
+    config: BridgeConfig,
+    pair: PairConfig,
+    capabilities: str,
+    personality: str,
+    status: dict[str, Any] | None,
+    user_text: str,
+    image_bytes: bytes,
+    content_type: str,
+) -> dict[str, Any]:
+    payload = {
+        "model": config.hermes.model,
+        "messages": build_hermes_vision_messages(
+            pair,
+            capabilities,
+            personality,
+            status,
+            user_text,
+            image_bytes,
+            content_type,
+        ),
+        "temperature": 0.2,
     }
     response = http_post_json(
         hermes_chat_url(config.hermes.base_url),
@@ -1038,6 +1119,23 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         text = safe_stackchan_text(text, MAX_STACKCHAN_DISPLAY_CHARS)
         payload = build_display_payload(text, parse_int_value(action.get("duration_ms"), 5000, "display.duration_ms"), action_request_id)
         return pair.display_topic, payload
+
+    if name in {"display_image", "image"}:
+        url = optional_string(action.get("url") or action.get("image_url"))
+        if not url:
+            raise ConfigError("display_image action needs url")
+        payload: dict[str, Any] = {
+            "mode": "image",
+            "url": url,
+            "width": clamp_int(parse_int_value(action.get("width"), 320, "display_image.width"), 1, 320),
+            "height": clamp_int(parse_int_value(action.get("height"), 240, "display_image.height"), 1, 240),
+            "format": optional_string(action.get("format")) or "rgb565le",
+            "duration_ms": parse_int_value(action.get("duration_ms"), 9000, "display_image.duration_ms"),
+        }
+        caption = optional_string(action.get("caption"))
+        if caption:
+            payload["caption"] = safe_stackchan_text(caption, 80)
+        return pair.display_topic, with_request_id(payload, action_request_id)
 
     if name == "say":
         text = optional_string(action.get("text"))
@@ -1150,13 +1248,13 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["enabled"] = parse_bool_value(action.get("enabled"), True)
         return pair.audio_topic, with_request_id(payload, action_request_id)
 
-    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake"}:
+    if name in {"system", "ping", "status", "reboot", "display_sleep", "display_wake", "take_photo", "photo", "camera"}:
         system_action = optional_string(action.get("system_action") or action.get("command"))
         if name != "system":
-            system_action = name
+            system_action = "take_photo" if name in {"photo", "camera"} else name
         if not system_action:
             raise ConfigError("system action needs system_action or command")
-        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake"}:
+        if system_action not in {"ping", "status", "reboot", "display_sleep", "display_wake", "take_photo"}:
             raise ConfigError(f"unsupported system action: {system_action}")
         return pair.system_topic, with_request_id({"action": system_action}, action_request_id)
 
@@ -3164,6 +3262,130 @@ def make_tts_wav(text: str, speech: SpeechConfig, request_id: str) -> str:
     return f"/stackchan/tts/{out_path.name}"
 
 
+def image_dir_for(speech: SpeechConfig) -> Path:
+    path = Path(speech.image_dir or Path.home() / ".hermes" / "stackchan_images").expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_asset_id(request_id: str) -> str:
+    return "".join(char for char in request_id if char.isalnum() or char in {"-", "_"})[:48] or uuid.uuid4().hex[:16]
+
+
+def bridge_public_url_for_request(config: BridgeConfig, handler: http.server.BaseHTTPRequestHandler | None = None) -> str:
+    if config.speech.bridge_public_url:
+        return config.speech.bridge_public_url.rstrip("/")
+    if handler is not None:
+        host = handler.headers.get("Host") or f"{handler.server.server_address[0]}:{handler.server.server_address[1]}"
+        return f"http://{host}"
+    raise ConfigError("H2S_BRIDGE_PUBLIC_URL or request Host is required")
+
+
+def content_type_from_filename(path: str, fallback: str = "image/jpeg") -> str:
+    guessed = mimetypes.guess_type(path)[0]
+    return guessed if guessed and guessed.startswith("image/") else fallback
+
+
+def parse_data_url(data_url: str) -> tuple[bytes, str]:
+    header, separator, payload = data_url.partition(",")
+    if not separator or not header.startswith("data:"):
+        raise ConfigError("invalid image data_url")
+    content_type = header[5:].split(";", 1)[0] or "image/jpeg"
+    if ";base64" not in header:
+        raise ConfigError("image data_url must be base64 encoded")
+    return base64.b64decode(payload, validate=True), content_type
+
+
+def download_image_bytes(url: str, max_bytes: int, timeout_s: float = 12.0) -> tuple[bytes, str]:
+    request = urllib.request.Request(url, headers={"User-Agent": "hermes2stackchan-bridge/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        content_type = response.headers.get_content_type() or content_type_from_filename(url)
+        data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ConfigError(f"image too large; max {max_bytes} bytes")
+    if not content_type.startswith("image/"):
+        content_type = content_type_from_filename(url)
+    return data, content_type
+
+
+def image_bytes_from_payload(payload: dict[str, Any], speech: SpeechConfig) -> tuple[bytes, str, str]:
+    data_url = optional_string(payload.get("data_url") or payload.get("image_data_url"))
+    if data_url:
+        data, content_type = parse_data_url(data_url)
+        source = "data_url"
+    elif optional_string(payload.get("image_base64") or payload.get("base64")):
+        encoded = optional_string(payload.get("image_base64") or payload.get("base64")) or ""
+        data = base64.b64decode(encoded, validate=True)
+        content_type = optional_string(payload.get("content_type") or payload.get("mime_type")) or "image/jpeg"
+        source = "base64"
+    else:
+        url = optional_string(payload.get("image_url") or payload.get("url"))
+        if not url:
+            raise ConfigError("image payload needs image_url, url, data_url, or image_base64")
+        data, content_type = download_image_bytes(url, speech.max_image_bytes, speech.timeout_s)
+        source = url
+    if len(data) > speech.max_image_bytes:
+        raise ConfigError(f"image too large; max {speech.max_image_bytes} bytes")
+    if not content_type.startswith("image/"):
+        content_type = "image/jpeg"
+    return data, content_type, source
+
+
+def convert_image_to_rgb565le(image_bytes: bytes) -> bytes:
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise ConfigError("Pillow is required for image display. Install with: pip install -e .") from exc
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((320, 240), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (320, 240), (0, 0, 0))
+        x = (320 - image.width) // 2
+        y = (240 - image.height) // 2
+        if image.mode in {"RGBA", "LA"} or ("transparency" in image.info):
+            canvas.paste(image.convert("RGBA"), (x, y), image.convert("RGBA"))
+        else:
+            canvas.paste(image.convert("RGB"), (x, y))
+        pixels = canvas.tobytes()
+
+    out = bytearray(320 * 240 * 2)
+    j = 0
+    for i in range(0, len(pixels), 3):
+        r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out[j] = value & 0xFF
+        out[j + 1] = (value >> 8) & 0xFF
+        j += 2
+    return bytes(out)
+
+
+def prepare_stackchan_image(
+    config: BridgeConfig,
+    handler: http.server.BaseHTTPRequestHandler | None,
+    image_bytes: bytes,
+    request_id: str,
+) -> dict[str, Any]:
+    image_id = f"{safe_asset_id(request_id)}-{hashlib.sha256(image_bytes).hexdigest()[:10]}"
+    image_dir = image_dir_for(config.speech)
+    raw_path = image_dir / f"{image_id}.source"
+    rgb_path = image_dir / f"{image_id}.rgb565"
+    raw_path.write_bytes(image_bytes)
+    rgb_bytes = convert_image_to_rgb565le(image_bytes)
+    rgb_path.write_bytes(rgb_bytes)
+    return {
+        "id": image_id,
+        "path": str(rgb_path),
+        "url_path": f"/stackchan/images/{rgb_path.name}",
+        "url": f"{bridge_public_url_for_request(config, handler)}/stackchan/images/{rgb_path.name}",
+        "width": 320,
+        "height": 240,
+        "format": "rgb565le",
+        "sha256": hashlib.sha256(rgb_bytes).hexdigest(),
+        "bytes": len(rgb_bytes),
+    }
+
+
 class SpeechHttpServer(http.server.ThreadingHTTPServer):
     config: BridgeConfig
     config_path: Path
@@ -3215,6 +3437,165 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         except ConfigError:
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             return f"http://{host}{tts_path}"
+
+    def publish_image_to_stackchan(
+        self,
+        image_info: dict[str, Any],
+        request_id: str,
+        caption: str = "",
+        duration_ms: int = 9000,
+    ) -> None:
+        action = {
+            "action": "display_image",
+            "url": image_info["url"],
+            "width": image_info["width"],
+            "height": image_info["height"],
+            "format": image_info["format"],
+            "duration_ms": duration_ms,
+        }
+        if caption:
+            action["caption"] = caption
+        publish_action_messages(
+            self.server.mqtt_client,
+            [action_to_topic_payload(self.server.pair, action, request_id)],
+            self.server.pair,
+        )
+
+    def handle_display_image_post(self, request_id: str) -> None:
+        payload = self.read_json_body(request_id, self.server.config.speech.max_image_bytes + 65536)
+        if payload is None:
+            return
+        started = time.monotonic()
+        request_id = optional_string(payload.get("request_id")) or request_id
+        pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+
+        try:
+            image_bytes, content_type, source = image_bytes_from_payload(payload, self.server.config.speech)
+            image_info = prepare_stackchan_image(self.server.config, self, image_bytes, request_id)
+            caption = safe_stackchan_text(optional_string(payload.get("caption")) or "", 80)
+            duration_ms = parse_int_value(payload.get("duration_ms"), 9000, "display_image.duration_ms")
+            pause_life_animation(self.server.pair.pair_id, max(12.0, duration_ms / 1000.0 + 4.0), f"image display {request_id}")
+            self.publish_image_to_stackchan(image_info, f"image-{request_id}", caption, duration_ms)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] display-image request_id={request_id} source={source} "
+                f"type={content_type} bytes={len(image_bytes)} total={total_ms}ms",
+                flush=True,
+            )
+            self.send_json(200, {"ok": True, "request_id": request_id, "image": image_info, "total_ms": total_ms})
+        except Exception as exc:
+            print(f"[bridge-http] display-image error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
+    def handle_photo_post(self, request_id: str) -> None:
+        started = time.monotonic()
+        pair_id = (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.send_json(400, {"ok": False, "error": "invalid content length", "request_id": request_id})
+            return
+        if length <= 0:
+            self.send_json(400, {"ok": False, "error": "missing image body", "request_id": request_id})
+            return
+        if length > self.server.config.speech.max_image_bytes:
+            self.send_json(413, {"ok": False, "error": "image too large", "request_id": request_id})
+            return
+        image_bytes = self.rfile.read(length)
+        content_type = self.headers.get_content_type() or "image/jpeg"
+        if not content_type.startswith("image/"):
+            self.send_json(415, {"ok": False, "error": "expected image content type", "request_id": request_id})
+            return
+
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        prompt = (
+            self.headers.get("X-H2S-Photo-Prompt")
+            or (query.get("prompt", [""])[0] if query else "")
+            or "Beschreibe kurz auf Deutsch, was auf diesem StackChan-Kamerabild zu sehen ist. "
+               "Wenn es eine sinnvolle Aktion gibt, schlage sie knapp vor."
+        )
+        try:
+            pause_life_animation(self.server.pair.pair_id, 60.0, f"photo {request_id}")
+            image_info = prepare_stackchan_image(self.server.config, self, image_bytes, f"photo-{request_id}")
+            self.publish_image_to_stackchan(image_info, f"photo-preview-{request_id}", "KAMERA", 2500)
+            status_started = time.monotonic()
+            status = read_latest_status(self.server.config, self.server.pair, timeout_s=1.0)
+            status_ms = round((time.monotonic() - status_started) * 1000)
+            capabilities = read_optional_text(self.server.pair.capabilities_file, self.server.config_path)
+            personality = read_optional_text(self.server.pair.personality_file, self.server.config_path)
+            hermes_started = time.monotonic()
+            hermes_response = ask_hermes_vision_http(
+                self.server.config,
+                self.server.pair,
+                capabilities,
+                personality,
+                status,
+                prompt,
+                image_bytes,
+                content_type,
+            )
+            hermes_ms = round((time.monotonic() - hermes_started) * 1000)
+            display_text = speech_text_from_hermes_response(hermes_response, "Ich habe das Bild bekommen.")
+            actions = ensure_reply_action(hermes_response)
+            actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+                self.server.config,
+                self.server.pair,
+                actions,
+                f"photo-reminder-{request_id}",
+            )
+            action_messages, action_errors = actions_to_topic_payloads(
+                self.server.pair,
+                actions,
+                f"photo-{request_id}",
+                skip_actions={"say"},
+            )
+            action_errors.extend(reminder_errors)
+            tts_started = time.monotonic()
+            tts_path = make_tts_wav(display_text, self.server.config.speech, f"photo-{request_id}") if display_text else ""
+            tts_ms = round((time.monotonic() - tts_started) * 1000) if tts_path else 0
+            tts_url = self.public_tts_url(tts_path)
+            if tts_url:
+                action_messages.append(action_to_topic_payload(
+                    self.server.pair,
+                    {"action": "audio", "audio_action": "play_tts_url", "url": tts_url},
+                    f"photo-tts-{request_id}",
+                ))
+            publish_started = time.monotonic()
+            publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+            mqtt_ms = round((time.monotonic() - publish_started) * 1000)
+            for reminder in scheduled_reminders:
+                print(f"[bridge-http] scheduled reminder from photo {reminder['id']}: {reminder['text']}", flush=True)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] photo request_id={request_id} bytes={len(image_bytes)} "
+                f"status={status_ms}ms hermes={hermes_ms}ms tts={tts_ms}ms mqtt={mqtt_ms}ms total={total_ms}ms",
+                flush=True,
+            )
+            if action_errors:
+                print(f"[bridge-http] photo ignored invalid actions request_id={request_id}: {action_errors}", flush=True)
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "request_id": request_id,
+                    "reply": display_text[:240],
+                    "image": image_info,
+                    "tts_url": tts_url,
+                    "hermes_ms": hermes_ms,
+                    "tts_ms": tts_ms,
+                    "total_ms": total_ms,
+                    "action_errors": action_errors,
+                },
+            )
+        except Exception as exc:
+            print(f"[bridge-http] photo error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
 
     def handle_notify_post(self, request_id: str) -> None:
         payload = self.read_json_body(request_id)
@@ -3301,6 +3682,23 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path.startswith("/stackchan/images/") and path.endswith(".rgb565"):
+            filename = Path(path).name
+            image_path = image_dir_for(self.server.config.speech) / filename
+            if not image_path.exists():
+                self.send_json(404, {"ok": False, "error": "image not found"})
+                return
+            body = image_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-H2S-Image-Width", "320")
+            self.send_header("X-H2S-Image-Height", "240")
+            self.send_header("X-H2S-Image-Format", "rgb565le")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
@@ -3312,6 +3710,22 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 or uuid.uuid4().hex
             ).strip()
             self.handle_notify_post(request_id)
+            return
+        if path in {"/stackchan/display-image", "/hermes/display-image"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_display_image_post(request_id)
+            return
+        if path in {"/stackchan/photo", "/hermes/photo"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_photo_post(request_id)
             return
         if path != "/stackchan/audio":
             self.send_json(404, {"ok": False, "error": "not found"})
@@ -3473,6 +3887,8 @@ def serve_audio(args: argparse.Namespace) -> int:
     print(f"[bridge-http] listening on http://{args.host}:{args.port}", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/audio (audio/wav)", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/notify (application/json)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/display-image (application/json)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/photo (image/*)", flush=True)
     print(f"[bridge-http] Hermes API: {hermes_chat_url(config.hermes.base_url)}", flush=True)
     print(f"[bridge-http] dispatch Hermes actions to {pair.mqtt_prefix}/cmd/*", flush=True)
     try:

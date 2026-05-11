@@ -226,8 +226,16 @@ struct WavPlaybackState {
     bool has_pending_byte = false;
 };
 
+struct ImageDownloadState {
+    uint8_t* data = nullptr;
+    int capacity = 0;
+    int len = 0;
+    bool overflow = false;
+};
+
 enum class UiCommandType : uint8_t {
     Display,
+    Image,
     Face,
     Say,
 };
@@ -235,9 +243,12 @@ enum class UiCommandType : uint8_t {
 struct UiCommand {
     UiCommandType type;
     char text[768];
+    char url[256];
     char emotion[24];
     int intensity_pct;
     int duration_ms;
+    int image_width;
+    int image_height;
     bool beep;
     uint16_t accent;
 };
@@ -3023,9 +3034,43 @@ void handle_display_command(const char* data, int len)
 
     const char* request_id = json_string(root, "request_id");
     const char* mode = json_string(root, "mode");
+    if (std::strcmp(mode, "image") == 0) {
+        const char* url = json_string(root, "url");
+        const char* format = json_string(root, "format", "rgb565le");
+        const int width = clamp_int(json_int(root, "width", kWidth), 1, kWidth);
+        const int height = clamp_int(json_int(root, "height", kHeight), 1, kHeight);
+        if (!url || !*url || std::strcmp(format, "rgb565le") != 0) {
+            publish_error(request_id, "display", "expected image url and format rgb565le");
+            cJSON_Delete(root);
+            return;
+        }
+
+        UiCommand command = {};
+        command.type = UiCommandType::Image;
+        command.duration_ms = clamp_int(json_int(root, "duration_ms", 9000), 500, 20000);
+        command.image_width = width;
+        command.image_height = height;
+        copy_cstr(command.url, sizeof(command.url), url);
+        copy_display_text(command.emotion, sizeof(command.emotion), json_string(root, "caption"));
+        ESP_LOGI(kTag, "image display command queued: %dx%d url=%s request_id=%s",
+                 width,
+                 height,
+                 command.url,
+                 request_id && *request_id ? request_id : "");
+        if (!enqueue_ui_command(command)) {
+            publish_error(request_id, "display", "ui queue full");
+            cJSON_Delete(root);
+            return;
+        }
+
+        publish_ack(request_id, "display", "image queued");
+        cJSON_Delete(root);
+        return;
+    }
+
     const char* text = json_string(root, "text");
     if (std::strcmp(mode, "text") != 0 || !text || !*text) {
-        publish_error(request_id, "display", "expected mode text and non-empty text");
+        publish_error(request_id, "display", "expected mode text/image and valid payload");
         cJSON_Delete(root);
         return;
     }
@@ -3498,6 +3543,9 @@ void handle_system_command(const char* data, int len)
         set_lcd_sleep(false);
         publish_ack(request_id, "system", "display awake");
         publish_status();
+    } else if (std::strcmp(action, "take_photo") == 0) {
+        publish_error(request_id, "system", "camera not available in this firmware build");
+        publish_status();
     } else {
         publish_error(request_id, "system", "unsupported action");
     }
@@ -3674,6 +3722,110 @@ esp_err_t wav_playback_http_event_handler(esp_http_client_event_t* evt)
     return ESP_OK;
 }
 
+esp_err_t image_http_event_handler(esp_http_client_event_t* evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA || !evt->user_data || !evt->data || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    auto* state = static_cast<ImageDownloadState*>(evt->user_data);
+    const int space = state->capacity - state->len;
+    if (space <= 0) {
+        state->overflow = true;
+        return ESP_OK;
+    }
+    const int copy = std::min(space, evt->data_len);
+    if (copy < evt->data_len) {
+        state->overflow = true;
+    }
+    std::memcpy(state->data + state->len, evt->data, copy);
+    state->len += copy;
+    return ESP_OK;
+}
+
+bool download_rgb565_image(const char* url, uint8_t* target, int expected_bytes)
+{
+    if (!url || !*url || !target || expected_bytes <= 0) {
+        return false;
+    }
+    if (!wait_for_wifi(pdMS_TO_TICKS(5000))) {
+        ESP_LOGW(kTag, "image download skipped: wifi not connected");
+        return false;
+    }
+    ImageDownloadState state = {};
+    state.data = target;
+    state.capacity = expected_bytes;
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = 20000;
+    config.disable_auto_redirect = true;
+    config.event_handler = image_http_event_handler;
+    config.user_data = &state;
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return false;
+    }
+    ESP_LOGI(kTag, "image download start: %s", url);
+    const esp_err_t err = esp_http_client_perform(client);
+    const int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    ESP_LOGI(kTag,
+             "image download done: status=%d err=%s bytes=%d/%d overflow=%s",
+             status,
+             esp_err_to_name(err),
+             state.len,
+             expected_bytes,
+             state.overflow ? "true" : "false");
+    return err == ESP_OK && status >= 200 && status < 300 && !state.overflow && state.len == expected_bytes;
+}
+
+void draw_image_from_url(const char* url, int width, int height, const char* caption, int duration_ms)
+{
+    wake_display_if_needed();
+    copy_ui_mode("image");
+    publish_status();
+
+    width = clamp_int(width, 1, kWidth);
+    height = clamp_int(height, 1, kHeight);
+    const int expected_bytes = width * height * static_cast<int>(sizeof(uint16_t));
+    uint8_t* image = static_cast<uint8_t*>(heap_caps_malloc(expected_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!image) {
+        image = static_cast<uint8_t*>(heap_caps_malloc(expected_bytes, MALLOC_CAP_8BIT));
+    }
+    if (!image) {
+        ESP_LOGW(kTag, "image display failed: no memory for %d bytes", expected_bytes);
+        draw_wrapped_message("BILD", "SPEICHER FEHLT", rgb565(255, 50, 50));
+        vTaskDelay(pdMS_TO_TICKS(1800));
+        copy_ui_mode("face");
+        return;
+    }
+
+    const bool ok = download_rgb565_image(url, image, expected_bytes);
+    if (ok) {
+        bool locked = false;
+        if (g_display_mutex) {
+            locked = xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(250)) == pdTRUE;
+        }
+        const int x = (kWidth - width) / 2;
+        const int y = (kHeight - height) / 2;
+        draw_bitmap_dma(x, y, width, height, reinterpret_cast<const uint16_t*>(image));
+        if (g_display_mutex && locked) {
+            xSemaphoreGive(g_display_mutex);
+        }
+        if (caption && *caption) {
+            ESP_LOGI(kTag, "image caption: %s", caption);
+        }
+        vTaskDelay(pdMS_TO_TICKS(clamp_int(duration_ms, 500, 20000)));
+    } else {
+        draw_wrapped_message("BILD", "DOWNLOAD FEHLER", rgb565(255, 50, 50));
+        vTaskDelay(pdMS_TO_TICKS(1800));
+    }
+
+    heap_caps_free(image);
+    copy_ui_mode("face");
+}
+
 bool play_wav_url(const char* url)
 {
     if (!url || !*url || !g_audio_output_ready || !g_audio_output) {
@@ -3821,6 +3973,14 @@ void ui_task(void*)
 
         if (command.type == UiCommandType::Display) {
             draw_word_sequence("HERMES", command.text, command.duration_ms, command.accent);
+            publish_status();
+            draw_face(g_face_emotion, g_face_intensity_pct);
+        } else if (command.type == UiCommandType::Image) {
+            draw_image_from_url(command.url,
+                                command.image_width > 0 ? command.image_width : kWidth,
+                                command.image_height > 0 ? command.image_height : kHeight,
+                                command.emotion,
+                                command.duration_ms);
             publish_status();
             draw_face(g_face_emotion, g_face_intensity_pct);
         } else if (command.type == UiCommandType::Face) {

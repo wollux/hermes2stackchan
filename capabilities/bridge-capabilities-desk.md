@@ -44,6 +44,37 @@ The notify endpoint creates TTS, publishes `cmd/display`, publishes `cmd/audio`,
 and returns a `tts_url`. Do not use legacy `say` for proactive speech; `say` is
 treated as display-only compatibility.
 
+### images and camera
+
+Hermes can show images on StackChan through the bridge endpoint. Send normal image
+URLs, data URLs, or base64 JSON to the bridge; the bridge converts the image to
+the firmware display format and publishes a safe `display_image` command.
+
+```http
+POST http://127.0.0.1:8788/stackchan/display-image
+Content-Type: application/json
+```
+
+```json
+{
+  "image_url": "https://example.com/image.jpg",
+  "caption": "Kamera",
+  "duration_ms": 9000
+}
+```
+
+StackChan camera uploads, once camera hardware is available in firmware, use:
+
+```http
+POST http://127.0.0.1:8788/stackchan/photo
+Content-Type: image/jpeg
+```
+
+The bridge sends the uploaded photo to Hermes vision/chat, then returns Hermes'
+answer through the same display/TTS/audio path as speech. The current firmware
+advertises `camera_available:false` and rejects `take_photo` until a camera
+driver is wired.
+
 ### display
 
 Publishes to `hermes-stackchan/desk/cmd/display`.
@@ -57,6 +88,21 @@ Payload:
   "text": "Hello from Hermes2StackChan",
   "duration_ms": 5000,
   "request_id": "test-001"
+}
+```
+
+Image display payload:
+
+```json
+{
+  "schema_version": "1.0",
+  "mode": "image",
+  "url": "http://127.0.0.1:8788/stackchan/images/example.rgb565",
+  "width": 320,
+  "height": 240,
+  "format": "rgb565le",
+  "duration_ms": 9000,
+  "request_id": "image-001"
 }
 ```
 

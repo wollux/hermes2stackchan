@@ -47,6 +47,8 @@ from bridge.hermes2stackchan_bridge import (
     parse_env_file,
     should_listen_for_followup,
     build_hermes_messages,
+    build_hermes_vision_messages,
+    image_data_url,
     status_allows_life_animation,
 )
 
@@ -167,6 +169,41 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "text")
         self.assertEqual(payload["text"], "Hallo StackChan")
         self.assertEqual(payload["request_id"], "test-001")
+
+    def test_display_image_action_targets_display_topic(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        topic, payload = action_to_topic_payload(
+            config.pairs["desk"],
+            {
+                "action": "display_image",
+                "url": "http://127.0.0.1:8788/stackchan/images/test.rgb565",
+                "caption": "Kamera",
+            },
+            "img-1",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/display")
+        self.assertEqual(payload["mode"], "image")
+        self.assertEqual(payload["format"], "rgb565le")
+        self.assertEqual(payload["width"], 320)
+        self.assertEqual(payload["height"], 240)
+        self.assertEqual(payload["request_id"], "img-1")
+
+    def test_hermes_vision_messages_include_data_url(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        messages = build_hermes_vision_messages(
+            config.pairs["desk"],
+            "",
+            "",
+            {},
+            "Was siehst du?",
+            b"fake-image",
+            "image/jpeg",
+        )
+
+        self.assertEqual(messages[1]["content"][0]["text"], "Was siehst du?")
+        self.assertTrue(messages[1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(image_data_url(b"x", "image/png"), "data:image/png;base64,eA==")
 
     def test_multipart_form_data_contains_audio_file(self) -> None:
         body, boundary = build_multipart_form_data(
