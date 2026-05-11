@@ -271,6 +271,28 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(external_reply_actions(actions, "Hallo Wolfgang.", tts_enabled=False), actions)
 
+    def test_say_action_is_mapped_to_display_without_beep(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {"action": "say", "text": "Hallo Wolfgang.", "emotion": "speaking", "beep": True},
+            "legacy-say-001",
+        )
+
+        self.assertEqual(topic, pair.display_topic)
+        self.assertEqual(payload["mode"], "text")
+        self.assertEqual(payload["text"], "Hallo Wolfgang.")
+        self.assertNotIn("beep", payload)
+
+    def test_display_payload_is_hard_clamped_for_stackchan(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+        long_text = "Wort " * 200
+
+        _topic, payload = action_to_topic_payload(pair, {"action": "display", "text": long_text}, "display-001")
+
+        self.assertLessEqual(len(payload["text"]), 320)
+
     def test_mqtt_settle_delay_spaces_text_before_followup_actions(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
 

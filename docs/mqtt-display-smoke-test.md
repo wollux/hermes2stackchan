@@ -13,7 +13,7 @@ This is the first Hermes2StackChan V1.0 hardware slice: the bridge sends MQTT co
 - Audio command: `hermes-stackchan/desk/cmd/audio`
 - LED command: `hermes-stackchan/desk/cmd/led`
 - Device command: `hermes-stackchan/desk/cmd/device`
-- Say command: `hermes-stackchan/desk/cmd/say`
+- Legacy say command: `hermes-stackchan/desk/cmd/say` exists in older firmware, but the bridge maps `say` to `display` and does not send beeps for normal Hermes replies.
 - Status: `hermes-stackchan/desk/status`
 - ACK: `hermes-stackchan/desk/ack`
 - Error: `hermes-stackchan/desk/error`

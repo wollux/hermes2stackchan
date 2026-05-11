@@ -25,6 +25,7 @@ from typing import Any, Callable
 SCHEMA_VERSION = "1.0"
 POWER_DISPLAY_DURATION_MS = 5000
 MAX_STACKCHAN_TEXT_CHARS = 700
+MAX_STACKCHAN_DISPLAY_CHARS = 320
 MAX_STACKCHAN_TTS_CHARS = 2500
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
@@ -1034,7 +1035,7 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         text = optional_string(action.get("text"))
         if not text:
             raise ConfigError("display action needs text")
-        text = safe_stackchan_text(text)
+        text = safe_stackchan_text(text, MAX_STACKCHAN_DISPLAY_CHARS)
         payload = build_display_payload(text, parse_int_value(action.get("duration_ms"), 5000, "display.duration_ms"), action_request_id)
         return pair.display_topic, payload
 
@@ -1042,16 +1043,13 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         text = optional_string(action.get("text"))
         if not text:
             raise ConfigError("say action needs text")
-        text = safe_stackchan_text(text)
-        payload = with_request_id(
-            {
-                "text": text,
-                "emotion": optional_string(action.get("emotion")) or "speaking",
-                "beep": parse_bool_value(action.get("beep"), True),
-            },
+        text = safe_stackchan_text(text, MAX_STACKCHAN_DISPLAY_CHARS)
+        payload = build_display_payload(
+            text,
+            parse_int_value(action.get("duration_ms"), 7000, "say.duration_ms"),
             action_request_id,
         )
-        return pair.say_topic, payload
+        return pair.display_topic, payload
 
     if name == "face":
         payload = with_request_id(
@@ -2814,15 +2812,8 @@ def send_audio(args: argparse.Namespace) -> int:
 def send_say(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
-    payload = with_request_id(
-        {
-            "text": safe_stackchan_text(args.text),
-            "emotion": args.emotion,
-            "beep": not args.no_beep,
-        },
-        args.request_id,
-    )
-    return send_payload(args, pair.say_topic, payload)
+    payload = build_display_payload(safe_stackchan_text(args.text, MAX_STACKCHAN_DISPLAY_CHARS), 7000, args.request_id)
+    return send_payload(args, pair.display_topic, payload)
 
 
 def send_system(args: argparse.Namespace) -> int:
