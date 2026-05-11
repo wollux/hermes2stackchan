@@ -113,7 +113,7 @@ scripts/stop_life_animator.sh desk
 
 ## Audio Control Slice
 
-Issue #6 starts with the control contract for wakeword and push-to-talk. This slice does not yet stream microphone PCM, but it gives firmware, bridge, MQTTX, and later Hermes one stable way to set and observe speech mode.
+Issue #6 starts with the control contract for wakeword and push-to-talk. Firmware now initializes the ES7210 microphone and runs a local voice-activity detector. This slice still does not upload PCM audio to the bridge, but it gives firmware, bridge, MQTTX, and later Hermes one stable way to set and observe speech mode.
 
 Enable the configured wakeword:
 
@@ -126,26 +126,27 @@ scripts/h2s_bridge.sh send-audio \
   --wait-ack
 ```
 
-Simulate a wakeword trigger and let the firmware auto-stop after the configured minimum plus silence timeout:
+Simulate a wakeword trigger and let the firmware auto-stop when speech has been heard and then falls below the silence threshold:
 
 ```sh
 scripts/h2s_bridge.sh send-audio \
   --pair desk \
   --action simulate_wakeword \
   --wakeword Computer \
-  --min-ms 5000 \
-  --silence-timeout-ms 1000 \
+  --silence-timeout-ms 500 \
   --wait-ack
 ```
 
-Simulate push-to-talk while a touch/button is held:
+Start and stop recording manually:
 
 ```sh
 scripts/h2s_bridge.sh send-audio --pair desk --action start_recording --source push_to_talk --wait-ack
-scripts/h2s_bridge.sh send-audio --pair desk --action stop_recording --source push_to_talk --reason touch_release --wait-ack
+scripts/h2s_bridge.sh send-audio --pair desk --action stop_recording --source push_to_talk --reason manual_stop --wait-ack
 ```
 
-The retained status includes top-level `wakeword_enabled` and `recording`, plus an `audio` object with `input_ready`, `wakeword`, `recording_source`, and timing fields. The firmware also publishes realtime state changes to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
+The retained status includes top-level `wakeword_enabled` and `recording`, plus an `audio` object with `input_ready`, `wakeword`, `recording_source`, timing fields, `voice_active`, `voice_level_pct`, `voice_avg_level`, and `voice_peak_level`. The firmware also publishes realtime state changes to `hermes-stackchan/desk/events`, for example `wakeword_detected`, `recording_started`, and `recording_stopped`.
+
+While recording, the face remains visible and the face renderer adds a small waveform overlay below the mouth from the same framebuffer before the frame is flushed. The overlay is the first `FaceExtraMode`; later extras can use the same hook without replacing the face screen.
 
 For a quick head-touch hardware test, run the bridge touch lamp watcher:
 
@@ -153,7 +154,7 @@ For a quick head-touch hardware test, run the bridge touch lamp watcher:
 scripts/h2s_bridge.sh watch-touch-lamp --pair desk
 ```
 
-StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. A touch turns the LEDs solid green immediately. Releasing touch does not turn the LEDs off. They stay green while recording is active and turn off about 500 ms after `recording_stopped` or a retained status update reports `recording:false` after an active recording. This is intentionally bridge-driven so the MQTT event path is visible. The watcher logs the bridge-side publish timing in verbose mode.
+StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. A touch starts recording immediately in firmware. Releasing touch does not stop recording; recording stops when the microphone has heard speech and then sees about 500 ms of silence, or after a no-voice timeout. A touch turns the LEDs solid green immediately through the bridge watcher. They stay green while recording is active and turn off about 500 ms after `recording_stopped` or a retained status update reports `recording:false` after an active recording. This is intentionally bridge-driven so the MQTT event path is visible. The watcher logs the bridge-side publish timing in verbose mode.
 
 To watch both bridge and firmware logs during a touch test:
 
@@ -167,6 +168,12 @@ For serial firmware logs:
 cd firmware
 source /Users/wolfgangvieregg/development/esp-idf-v5.5.4/export.sh
 idf.py -p /dev/cu.usbmodem21301 monitor | rg --line-buffered 'touch|SI12T|MQTT|led'
+```
+
+For voice/VAD debugging, include microphone lines too:
+
+```sh
+idf.py -p /dev/cu.usbmodem21301 monitor | rg --line-buffered 'touch|voice|microphone|recording|led'
 ```
 
 ## Hermes HTTP Adapter

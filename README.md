@@ -294,6 +294,14 @@ The v1.0 backlog lives in GitHub:
 - #15 CI checks for Bridge and firmware build
 - #16 Installation, services, and operations docs
 
+Current #6 slice status:
+
+- ES7210 microphone initializes in firmware.
+- Touch starts recording immediately.
+- Recording stops from local voice activity detection: after speech plus about 500 ms silence, or after a no-voice timeout.
+- The face remains the default display while recording, with a small waveform overlay rendered below it from the face framebuffer.
+- Retained MQTT status exposes `audio.voice_active`, `audio.voice_level_pct`, `audio.voice_avg_level`, and `audio.voice_peak_level`.
+
 Suggested order:
 
 1. Harden MQTT schemas.

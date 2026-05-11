@@ -3,12 +3,15 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 
 #include "cJSON.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
+#include "driver/i2s_tdm.h"
 #include "driver/spi_master.h"
 #include "driver/temperature_sensor.h"
 #include "esp_codec_dev.h"
@@ -30,6 +33,7 @@
 #include "freertos/task.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
+#include "es7210_adc.h"
 #include "SCSCL.h"
 
 namespace {
@@ -45,21 +49,29 @@ constexpr uint8_t kAw9523Addr = 0x58;
 constexpr uint8_t kPy32Addr = 0x6F;
 constexpr uint8_t kHeadTouchAddr = 0x68;
 constexpr uint8_t kAw88298Addr = AW88298_CODEC_DEFAULT_ADDR;
+constexpr uint8_t kEs7210Addr = ES7210_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
 constexpr size_t kFrameBufferBytes = kWidth * kHeight * sizeof(uint16_t);
 constexpr int kAudioSampleRate = 16000;
+constexpr int kVoiceStartGraceMs = 250;
+constexpr int kVoiceNoSpeechTimeoutMs = 5000;
+constexpr int kVoiceMinSpeechMs = 250;
+constexpr int kVoiceSilenceAvgThreshold = 260;
+constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
 constexpr gpio_num_t kAudioMclk = GPIO_NUM_0;
 constexpr gpio_num_t kAudioBclk = GPIO_NUM_34;
 constexpr gpio_num_t kAudioWs = GPIO_NUM_33;
+constexpr gpio_num_t kAudioDin = GPIO_NUM_14;
 constexpr gpio_num_t kAudioDout = GPIO_NUM_13;
 
 esp_lcd_panel_handle_t g_panel = nullptr;
 esp_lcd_panel_io_handle_t g_panel_io = nullptr;
 uint16_t* g_framebuffer = nullptr;
 bool g_framebuffer_active = false;
+SemaphoreHandle_t g_display_mutex = nullptr;
 i2c_master_bus_handle_t g_i2c_bus = nullptr;
 SemaphoreHandle_t g_i2c_mutex = nullptr;
 EventGroupHandle_t g_wifi_events = nullptr;
@@ -69,7 +81,11 @@ uint8_t g_display_brightness_pct = CONFIG_STACKCHAN_DISPLAY_BRIGHTNESS;
 bool g_display_sleeping = false;
 SCSCL g_servo_bus;
 i2s_chan_handle_t g_audio_tx = nullptr;
+i2s_chan_handle_t g_audio_rx = nullptr;
 const audio_codec_data_if_t* g_audio_data_if = nullptr;
+const audio_codec_ctrl_if_t* g_audio_in_ctrl_if = nullptr;
+const audio_codec_if_t* g_audio_in_codec_if = nullptr;
+esp_codec_dev_handle_t g_audio_input = nullptr;
 const audio_codec_ctrl_if_t* g_audio_out_ctrl_if = nullptr;
 const audio_codec_gpio_if_t* g_audio_gpio_if = nullptr;
 const audio_codec_if_t* g_audio_out_codec_if = nullptr;
@@ -102,6 +118,8 @@ volatile int g_pending_yaw_target_pct = 101;
 volatile int g_pending_pitch_target_pct = 101;
 char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
+char g_pre_recording_face_emotion[24] = "neutral";
+int g_pre_recording_face_intensity_pct = 60;
 volatile bool g_audio_input_ready = false;
 volatile bool g_wakeword_enabled = false;
 volatile bool g_recording = false;
@@ -113,8 +131,14 @@ volatile int g_touch_x = -1;
 volatile int g_touch_y = -1;
 volatile int64_t g_recording_started_ms = 0;
 volatile int g_recording_min_ms = 5000;
-volatile int g_recording_silence_timeout_ms = 1000;
+volatile int g_recording_silence_timeout_ms = 500;
 volatile int g_recording_max_ms = 15000;
+volatile int g_voice_level_pct = 0;
+volatile int g_voice_avg_level = 0;
+volatile int g_voice_peak_level = 0;
+volatile bool g_voice_active = false;
+std::array<uint8_t, 64> g_voice_waveform = {};
+volatile int g_voice_waveform_head = 0;
 char g_wakeword[32] = "Computer";
 char g_recording_source[24] = "none";
 
@@ -177,6 +201,13 @@ struct UiCommand {
 QueueHandle_t g_sound_queue = nullptr;
 QueueHandle_t g_motion_queue = nullptr;
 QueueHandle_t g_ui_queue = nullptr;
+
+enum class FaceExtraMode : uint8_t {
+    None,
+    VoiceWaveform,
+};
+
+volatile FaceExtraMode g_face_extra_mode = FaceExtraMode::None;
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -715,6 +746,10 @@ void init_display()
 
 void init_framebuffer()
 {
+    g_display_mutex = xSemaphoreCreateMutex();
+    if (!g_display_mutex) {
+        ESP_LOGW(kTag, "display mutex unavailable");
+    }
     g_framebuffer = static_cast<uint16_t*>(
         heap_caps_malloc(kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!g_framebuffer) {
@@ -733,6 +768,10 @@ bool begin_frame()
     if (!g_framebuffer) {
         return false;
     }
+    if (g_display_mutex && xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGW(kTag, "display framebuffer busy; falling back to direct drawing");
+        return false;
+    }
     g_framebuffer_active = true;
     return true;
 }
@@ -747,7 +786,12 @@ void flush_frame()
         ESP_ERROR_CHECK_WITHOUT_ABORT(
             esp_lcd_panel_draw_bitmap(g_panel, 0, 0, kWidth, kHeight, g_framebuffer));
     }
+    if (g_display_mutex) {
+        xSemaphoreGive(g_display_mutex);
+    }
 }
+
+void draw_face_extras();
 
 struct FrameGuard {
     bool active;
@@ -757,6 +801,20 @@ struct FrameGuard {
     ~FrameGuard()
     {
         if (active) {
+            flush_frame();
+        }
+    }
+};
+
+struct FaceFrameGuard {
+    bool active;
+
+    FaceFrameGuard() : active(begin_frame()) {}
+
+    ~FaceFrameGuard()
+    {
+        if (active) {
+            draw_face_extras();
             flush_frame();
         }
     }
@@ -879,6 +937,65 @@ void draw_mouth_curve(int cx, int cy, int width, int height, bool smile, uint16_
 void clear(uint16_t color)
 {
     draw_rect(0, 0, kWidth, kHeight, color);
+}
+
+void reset_voice_meter()
+{
+    g_voice_level_pct = 0;
+    g_voice_avg_level = 0;
+    g_voice_peak_level = 0;
+    g_voice_active = false;
+    std::fill(g_voice_waveform.begin(), g_voice_waveform.end(), 0);
+    g_voice_waveform_head = 0;
+}
+
+void push_voice_level(int level_pct, int avg, int peak, bool active)
+{
+    level_pct = clamp_int(level_pct, 0, 100);
+    g_voice_level_pct = level_pct;
+    g_voice_avg_level = avg;
+    g_voice_peak_level = peak;
+    g_voice_active = active;
+    const int next = (static_cast<int>(g_voice_waveform_head) + 1) %
+                     static_cast<int>(g_voice_waveform.size());
+    g_voice_waveform[next] = static_cast<uint8_t>(level_pct);
+    g_voice_waveform_head = next;
+}
+
+void draw_voice_waveform_overlay()
+{
+    const int panel_x = 20;
+    const int panel_y = 198;
+    const int panel_w = 280;
+    const int panel_h = 34;
+    const int mid_y = panel_y + panel_h / 2;
+    const uint16_t background = rgb565(0, 4, 8);
+    const uint16_t dim = rgb565(10, 55, 70);
+    const uint16_t idle = rgb565(40, 130, 180);
+    const uint16_t active = rgb565(80, 255, 130);
+    const uint16_t color = g_voice_active ? active : idle;
+
+    draw_rect(panel_x, panel_y, panel_w, panel_h, background);
+    draw_line(panel_x + 8, mid_y, panel_x + panel_w - 8, mid_y, dim, 1);
+
+    const int bars = std::min<int>(static_cast<int>(g_voice_waveform.size()), (panel_w - 16) / 4);
+    const int latest = static_cast<int>(g_voice_waveform_head);
+    for (int i = 0; i < bars; ++i) {
+        const int history_index =
+            (latest - (bars - 1 - i) + static_cast<int>(g_voice_waveform.size()) * 2) %
+            static_cast<int>(g_voice_waveform.size());
+        const int level = clamp_int(static_cast<int>(g_voice_waveform[history_index]), 0, 100);
+        const int bar_h = std::max(2, level * (panel_h - 8) / 100);
+        const int x = panel_x + 8 + i * 4;
+        draw_line(x, mid_y - bar_h / 2, x, mid_y + bar_h / 2, color, 2);
+    }
+}
+
+void draw_face_extras()
+{
+    if (g_face_extra_mode == FaceExtraMode::VoiceWaveform) {
+        draw_voice_waveform_overlay();
+    }
 }
 
 const uint8_t* glyph_for(char raw)
@@ -1059,8 +1176,8 @@ void draw_life_face_frame(const char* base_emotion, int intensity_pct,
                           int mouth_mode = 0)
 {
     wake_display_if_needed();
-    copy_ui_mode("face");
-    FrameGuard frame;
+    copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
+    FaceFrameGuard frame;
 
     const uint16_t white = rgb565(245, 250, 255);
     const uint16_t warm = rgb565(255, 230, 120);
@@ -1252,9 +1369,9 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 void draw_face(const char* emotion, int intensity_pct)
 {
     wake_display_if_needed();
-    copy_ui_mode("face");
+    copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
     copy_face_emotion(emotion, intensity_pct);
-    FrameGuard frame;
+    FaceFrameGuard frame;
 
     const uint16_t white = rgb565(245, 250, 255);
     const uint16_t cyan = rgb565(20, 180, 255);
@@ -1494,9 +1611,9 @@ bool init_speaker()
         .auto_clear_before_cb = false,
         .intr_priority = 0,
     };
-    esp_err_t err = i2s_new_channel(&chan_cfg, &g_audio_tx, nullptr);
+    esp_err_t err = i2s_new_channel(&chan_cfg, &g_audio_tx, &g_audio_rx);
     if (err != ESP_OK) {
-        ESP_LOGW(kTag, "speaker i2s channel failed: %s", esp_err_to_name(err));
+        ESP_LOGW(kTag, "audio i2s channels failed: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -1532,12 +1649,58 @@ bool init_speaker()
             },
         },
     };
-    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_init_std_mode(g_audio_tx, &std_cfg));
+
+    i2s_tdm_config_t tdm_cfg = {
+        .clk_cfg = {
+            .sample_rate_hz = kAudioSampleRate,
+            .clk_src = I2S_CLK_SRC_DEFAULT,
+            .ext_clk_freq_hz = 0,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+            .bclk_div = 8,
+        },
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+            .slot_mode = I2S_SLOT_MODE_STEREO,
+            .slot_mask = i2s_tdm_slot_mask_t(I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3),
+            .ws_width = I2S_TDM_AUTO_WS_WIDTH,
+            .ws_pol = false,
+            .bit_shift = true,
+            .left_align = false,
+            .big_endian = false,
+            .bit_order_lsb = false,
+            .skip_mask = false,
+            .total_slot = I2S_TDM_AUTO_SLOT_NUM,
+        },
+        .gpio_cfg = {
+            .mclk = kAudioMclk,
+            .bclk = kAudioBclk,
+            .ws = kAudioWs,
+            .dout = I2S_GPIO_UNUSED,
+            .din = kAudioDin,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    err = i2s_channel_init_std_mode(g_audio_tx, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "speaker i2s std init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = i2s_channel_init_tdm_mode(g_audio_rx, &tdm_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "microphone i2s tdm init failed: %s", esp_err_to_name(err));
+        return false;
+    }
     ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_enable(g_audio_tx));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(i2s_channel_enable(g_audio_rx));
 
     audio_codec_i2s_cfg_t i2s_cfg = {
         .port = I2S_NUM_0,
-        .rx_handle = nullptr,
+        .rx_handle = g_audio_rx,
         .tx_handle = g_audio_tx,
     };
     g_audio_data_if = audio_codec_new_i2s_data(&i2s_cfg);
@@ -1599,6 +1762,74 @@ bool init_speaker()
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_set_out_mute(g_audio_output, false));
     g_audio_output_ready = true;
     ESP_LOGI(kTag, "speaker ready: AW88298 addr=0x%02x volume=%d", kAw88298Addr, g_speaker_volume_pct);
+    return true;
+}
+
+bool init_microphone()
+{
+    if (!g_i2c_bus || !g_audio_data_if || !g_audio_rx) {
+        ESP_LOGW(kTag, "microphone skipped: audio bus not ready");
+        g_audio_input_ready = false;
+        return false;
+    }
+
+    audio_codec_i2c_cfg_t i2c_cfg = {
+        .port = I2C_NUM_1,
+        .addr = kEs7210Addr,
+        .bus_handle = g_i2c_bus,
+    };
+    g_audio_in_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    if (!g_audio_in_ctrl_if) {
+        ESP_LOGW(kTag, "microphone i2c ctrl iface failed");
+        g_audio_input_ready = false;
+        return false;
+    }
+
+    es7210_codec_cfg_t es7210_cfg = {};
+    es7210_cfg.ctrl_if = g_audio_in_ctrl_if;
+    es7210_cfg.mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3;
+    g_audio_in_codec_if = es7210_codec_new(&es7210_cfg);
+    if (!g_audio_in_codec_if) {
+        ESP_LOGW(kTag, "microphone ES7210 codec failed");
+        g_audio_input_ready = false;
+        return false;
+    }
+
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = g_audio_in_codec_if,
+        .data_if = g_audio_data_if,
+    };
+    g_audio_input = esp_codec_dev_new(&dev_cfg);
+    if (!g_audio_input) {
+        ESP_LOGW(kTag, "microphone codec dev failed");
+        g_audio_input_ready = false;
+        return false;
+    }
+
+    esp_codec_dev_sample_info_t sample_info = {
+        .bits_per_sample = 16,
+        .channel = 2,
+        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+        .sample_rate = kAudioSampleRate,
+        .mclk_multiple = 0,
+    };
+    esp_err_t err = static_cast<esp_err_t>(esp_codec_dev_open(g_audio_input, &sample_info));
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "microphone open failed: %s", esp_err_to_name(err));
+        g_audio_input_ready = false;
+        return false;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(
+        esp_codec_dev_set_in_channel_gain(g_audio_input, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), 30.0f));
+
+    g_audio_input_ready = true;
+    reset_voice_meter();
+    ESP_LOGI(kTag,
+             "microphone ready: ES7210 addr=0x%02x sample_rate=%d din=%d",
+             kEs7210Addr,
+             kAudioSampleRate,
+             static_cast<int>(kAudioDin));
     return true;
 }
 
@@ -2125,7 +2356,7 @@ void publish_status()
     update_soc_temperature();
     update_battery_status();
 
-    char payload[1900] = {};
+    char payload[2300] = {};
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
@@ -2139,7 +2370,8 @@ void publish_status()
                   "\"wakeword_enabled\":%s,\"recording\":%s,\"speaking\":false,"
                   "\"audio\":{\"input_ready\":%s,\"wakeword_enabled\":%s,\"wakeword\":\"%s\","
                   "\"recording\":%s,\"recording_source\":\"%s\",\"recording_started_ms\":%lld,"
-                  "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d},"
+                  "\"recording_min_ms\":%d,\"recording_silence_timeout_ms\":%d,\"recording_max_ms\":%d,"
+                  "\"voice_active\":%s,\"voice_level_pct\":%d,\"voice_avg_level\":%d,\"voice_peak_level\":%d},"
                   "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
                   "\"pressed\":%s,\"raw\":%d,\"x\":%d,\"y\":%d},"
                   "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
@@ -2180,6 +2412,10 @@ void publish_status()
                   static_cast<int>(g_recording_min_ms),
                   static_cast<int>(g_recording_silence_timeout_ms),
                   static_cast<int>(g_recording_max_ms),
+                  g_voice_active ? "true" : "false",
+                  static_cast<int>(g_voice_level_pct),
+                  static_cast<int>(g_voice_avg_level),
+                  static_cast<int>(g_voice_peak_level),
                   (g_head_touch_ready || g_display_touch_ready) ? "true" : "false",
                   g_head_touch_ready ? "true" : "false",
                   g_display_touch_ready ? "true" : "false",
@@ -2621,6 +2857,21 @@ void handle_say_command(const char* data, int len)
 void set_recording_state(bool enabled, const char* source, const char* request_id, const char* reason)
 {
     if (enabled) {
+        if (g_recording) {
+            publish_status();
+            return;
+        }
+        if (!is_transient_face_emotion(g_face_emotion) && std::strcmp(g_face_emotion, "speaking") != 0) {
+            copy_cstr(g_pre_recording_face_emotion,
+                      sizeof(g_pre_recording_face_emotion),
+                      g_face_emotion);
+            g_pre_recording_face_intensity_pct = g_face_intensity_pct;
+        } else {
+            copy_cstr(g_pre_recording_face_emotion, sizeof(g_pre_recording_face_emotion), "neutral");
+            g_pre_recording_face_intensity_pct = 60;
+        }
+        reset_voice_meter();
+        g_face_extra_mode = FaceExtraMode::VoiceWaveform;
         g_recording = true;
         g_recording_started_ms = esp_timer_get_time() / 1000;
         copy_cstr(g_recording_source, sizeof(g_recording_source), source && *source ? source : "manual");
@@ -2629,12 +2880,19 @@ void set_recording_state(bool enabled, const char* source, const char* request_i
         draw_face("speaking", 70);
         publish_event("recording_started", g_recording_source, request_id, reason);
     } else {
+        if (!g_recording) {
+            publish_status();
+            return;
+        }
         char previous_source[sizeof(g_recording_source)] = {};
         copy_cstr(previous_source, sizeof(previous_source), g_recording_source);
         g_recording = false;
         g_recording_started_ms = 0;
+        g_face_extra_mode = FaceExtraMode::None;
+        reset_voice_meter();
         copy_cstr(g_recording_source, sizeof(g_recording_source), "none");
         copy_cstr(g_ui_mode, sizeof(g_ui_mode), "face");
+        copy_face_emotion(g_pre_recording_face_emotion, g_pre_recording_face_intensity_pct);
         draw_face(g_face_emotion, g_face_intensity_pct);
         publish_event("recording_stopped", previous_source, request_id, reason);
     }
@@ -2660,6 +2918,11 @@ void handle_audio_command(const char* data, int len)
         publish_ack(request_id, "audio", g_wakeword_enabled ? "wakeword enabled" : "wakeword disabled");
         publish_status();
     } else if (std::strcmp(action, "start_recording") == 0) {
+        if (!g_audio_input_ready || !g_audio_input) {
+            publish_error(request_id, "audio", "microphone not ready");
+            cJSON_Delete(root);
+            return;
+        }
         const char* source = json_string(root, "source", "manual");
         g_recording_min_ms = clamp_int(json_int(root, "min_ms", static_cast<int>(g_recording_min_ms)), 0, 30000);
         g_recording_silence_timeout_ms = clamp_int(json_int(root, "silence_timeout_ms", static_cast<int>(g_recording_silence_timeout_ms)), 0, 10000);
@@ -2672,6 +2935,11 @@ void handle_audio_command(const char* data, int len)
         set_recording_state(false, source, request_id, reason);
         publish_ack(request_id, "audio", "recording stopped");
     } else if (std::strcmp(action, "simulate_wakeword") == 0) {
+        if (!g_audio_input_ready || !g_audio_input) {
+            publish_error(request_id, "audio", "microphone not ready");
+            cJSON_Delete(root);
+            return;
+        }
         const char* wakeword = json_string(root, "wakeword", g_wakeword);
         publish_event("wakeword_detected", wakeword, request_id, "simulated wakeword");
         g_wakeword_enabled = true;
@@ -2840,22 +3108,129 @@ void ui_task(void*)
 
 void audio_state_task(void*)
 {
+    static constexpr int kAudioChunkSamples = 512;
+    static std::array<int16_t, kAudioChunkSamples> samples = {};
+    int64_t session_start_ms = 0;
+    int64_t quiet_started_ms = 0;
+    int64_t last_draw_ms = 0;
+    int64_t last_status_ms = 0;
+    bool speech_seen = false;
+    int active_chunks = 0;
+    const int min_speech_chunks = std::max(1, (kAudioSampleRate * kVoiceMinSpeechMs / 1000 + kAudioChunkSamples - 1) /
+                                              kAudioChunkSamples);
+
     while (true) {
-        if (g_recording) {
-            const int64_t now_ms = esp_timer_get_time() / 1000;
-            const int64_t elapsed_ms = now_ms - g_recording_started_ms;
-            const bool wakeword_source = std::strcmp(g_recording_source, "wakeword") == 0;
-            const int auto_stop_ms = wakeword_source
-                                         ? static_cast<int>(g_recording_min_ms + g_recording_silence_timeout_ms)
-                                         : static_cast<int>(g_recording_max_ms);
-            if (elapsed_ms >= auto_stop_ms) {
-                set_recording_state(false,
-                                    wakeword_source ? "wakeword" : g_recording_source,
-                                    "",
-                                    wakeword_source ? "silence timeout" : "max duration");
+        if (!g_recording) {
+            session_start_ms = 0;
+            quiet_started_ms = 0;
+            last_draw_ms = 0;
+            last_status_ms = 0;
+            speech_seen = false;
+            active_chunks = 0;
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
+
+        if (session_start_ms != g_recording_started_ms) {
+            session_start_ms = g_recording_started_ms;
+            quiet_started_ms = 0;
+            last_draw_ms = 0;
+            last_status_ms = 0;
+            speech_seen = false;
+            active_chunks = 0;
+            reset_voice_meter();
+            ESP_LOGI(kTag,
+                     "voice monitor start: source=%s max=%dms silence=%dms no_voice=%dms",
+                     g_recording_source,
+                     static_cast<int>(g_recording_max_ms),
+                     static_cast<int>(g_recording_silence_timeout_ms),
+                     kVoiceNoSpeechTimeoutMs);
+        }
+
+        if (!g_audio_input_ready || !g_audio_input) {
+            ESP_LOGW(kTag, "voice monitor stopped: microphone not ready");
+            set_recording_state(false, g_recording_source, "", "microphone not ready");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        const esp_err_t err = esp_codec_dev_read(g_audio_input,
+                                                 samples.data(),
+                                                 samples.size() * sizeof(int16_t));
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "voice monitor read failed: %s", esp_err_to_name(err));
+            set_recording_state(false, g_recording_source, "", "microphone read failed");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        int64_t sum = 0;
+        int peak = 0;
+        for (const int16_t sample : samples) {
+            const int value = sample == INT16_MIN ? INT16_MAX : std::abs(static_cast<int>(sample));
+            sum += value;
+            peak = std::max(peak, value);
+        }
+        const int avg = static_cast<int>(sum / static_cast<int>(samples.size()));
+        const bool active = avg >= kVoiceSilenceAvgThreshold || peak >= kVoiceSilencePeakThreshold;
+        const int avg_level = avg * 100 / 1400;
+        const int peak_level = peak * 100 / 7000;
+        const int level_pct = clamp_int(std::max(avg_level, peak_level), 0, 100);
+        push_voice_level(level_pct, avg, peak, active);
+
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const int64_t elapsed_ms = now_ms - g_recording_started_ms;
+        const bool start_grace_done = elapsed_ms >= kVoiceStartGraceMs;
+
+        if (active && start_grace_done) {
+            ++active_chunks;
+            if (active_chunks >= min_speech_chunks) {
+                speech_seen = true;
+            }
+            quiet_started_ms = 0;
+        } else {
+            active_chunks = 0;
+            if (speech_seen && quiet_started_ms == 0) {
+                quiet_started_ms = now_ms;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+        if (now_ms - last_draw_ms >= 80) {
+            draw_face("speaking", clamp_int(62 + level_pct / 3, 62, 95));
+            last_draw_ms = now_ms;
+        }
+        if (now_ms - last_status_ms >= 500) {
+            publish_status();
+            last_status_ms = now_ms;
+        }
+
+        if (speech_seen && quiet_started_ms > 0 &&
+            now_ms - quiet_started_ms >= static_cast<int64_t>(g_recording_silence_timeout_ms)) {
+            ESP_LOGI(kTag,
+                     "voice monitor stop: silence elapsed=%lldms avg=%d peak=%d level=%d%%",
+                     static_cast<long long>(elapsed_ms),
+                     avg,
+                     peak,
+                     level_pct);
+            set_recording_state(false, g_recording_source, "", "voice silence");
+        } else if (!speech_seen && elapsed_ms >= kVoiceNoSpeechTimeoutMs) {
+            ESP_LOGI(kTag,
+                     "voice monitor stop: no voice elapsed=%lldms avg=%d peak=%d level=%d%%",
+                     static_cast<long long>(elapsed_ms),
+                     avg,
+                     peak,
+                     level_pct);
+            set_recording_state(false, g_recording_source, "", "no voice");
+        } else if (elapsed_ms >= static_cast<int64_t>(g_recording_max_ms)) {
+            ESP_LOGI(kTag,
+                     "voice monitor stop: max duration elapsed=%lldms avg=%d peak=%d level=%d%%",
+                     static_cast<long long>(elapsed_ms),
+                     avg,
+                     peak,
+                     level_pct);
+            set_recording_state(false, g_recording_source, "", "max duration");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -2918,6 +3293,17 @@ void touch_event_task(void*)
                                 pressed,
                                 display_pressed ? x : -1,
                                 display_pressed ? y : -1);
+            if (pressed) {
+                if (g_audio_input_ready && g_audio_input) {
+                    set_recording_state(true,
+                                        source,
+                                        "",
+                                        "touch pressed");
+                } else {
+                    draw_face("error", 80);
+                    publish_event("recording_error", source, "", "microphone not ready");
+                }
+            }
             if (!pressed) {
                 copy_cstr(active_source, sizeof(active_source), "none");
             }
@@ -3284,6 +3670,7 @@ extern "C" void app_main()
     display_boot();
     init_temperature_sensor();
     init_speaker();
+    init_microphone();
     g_sound_queue = xQueueCreate(4, sizeof(SoundCommand));
     g_motion_queue = xQueueCreate(3, sizeof(MotionCommand));
     g_ui_queue = xQueueCreate(6, sizeof(UiCommand));
@@ -3295,7 +3682,7 @@ extern "C" void app_main()
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
-    xTaskCreate(audio_state_task, "audio_state", 4096, nullptr, 2, nullptr);
+    xTaskCreate(audio_state_task, "audio_state", 12288, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
