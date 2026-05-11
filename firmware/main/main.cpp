@@ -16,6 +16,7 @@
 #include "driver/temperature_sensor.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_camera.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -122,6 +123,7 @@ volatile bool g_battery_charging_done = false;
 volatile bool g_battery_known = false;
 volatile bool g_usb_power_present = false;
 volatile int g_battery_current_direction = -1;
+volatile bool g_camera_available = false;
 volatile int g_led_mode = 0;
 volatile int g_led_r = 0;
 volatile int g_led_g = 0;
@@ -140,6 +142,10 @@ char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
+bool init_camera();
+bool capture_and_send_photo(const char* request_id, const char* prompt);
+void camera_init_task(void* arg);
+void photo_capture_task(void* arg);
 volatile bool g_audio_input_ready = false;
 volatile bool g_tts_playing = false;
 volatile bool g_wakeword_enabled = true;
@@ -231,6 +237,11 @@ struct ImageDownloadState {
     int capacity = 0;
     int len = 0;
     bool overflow = false;
+};
+
+struct PhotoTaskArgs {
+    char request_id[64];
+    char prompt[192];
 };
 
 enum class UiCommandType : uint8_t {
@@ -2725,7 +2736,7 @@ void publish_status()
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
                   "\"ui\":{\"mode\":\"%s\"},"
                   "\"speaker\":{\"ready\":%s,\"volume_pct\":%d},"
-                  "\"camera_available\":false,"
+                  "\"camera_available\":%s,"
                   "\"firmware\":\"1.0.0-mqtt-hardware\","
                   "\"firmware_version\":\"1.0.0-mqtt-hardware\"}",
                   CONFIG_STACKCHAN_PAIR_ID,
@@ -2786,7 +2797,8 @@ void publish_status()
                   g_face_intensity_pct,
                   g_ui_mode,
                   g_audio_output_ready ? "true" : "false",
-                  g_speaker_volume_pct);
+                  g_speaker_volume_pct,
+                  g_camera_available ? "true" : "false");
     publish_json(g_topic_status, payload, 1, 1);
 }
 
@@ -3544,7 +3556,25 @@ void handle_system_command(const char* data, int len)
         publish_ack(request_id, "system", "display awake");
         publish_status();
     } else if (std::strcmp(action, "take_photo") == 0) {
-        publish_error(request_id, "system", "camera not available in this firmware build");
+        auto* args = static_cast<PhotoTaskArgs*>(std::malloc(sizeof(PhotoTaskArgs)));
+        if (!args) {
+            publish_error(request_id, "system", "photo task allocation failed");
+            cJSON_Delete(root);
+            return;
+        }
+        std::memset(args, 0, sizeof(PhotoTaskArgs));
+        copy_cstr(args->request_id, sizeof(args->request_id), request_id);
+        copy_display_text(args->prompt,
+                          sizeof(args->prompt),
+                          json_string(root, "prompt", "Beschreibe kurz, was du auf dem StackChan-Kamerabild siehst."));
+        const BaseType_t ok = xTaskCreate(photo_capture_task, "photo", 12288, args, 3, nullptr);
+        if (ok != pdPASS) {
+            std::free(args);
+            publish_error(request_id, "system", "photo task failed");
+            cJSON_Delete(root);
+            return;
+        }
+        publish_ack(request_id, "system", "photo capture started");
         publish_status();
     } else {
         publish_error(request_id, "system", "unsupported action");
@@ -3656,6 +3686,199 @@ bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request
         ESP_LOGW(kTag, "voice upload response has no tts_url");
     }
     return true;
+}
+
+void build_bridge_photo_url(char* out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (std::strlen(CONFIG_STACKCHAN_BRIDGE_PHOTO_URL) > 0) {
+        copy_cstr(out, out_len, CONFIG_STACKCHAN_BRIDGE_PHOTO_URL);
+        return;
+    }
+    const char* suffix = std::strstr(CONFIG_STACKCHAN_BRIDGE_AUDIO_URL, "/stackchan/audio");
+    if (!suffix) {
+        return;
+    }
+    const size_t prefix_len = static_cast<size_t>(suffix - CONFIG_STACKCHAN_BRIDGE_AUDIO_URL);
+    const size_t copy_len = std::min(prefix_len, out_len - 1);
+    std::memcpy(out, CONFIG_STACKCHAN_BRIDGE_AUDIO_URL, copy_len);
+    out[copy_len] = '\0';
+    std::strncat(out, "/stackchan/photo", out_len - std::strlen(out) - 1);
+}
+
+bool init_camera()
+{
+    if (g_camera_available) {
+        return true;
+    }
+    camera_config_t config = {};
+    config.pin_pwdn = GPIO_NUM_NC;
+    config.pin_reset = GPIO_NUM_NC;
+    config.pin_xclk = GPIO_NUM_NC;
+    config.pin_sccb_sda = GPIO_NUM_NC;
+    config.pin_sccb_scl = GPIO_NUM_NC;
+    config.pin_d7 = GPIO_NUM_47;
+    config.pin_d6 = GPIO_NUM_48;
+    config.pin_d5 = GPIO_NUM_16;
+    config.pin_d4 = GPIO_NUM_15;
+    config.pin_d3 = GPIO_NUM_42;
+    config.pin_d2 = GPIO_NUM_41;
+    config.pin_d1 = GPIO_NUM_40;
+    config.pin_d0 = GPIO_NUM_39;
+    config.pin_vsync = GPIO_NUM_46;
+    config.pin_href = GPIO_NUM_38;
+    config.pin_pclk = GPIO_NUM_45;
+    config.sccb_i2c_port = I2C_NUM_1;
+    config.xclk_freq_hz = 20000000;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+    const esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "camera init failed: %s", esp_err_to_name(err));
+        g_camera_available = false;
+        publish_status();
+        return false;
+    }
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor) {
+        sensor->set_framesize(sensor, FRAMESIZE_QVGA);
+        sensor->set_hmirror(sensor, 0);
+        sensor->set_vflip(sensor, 0);
+    }
+    g_camera_available = true;
+    ESP_LOGI(kTag, "camera ready");
+    publish_status();
+    return true;
+}
+
+bool capture_and_send_photo(const char* request_id, const char* prompt)
+{
+    char photo_url[256] = {};
+    build_bridge_photo_url(photo_url, sizeof(photo_url));
+    if (photo_url[0] == '\0') {
+        publish_error(request_id, "system", "bridge photo url missing");
+        return false;
+    }
+    if (!init_camera()) {
+        publish_error(request_id, "system", "camera unavailable");
+        return false;
+    }
+    if (!wait_for_wifi(pdMS_TO_TICKS(5000))) {
+        publish_error(request_id, "system", "wifi not connected");
+        return false;
+    }
+
+    draw_wrapped_message("KAMERA", "FOTO...", rgb565(0, 220, 230));
+    camera_fb_t* fb = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        fb = esp_camera_fb_get();
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+    if (!fb || !fb->buf || fb->len == 0) {
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        publish_error(request_id, "system", "camera capture failed");
+        draw_face("error", 55);
+        return false;
+    }
+
+    auto response = std::make_unique<HttpResponseBuffer>();
+    esp_http_client_config_t config = {};
+    config.url = photo_url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 90000;
+    config.disable_auto_redirect = true;
+    config.event_handler = http_event_handler;
+    config.user_data = response.get();
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        esp_camera_fb_return(fb);
+        publish_error(request_id, "system", "photo http init failed");
+        return false;
+    }
+
+    char value[32] = {};
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "Content-Type", "application/octet-stream"));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Pair-Id", CONFIG_STACKCHAN_PAIR_ID));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-StackChan-Id", CONFIG_STACKCHAN_STACKCHAN_ID));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Request-Id", request_id && *request_id ? request_id : ""));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Photo-Prompt", prompt && *prompt ? prompt : "Was siehst du auf diesem Bild?"));
+    std::snprintf(value, sizeof(value), "%d", fb->width);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Image-Width", value));
+    std::snprintf(value, sizeof(value), "%d", fb->height);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Image-Height", value));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_http_client_set_header(client, "X-H2S-Image-Format", fb->format == PIXFORMAT_JPEG ? "jpeg" : "rgb565"));
+
+    ESP_LOGI(kTag, "photo upload start: %dx%d len=%u fmt=%d -> %s request_id=%s",
+             fb->width,
+             fb->height,
+             static_cast<unsigned>(fb->len),
+             fb->format,
+             photo_url,
+             request_id && *request_id ? request_id : "");
+    publish_event("photo_upload_started", "camera", request_id, "posting photo to bridge");
+    esp_err_t err = esp_http_client_set_post_field(client,
+                                                   reinterpret_cast<const char*>(fb->buf),
+                                                   static_cast<int>(fb->len));
+    const int64_t started_us = esp_timer_get_time();
+    if (err == ESP_OK) {
+        err = esp_http_client_perform(client);
+    }
+    const int elapsed_ms = static_cast<int>((esp_timer_get_time() - started_us) / 1000);
+    const int status = esp_http_client_get_status_code(client);
+    esp_camera_fb_return(fb);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 300) {
+        ESP_LOGW(kTag, "photo upload failed: err=%s status=%d elapsed=%dms response=%s",
+                 esp_err_to_name(err),
+                 status,
+                 elapsed_ms,
+                 response->data);
+        publish_event("photo_upload_failed", "camera", request_id, "bridge photo upload failed");
+        draw_face("error", 55);
+        return false;
+    }
+    ESP_LOGI(kTag, "photo upload done: status=%d elapsed=%dms response=%s", status, elapsed_ms, response->data);
+    publish_event("photo_upload_done", "camera", request_id, "bridge accepted photo");
+    return true;
+}
+
+void photo_capture_task(void* arg)
+{
+    auto* args = static_cast<PhotoTaskArgs*>(arg);
+    char request_id[64] = {};
+    char prompt[192] = {};
+    if (args) {
+        copy_cstr(request_id, sizeof(request_id), args->request_id);
+        copy_cstr(prompt, sizeof(prompt), args->prompt);
+        std::free(args);
+    }
+    capture_and_send_photo(request_id, prompt);
+    publish_status();
+    vTaskDelete(nullptr);
+}
+
+void camera_init_task(void*)
+{
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    init_camera();
+    publish_status();
+    vTaskDelete(nullptr);
 }
 
 void write_aligned_pcm16(WavPlaybackState& state, const uint8_t* data, int len)
@@ -4839,6 +5062,7 @@ extern "C" void app_main()
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
+    xTaskCreate(camera_init_task, "camera_init", 12288, nullptr, 2, nullptr);
 
     if (!init_wifi()) {
         return;

@@ -10,6 +10,7 @@ idf_component_register(
     REQUIRES
         driver
         esp_codec_dev
+        esp32-camera
         esp_driver_tsens
         esp_event
         esp_http_client

@@ -3360,6 +3360,34 @@ def convert_image_to_rgb565le(image_bytes: bytes) -> bytes:
     return bytes(out)
 
 
+def rgb565le_to_jpeg(image_bytes: bytes, width: int, height: int) -> bytes:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ConfigError("Pillow is required for camera RGB565 conversion. Install with: pip install -e .") from exc
+
+    width = clamp_int(width, 1, 640)
+    height = clamp_int(height, 1, 480)
+    expected = width * height * 2
+    if len(image_bytes) != expected:
+        raise ConfigError(f"rgb565 image has {len(image_bytes)} bytes, expected {expected}")
+    rgb = bytearray(width * height * 3)
+    j = 0
+    for i in range(0, len(image_bytes), 2):
+        value = image_bytes[i] | (image_bytes[i + 1] << 8)
+        r = ((value >> 11) & 0x1F) << 3
+        g = ((value >> 5) & 0x3F) << 2
+        b = (value & 0x1F) << 3
+        rgb[j] = r | (r >> 5)
+        rgb[j + 1] = g | (g >> 6)
+        rgb[j + 2] = b | (b >> 5)
+        j += 3
+    image = Image.frombytes("RGB", (width, height), bytes(rgb))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=88)
+    return out.getvalue()
+
+
 def prepare_stackchan_image(
     config: BridgeConfig,
     handler: http.server.BaseHTTPRequestHandler | None,
@@ -3509,8 +3537,26 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         image_bytes = self.rfile.read(length)
         content_type = self.headers.get_content_type() or "image/jpeg"
+        image_format = (self.headers.get("X-H2S-Image-Format") or self.headers.get("X-StackChan-Image-Format") or "").strip().lower()
+        if image_format == "rgb565":
+            width = parse_int(
+                self.headers.get("X-H2S-Image-Width") or self.headers.get("X-StackChan-Image-Width"),
+                320,
+                "X-H2S-Image-Width",
+            )
+            height = parse_int(
+                self.headers.get("X-H2S-Image-Height") or self.headers.get("X-StackChan-Image-Height"),
+                240,
+                "X-H2S-Image-Height",
+            )
+            image_bytes = rgb565le_to_jpeg(image_bytes, width, height)
+            content_type = "image/jpeg"
+        elif image_format in {"jpeg", "jpg"}:
+            content_type = "image/jpeg"
+        elif image_format == "png":
+            content_type = "image/png"
         if not content_type.startswith("image/"):
-            self.send_json(415, {"ok": False, "error": "expected image content type", "request_id": request_id})
+            self.send_json(415, {"ok": False, "error": "expected image content type or X-H2S-Image-Format", "request_id": request_id})
             return
 
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)

@@ -125,7 +125,7 @@ Expected success:
 
 ## Camera Photo Endpoint
 
-The bridge side is ready for camera uploads:
+The bridge accepts direct camera uploads:
 
 ```bash
 curl -fsS -X POST 'http://127.0.0.1:8788/stackchan/photo?prompt=Was%20siehst%20du%3F' \
@@ -134,9 +134,23 @@ curl -fsS -X POST 'http://127.0.0.1:8788/stackchan/photo?prompt=Was%20siehst%20d
 ```
 
 The bridge sends the image to Hermes vision/chat, creates TTS for the reply, and
-publishes display/audio actions back to StackChan. Current firmware may still
-report `camera_available:false`; in that case `system take_photo` is rejected by
-the firmware until the actual camera driver is wired.
+publishes display/audio actions back to StackChan.
+
+For the onboard StackChan camera, use the MQTT system action instead of uploading
+manually:
+
+```json
+{
+  "action": "system",
+  "system_action": "take_photo",
+  "prompt": "Beschreibe kurz auf Deutsch, was du siehst.",
+  "request_id": "photo-001"
+}
+```
+
+Firmware captures QVGA RGB565, posts it to `/stackchan/photo`, the bridge
+converts it for Hermes vision and also sends a short preview to the display.
+Only ask for this when the retained status says `camera_available:true`.
 
 ## Why Text-Only Happens
 

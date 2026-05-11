@@ -63,7 +63,7 @@ Content-Type: application/json
 }
 ```
 
-StackChan camera uploads, once camera hardware is available in firmware, use:
+StackChan camera uploads use:
 
 ```http
 POST http://127.0.0.1:8788/stackchan/photo
@@ -71,9 +71,19 @@ Content-Type: image/jpeg
 ```
 
 The bridge sends the uploaded photo to Hermes vision/chat, then returns Hermes'
-answer through the same display/TTS/audio path as speech. The current firmware
-advertises `camera_available:false` and rejects `take_photo` until a camera
-driver is wired.
+answer through the same display/TTS/audio path as speech. Firmware can also
+capture directly from the onboard camera by sending a system command:
+
+```json
+{
+  "action": "system",
+  "system_action": "take_photo",
+  "prompt": "Beschreibe kurz auf Deutsch, was du siehst.",
+  "request_id": "photo-001"
+}
+```
+
+Only request a photo when status reports `camera_available:true`.
 
 ### display
 
