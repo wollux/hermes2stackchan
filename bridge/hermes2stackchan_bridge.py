@@ -1871,8 +1871,8 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
             if recording_active:
                 recording_active = False
                 schedule_off(event_received_ms, event)
-        elif event == "touch_up" and not recording_active and not recording_seen:
-            schedule_off(event_received_ms, event)
+        elif event == "touch_up" and args.verbose:
+            print("[bridge] fast-touch touch_up ignored; waiting for recording_stopped", flush=True)
 
     client.on_message = on_message
     connect_and_start(client, config.mqtt)

@@ -153,7 +153,7 @@ For a quick head-touch hardware test, run the bridge touch lamp watcher:
 scripts/h2s_bridge.sh watch-touch-lamp --pair desk
 ```
 
-StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. A touch turns the LEDs solid green immediately. They stay green while recording is active and turn off about 500 ms after `recording_stopped` or a retained status update reports `recording:false`. If no recording ever starts, releasing touch is used as a fallback so the LEDs cannot get stuck forever. This is intentionally bridge-driven so the MQTT event path is visible. The watcher logs the bridge-side publish timing in verbose mode.
+StackChan publishes `touch_down` and `touch_up` events from the SI12T head-touch sensor. A touch turns the LEDs solid green immediately. Releasing touch does not turn the LEDs off. They stay green while recording is active and turn off about 500 ms after `recording_stopped` or a retained status update reports `recording:false` after an active recording. This is intentionally bridge-driven so the MQTT event path is visible. The watcher logs the bridge-side publish timing in verbose mode.
 
 To watch both bridge and firmware logs during a touch test:
 
