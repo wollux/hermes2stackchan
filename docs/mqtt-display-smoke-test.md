@@ -244,4 +244,6 @@ idf.py -p /dev/cu.usbmodem21301 flash monitor
 3. StackChan publishes retained status.
 4. The bridge sends a `cmd/display` message.
 5. StackChan shows the text and publishes an ACK with the same `request_id`.
-6. Hardware commands publish ACK/Error and the retained `status` reflects the new state, including `battery_pct`, `battery_charging`, `battery_discharging`, `temperature.soc_c`, `temperature.servo_yaw_c`, and `temperature.servo_pitch_c`.
+6. Hardware commands publish ACK/Error and the retained `status` reflects the new state, including `battery_pct`, `battery_charging`, `battery_discharging`, `temperature.soc_c`, `temperature.servo_yaw_c`, `temperature.servo_pitch_c`, `interaction`, and `sensors`.
+
+The firmware publishes an `interaction` event when the BMI270 IMU detects real device movement or the LTR553 proximity sensor sees something close in front of StackChan. These events reset the bridge idle-sleep timer and wake a sleeping display. Internal head-servo motion is ignored for IMU interaction detection so idle animations do not keep waking the device by themselves.

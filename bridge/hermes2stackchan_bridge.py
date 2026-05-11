@@ -714,6 +714,25 @@ REQUIRED_STATUS_PATHS = (
     "audio.recording_min_ms",
     "audio.recording_silence_timeout_ms",
     "audio.recording_max_ms",
+    "interaction.active",
+    "interaction.last_source",
+    "interaction.last_ms",
+    "sensors.imu.ready",
+    "sensors.imu.accel_mg.x",
+    "sensors.imu.accel_mg.y",
+    "sensors.imu.accel_mg.z",
+    "sensors.imu.gyro_dps.x",
+    "sensors.imu.gyro_dps.y",
+    "sensors.imu.gyro_dps.z",
+    "sensors.imu.motion_score_pct",
+    "sensors.imu.motion_active",
+    "sensors.ltr553.ready",
+    "sensors.ltr553.proximity_raw",
+    "sensors.ltr553.ambient_raw",
+    "sensors.ltr553.proximity_baseline",
+    "sensors.ltr553.proximity_delta",
+    "sensors.ltr553.near",
+    "sensors.ltr553.light_changed",
 )
 
 
@@ -1749,6 +1768,7 @@ def status_allows_life_animation(status: dict[str, Any] | None) -> bool:
 
 
 HUMAN_ACTIVITY_EVENTS = {
+    "interaction",
     "touch_down",
     "touch_up",
     "wakeword_detected",

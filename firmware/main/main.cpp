@@ -39,6 +39,7 @@
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "es7210_adc.h"
+#include "drivers/bmi270/bmi270.h"
 #include "SCSCL.h"
 
 namespace {
@@ -53,6 +54,8 @@ constexpr uint8_t kPmicAddr = 0x34;
 constexpr uint8_t kAw9523Addr = 0x58;
 constexpr uint8_t kPy32Addr = 0x6F;
 constexpr uint8_t kHeadTouchAddr = 0x68;
+constexpr uint8_t kBmi270Addr = 0x69;
+constexpr uint8_t kLtr553Addr = 0x23;
 constexpr uint8_t kAw88298Addr = AW88298_CODEC_DEFAULT_ADDR;
 constexpr uint8_t kEs7210Addr = ES7210_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
@@ -74,6 +77,11 @@ constexpr int kVoiceMinSpeechMs = 250;
 constexpr int kVoiceSilenceAvgThreshold = 260;
 constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
+constexpr int kInteractionPollIntervalMs = 100;
+constexpr int kInteractionEventCooldownMs = 1500;
+constexpr int kImuIgnoreAfterHeadMotionMs = 1400;
+constexpr int kLtr553NearRawThreshold = 500;
+constexpr int kLtr553NearDeltaThreshold = 180;
 constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
@@ -120,6 +128,25 @@ bool g_temperature_sensor_ready = false;
 volatile int g_temperature_soc_c = -1;
 volatile int g_temperature_servo_yaw_c = -1;
 volatile int g_temperature_servo_pitch_c = -1;
+volatile bool g_imu_ready = false;
+volatile int g_imu_accel_x_mg = 0;
+volatile int g_imu_accel_y_mg = 0;
+volatile int g_imu_accel_z_mg = 0;
+volatile int g_imu_gyro_x_dps = 0;
+volatile int g_imu_gyro_y_dps = 0;
+volatile int g_imu_gyro_z_dps = 0;
+volatile int g_imu_motion_score_pct = 0;
+volatile bool g_imu_motion_active = false;
+volatile bool g_ltr553_ready = false;
+volatile int g_ltr553_proximity_raw = -1;
+volatile int g_ltr553_ambient_raw = -1;
+volatile int g_ltr553_proximity_baseline = -1;
+volatile int g_ltr553_proximity_delta = 0;
+volatile bool g_ltr553_near = false;
+volatile bool g_ltr553_light_changed = false;
+volatile bool g_interaction_active = false;
+volatile int64_t g_last_interaction_ms = 0;
+char g_last_interaction_source[24] = "none";
 volatile int g_battery_pct = -1;
 volatile bool g_battery_charging = false;
 volatile bool g_battery_discharging = false;
@@ -140,6 +167,8 @@ volatile int g_pending_yaw_delta = 0;
 volatile int g_pending_pitch_delta = 0;
 volatile int g_pending_yaw_target_pct = 101;
 volatile int g_pending_pitch_target_pct = 101;
+volatile bool g_head_motion_active = false;
+volatile int64_t g_last_head_motion_ms = 0;
 volatile bool g_sleep_pose_saved = false;
 volatile int g_pre_sleep_yaw_pct = kDefaultIdleYawPct;
 volatile int g_pre_sleep_pitch_pct = kDefaultIdlePitchPct;
@@ -436,6 +465,91 @@ std::unique_ptr<I2cDevice> g_pmic;
 std::unique_ptr<I2cDevice> g_py32;
 std::unique_ptr<I2cDevice> g_head_touch;
 std::unique_ptr<I2cDevice> g_display_touch;
+std::unique_ptr<I2cDevice> g_ltr553;
+std::unique_ptr<BMI270> g_bmi270;
+
+bool init_ltr553()
+{
+    if (!g_i2c_bus) {
+        return false;
+    }
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, kLtr553Addr, 200);
+    if (probe != ESP_OK) {
+        ESP_LOGW(kTag, "LTR553 proximity/light sensor not found at 0x%02x: %s",
+                 kLtr553Addr, esp_err_to_name(probe));
+        g_ltr553_ready = false;
+        return false;
+    }
+
+    g_ltr553 = std::make_unique<I2cDevice>(g_i2c_bus, kLtr553Addr, 400 * 1000);
+    I2cDevice& dev = *g_ltr553;
+
+    bool ok = true;
+    ok = (dev.try_write_reg(0x81, 0x00) == ESP_OK) && ok;  // PS standby during setup
+    ok = (dev.try_write_reg(0x80, 0x00) == ESP_OK) && ok;  // ALS standby during setup
+    ok = (dev.try_write_reg(0x82, 0x7B) == ESP_OK) && ok;  // LED: moderate current, 40 kHz pulse
+    ok = (dev.try_write_reg(0x83, 0x04) == ESP_OK) && ok;  // four PS pulses
+    ok = (dev.try_write_reg(0x84, 0x02) == ESP_OK) && ok;  // PS measurement around 50 ms
+    ok = (dev.try_write_reg(0x85, 0x03) == ESP_OK) && ok;  // ALS measurement around 100 ms
+    ok = (dev.try_write_reg(0x80, 0x19) == ESP_OK) && ok;  // ALS active, high gain
+    ok = (dev.try_write_reg(0x81, 0x03) == ESP_OK) && ok;  // PS active
+
+    uint8_t part_id = 0;
+    uint8_t manufacturer_id = 0;
+    dev.try_read_reg(0x86, part_id);
+    dev.try_read_reg(0x87, manufacturer_id);
+    g_ltr553_ready = ok;
+    ESP_LOGI(kTag, "LTR553 %s part=0x%02x manufacturer=0x%02x",
+             ok ? "ready" : "setup failed", part_id, manufacturer_id);
+    return ok;
+}
+
+bool read_ltr553(uint16_t& proximity, uint16_t& ambient)
+{
+    proximity = 0;
+    ambient = 0;
+    if (!g_ltr553_ready || !g_ltr553) {
+        return false;
+    }
+
+    uint8_t ps[2] = {};
+    uint8_t als[4] = {};
+    if (g_ltr553->try_read(0x8D, ps, sizeof(ps)) != ESP_OK ||
+        g_ltr553->try_read(0x88, als, sizeof(als)) != ESP_OK) {
+        return false;
+    }
+
+    proximity = static_cast<uint16_t>(ps[0] | ((ps[1] & 0x07) << 8));
+    const uint16_t als_ch1 = static_cast<uint16_t>(als[0] | (als[1] << 8));
+    const uint16_t als_ch0 = static_cast<uint16_t>(als[2] | (als[3] << 8));
+    ambient = std::max(als_ch0, als_ch1);
+    return true;
+}
+
+bool init_imu()
+{
+    if (!g_i2c_bus) {
+        return false;
+    }
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, kBmi270Addr, 200);
+    if (probe != ESP_OK) {
+        ESP_LOGW(kTag, "BMI270 IMU not found at 0x%02x: %s",
+                 kBmi270Addr, esp_err_to_name(probe));
+        g_imu_ready = false;
+        return false;
+    }
+
+    g_bmi270 = std::make_unique<BMI270>(g_i2c_bus, kBmi270Addr);
+    if (!g_bmi270->begin()) {
+        ESP_LOGW(kTag, "BMI270 init failed");
+        g_bmi270.reset();
+        g_imu_ready = false;
+        return false;
+    }
+    g_imu_ready = true;
+    ESP_LOGI(kTag, "BMI270 IMU ready");
+    return true;
+}
 
 bool init_head_touch()
 {
@@ -813,6 +927,8 @@ void init_power_and_reset_panel()
 
     init_head_touch();
     init_display_touch();
+    init_ltr553();
+    init_imu();
     init_robot_body_power();
 }
 
@@ -2910,7 +3026,7 @@ void publish_status()
     update_soc_temperature();
     update_battery_status();
 
-    char payload[2300] = {};
+    char payload[3600] = {};
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
@@ -2929,6 +3045,14 @@ void publish_status()
                   "\"voice_active\":%s,\"voice_level_pct\":%d,\"voice_avg_level\":%d,\"voice_peak_level\":%d},"
                   "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
                   "\"pressed\":%s,\"raw\":%d,\"x\":%d,\"y\":%d},"
+                  "\"interaction\":{\"active\":%s,\"last_source\":\"%s\",\"last_ms\":%lld},"
+                  "\"sensors\":{\"imu\":{\"ready\":%s,"
+                  "\"accel_mg\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"gyro_dps\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"motion_score_pct\":%d,\"motion_active\":%s},"
+                  "\"ltr553\":{\"ready\":%s,\"proximity_raw\":%d,\"ambient_raw\":%d,"
+                  "\"proximity_baseline\":%d,\"proximity_delta\":%d,"
+                  "\"near\":%s,\"light_changed\":%s}},"
                   "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
                   "\"led\":{\"mode\":\"%s\",\"mode_id\":%d,\"r\":%d,\"g\":%d,\"b\":%d,\"ready\":%s},"
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
@@ -2982,6 +3106,25 @@ void publish_status()
                   static_cast<int>(g_touch_raw),
                   static_cast<int>(g_touch_x),
                   static_cast<int>(g_touch_y),
+                  g_interaction_active ? "true" : "false",
+                  g_last_interaction_source,
+                  static_cast<long long>(g_last_interaction_ms),
+                  g_imu_ready ? "true" : "false",
+                  static_cast<int>(g_imu_accel_x_mg),
+                  static_cast<int>(g_imu_accel_y_mg),
+                  static_cast<int>(g_imu_accel_z_mg),
+                  static_cast<int>(g_imu_gyro_x_dps),
+                  static_cast<int>(g_imu_gyro_y_dps),
+                  static_cast<int>(g_imu_gyro_z_dps),
+                  static_cast<int>(g_imu_motion_score_pct),
+                  g_imu_motion_active ? "true" : "false",
+                  g_ltr553_ready ? "true" : "false",
+                  static_cast<int>(g_ltr553_proximity_raw),
+                  static_cast<int>(g_ltr553_ambient_raw),
+                  static_cast<int>(g_ltr553_proximity_baseline),
+                  static_cast<int>(g_ltr553_proximity_delta),
+                  g_ltr553_near ? "true" : "false",
+                  g_ltr553_light_changed ? "true" : "false",
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
@@ -3112,6 +3255,145 @@ void copy_cstr(char* destination, size_t destination_len, const char* source)
     source = source ? source : "";
     std::strncpy(destination, source, destination_len - 1);
     destination[destination_len - 1] = '\0';
+}
+
+void mark_sensor_interaction(const char* source, const char* message)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms - g_last_interaction_ms < kInteractionEventCooldownMs) {
+        g_interaction_active = true;
+        return;
+    }
+
+    copy_cstr(g_last_interaction_source, sizeof(g_last_interaction_source), source);
+    g_last_interaction_ms = now_ms;
+    g_interaction_active = true;
+    ESP_LOGI(kTag, "interaction detected source=%s message=%s",
+             source ? source : "sensor",
+             message ? message : "");
+
+    if (g_display_sleeping) {
+        ESP_LOGI(kTag, "sensor interaction wakes display");
+        set_lcd_sleep(false);
+    }
+
+    publish_event("interaction", source, "", message);
+    publish_status();
+}
+
+void update_ltr553_interaction(bool& previous_near, int& previous_ambient)
+{
+    uint16_t proximity = 0;
+    uint16_t ambient = 0;
+    bool near = false;
+    bool light_changed = false;
+
+    if (read_ltr553(proximity, ambient)) {
+        const int ps = static_cast<int>(proximity);
+        const int als = static_cast<int>(ambient);
+        g_ltr553_proximity_raw = ps;
+        g_ltr553_ambient_raw = als;
+
+        int baseline = static_cast<int>(g_ltr553_proximity_baseline);
+        if (baseline < 0) {
+            baseline = ps;
+        }
+        const int delta = std::max(0, ps - baseline);
+        near = ps >= kLtr553NearRawThreshold || delta >= kLtr553NearDeltaThreshold;
+        if (!near) {
+            baseline = (baseline * 31 + ps) / 32;
+        }
+        g_ltr553_proximity_baseline = baseline;
+        g_ltr553_proximity_delta = delta;
+        g_ltr553_near = near;
+
+        if (previous_ambient >= 0) {
+            const int ambient_delta = std::abs(als - previous_ambient);
+            light_changed = ambient_delta > std::max(100, previous_ambient / 6);
+        }
+        previous_ambient = als;
+        g_ltr553_light_changed = light_changed;
+
+        if (near && !previous_near) {
+            mark_sensor_interaction("proximity", "object near LTR553");
+        }
+        previous_near = near;
+    } else {
+        g_ltr553_near = false;
+        g_ltr553_light_changed = false;
+        previous_near = false;
+    }
+}
+
+void update_imu_interaction(bool& previous_motion, bool& has_previous,
+                            float& previous_ax, float& previous_ay, float& previous_az)
+{
+    bool motion = false;
+    int motion_score = 0;
+
+    if (g_imu_ready && g_bmi270 && g_bmi270->update()) {
+        const BMI270_Data& data = g_bmi270->getData();
+        g_imu_accel_x_mg = static_cast<int>(std::round(data.accel_x * 1000.0f / 9.80665f));
+        g_imu_accel_y_mg = static_cast<int>(std::round(data.accel_y * 1000.0f / 9.80665f));
+        g_imu_accel_z_mg = static_cast<int>(std::round(data.accel_z * 1000.0f / 9.80665f));
+        g_imu_gyro_x_dps = static_cast<int>(std::round(data.gyro_x));
+        g_imu_gyro_y_dps = static_cast<int>(std::round(data.gyro_y));
+        g_imu_gyro_z_dps = static_cast<int>(std::round(data.gyro_z));
+
+        if (has_previous) {
+            const float acc_diff = std::fabs(data.accel_x - previous_ax) +
+                                   std::fabs(data.accel_y - previous_ay) +
+                                   std::fabs(data.accel_z - previous_az);
+            const float gyro_abs = std::max({std::fabs(data.gyro_x),
+                                             std::fabs(data.gyro_y),
+                                             std::fabs(data.gyro_z)});
+            motion_score = clamp_int(static_cast<int>(std::round(acc_diff * 7.0f + gyro_abs * 0.55f)), 0, 100);
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            const bool own_head_motion = g_head_motion_active ||
+                                         (now_ms - g_last_head_motion_ms) < kImuIgnoreAfterHeadMotionMs;
+            motion = !own_head_motion && (acc_diff >= 2.4f || gyro_abs >= 65.0f);
+        }
+
+        previous_ax = data.accel_x;
+        previous_ay = data.accel_y;
+        previous_az = data.accel_z;
+        has_previous = true;
+    } else {
+        has_previous = false;
+    }
+
+    g_imu_motion_score_pct = motion_score;
+    g_imu_motion_active = motion;
+    if (motion && !previous_motion) {
+        mark_sensor_interaction("imu", "stackchan moved");
+    }
+    previous_motion = motion;
+}
+
+void sensor_interaction_task(void*)
+{
+    bool previous_near = false;
+    bool previous_imu_motion = false;
+    bool has_previous_imu = false;
+    float previous_ax = 0.0f;
+    float previous_ay = 0.0f;
+    float previous_az = 0.0f;
+    int previous_ambient = -1;
+    bool previous_combined = false;
+
+    while (true) {
+        update_ltr553_interaction(previous_near, previous_ambient);
+        update_imu_interaction(previous_imu_motion, has_previous_imu,
+                               previous_ax, previous_ay, previous_az);
+
+        const bool combined = g_ltr553_near || g_imu_motion_active || g_touch_pressed;
+        g_interaction_active = combined;
+        if (combined != previous_combined) {
+            publish_status();
+            previous_combined = combined;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kInteractionPollIntervalMs));
+    }
 }
 
 void append_ascii_text(char* destination, size_t destination_len, size_t& offset, const char* text)
@@ -5152,7 +5434,10 @@ void hardware_servo_task(void*)
         g_servo_bus.EnableTorque(yaw.id, 1);
         g_servo_bus.EnableTorque(pitch.id, 1);
         if (has_motion) {
+            g_head_motion_active = true;
             execute_motion_command(yaw, pitch, yaw_pos, pitch_pos, motion);
+            g_head_motion_active = false;
+            g_last_head_motion_ms = esp_timer_get_time() / 1000;
             update_servo_temperatures(yaw, pitch);
             g_servo_bus.EnableTorque(yaw.id, 0);
             g_servo_bus.EnableTorque(pitch.id, 0);
@@ -5163,7 +5448,10 @@ void hardware_servo_task(void*)
         const int yaw_target = has_yaw_target ? target_pct_to_raw_position(yaw, yaw_target_pct) : yaw_pos + yaw_delta;
         const int pitch_target = has_pitch_target ? target_pct_to_raw_position(pitch, pitch_target_pct) : pitch_pos + pitch_delta;
         ESP_LOGI(kTag, "servo target raw yaw=%d pitch=%d", yaw_target, pitch_target);
+        g_head_motion_active = true;
         move_axes_toward(yaw, pitch, yaw_pos, pitch_pos, yaw_target, pitch_target);
+        g_head_motion_active = false;
+        g_last_head_motion_ms = esp_timer_get_time() / 1000;
         update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
         update_servo_temperatures(yaw, pitch);
         g_servo_bus.EnableTorque(yaw.id, 0);
@@ -5361,6 +5649,7 @@ extern "C" void app_main()
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
+    xTaskCreate(sensor_interaction_task, "interaction", 6144, nullptr, 2, nullptr);
     xTaskCreate(camera_init_task, "camera_init", 12288, nullptr, 2, nullptr);
 
     if (!init_wifi()) {

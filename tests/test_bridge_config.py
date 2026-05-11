@@ -593,6 +593,25 @@ class BridgeConfigTests(unittest.TestCase):
             "led": {"mode": "off", "mode_id": 0, "r": 0, "g": 0, "b": 0, "ready": True},
             "speaker": {"ready": True, "volume_pct": 80},
             "temperature": {"soc_c": 40, "servo_yaw_c": -1, "servo_pitch_c": -1},
+            "interaction": {"active": False, "last_source": "none", "last_ms": 0},
+            "sensors": {
+                "imu": {
+                    "ready": True,
+                    "accel_mg": {"x": 0, "y": 0, "z": 1000},
+                    "gyro_dps": {"x": 0, "y": 0, "z": 0},
+                    "motion_score_pct": 0,
+                    "motion_active": False,
+                },
+                "ltr553": {
+                    "ready": True,
+                    "proximity_raw": 0,
+                    "ambient_raw": 100,
+                    "proximity_baseline": 0,
+                    "proximity_delta": 0,
+                    "near": False,
+                    "light_changed": False,
+                },
+            },
             "audio": {
                 "input_ready": False,
                 "wakeword_enabled": True,

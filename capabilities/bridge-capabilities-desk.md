@@ -386,7 +386,7 @@ AXP2101 PMIC to turn StackChan off after any voice reply has finished.
 
 ## Status
 
-StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, temperatures, `firmware`, and `firmware_version`.
+StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, interaction state, BMI270 IMU motion, LTR553 proximity/ambient light, temperatures, `firmware`, and `firmware_version`.
 
 Battery fields:
 
