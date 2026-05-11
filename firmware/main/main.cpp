@@ -72,6 +72,8 @@ constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
+constexpr uint32_t kMqttTaskStackBytes = 8192;
+constexpr uint32_t kUiTaskStackBytes = 12288;
 constexpr gpio_num_t kAudioMclk = GPIO_NUM_0;
 constexpr gpio_num_t kAudioBclk = GPIO_NUM_34;
 constexpr gpio_num_t kAudioWs = GPIO_NUM_33;
@@ -3033,6 +3035,10 @@ void handle_display_command(const char* data, int len)
     copy_display_text(command.text, sizeof(command.text), text);
     copy_cstr(command.emotion, sizeof(command.emotion), "neutral");
     command.intensity_pct = g_face_intensity_pct;
+    ESP_LOGI(kTag, "display command queued: bytes=%d duration=%d request_id=%s",
+             static_cast<int>(std::strlen(command.text)),
+             command.duration_ms,
+             request_id && *request_id ? request_id : "");
     if (!enqueue_ui_command(command)) {
         publish_error(request_id, "display", "ui queue full");
         cJSON_Delete(root);
@@ -3296,6 +3302,11 @@ void handle_say_command(const char* data, int len)
     command.beep = json_bool(root, "beep", true);
     copy_display_text(command.text, sizeof(command.text), text);
     copy_cstr(command.emotion, sizeof(command.emotion), emotion);
+    ESP_LOGI(kTag, "say command queued: bytes=%d duration=%d beep=%s request_id=%s",
+             static_cast<int>(std::strlen(command.text)),
+             command.duration_ms,
+             command.beep ? "true" : "false",
+             request_id && *request_id ? request_id : "");
     if (!enqueue_ui_command(command)) {
         publish_error(request_id, "say", "ui queue full");
         cJSON_Delete(root);
@@ -3792,7 +3803,7 @@ void sound_task(void*)
 
 void ui_task(void*)
 {
-    UiCommand command = {};
+    static UiCommand command = {};
     while (true) {
         if (xQueueReceive(g_ui_queue, &command, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -4584,6 +4595,7 @@ bool init_mqtt()
 
     esp_mqtt_client_config_t config = {};
     config.broker.address.uri = CONFIG_STACKCHAN_MQTT_URI;
+    config.task.stack_size = kMqttTaskStackBytes;
     g_mqtt_client = esp_mqtt_client_init(&config);
     ESP_ERROR_CHECK(esp_mqtt_client_register_event(g_mqtt_client, MQTT_EVENT_ANY,
                                                    mqtt_event_handler, nullptr));
@@ -4633,7 +4645,7 @@ void init_nvs()
 
 extern "C" void app_main()
 {
-    ESP_LOGI(kTag, "starting MQTT hardware firmware");
+    ESP_LOGI(kTag, "starting MQTT hardware firmware reset_reason=%d", static_cast<int>(esp_reset_reason()));
     build_topics();
     init_nvs();
     load_device_settings();
@@ -4651,7 +4663,7 @@ extern "C" void app_main()
         xTaskCreate(sound_task, "sound", 4096, nullptr, 3, nullptr);
     }
     if (g_ui_queue) {
-        xTaskCreate(ui_task, "ui", 6144, nullptr, 3, nullptr);
+        xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
