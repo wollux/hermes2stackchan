@@ -28,6 +28,7 @@ from bridge.hermes2stackchan_bridge import (
     build_power_followup_actions,
     build_reminder,
     build_touch_lamp_payload,
+    command_requests_display_sleep,
     direct_system_command_from_transcript,
     due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
@@ -222,6 +223,9 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertFalse(request_id_counts_as_idle_activity("idle-sleep-123"))
         self.assertFalse(command_counts_as_idle_activity(pair, pair.face_topic, {"request_id": "life-123"}))
         self.assertFalse(command_counts_as_idle_activity(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
+        self.assertTrue(command_requests_display_sleep(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
+        self.assertTrue(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_sleep"}))
+        self.assertFalse(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_wake"}))
         self.assertTrue(command_counts_as_idle_activity(pair, pair.display_topic, {"text": "Hallo", "request_id": "notify-123"}))
         self.assertTrue(command_counts_as_idle_activity(pair, pair.system_topic, {"action": "display_wake", "request_id": "reminder-123"}))
 

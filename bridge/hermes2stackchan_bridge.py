@@ -1775,14 +1775,19 @@ def request_id_counts_as_idle_activity(request_id: str | None) -> bool:
     return not request_id.startswith(IDLE_SLEEP_IGNORED_REQUEST_PREFIXES)
 
 
+def command_requests_display_sleep(pair: PairConfig, topic: str, payload: dict[str, Any]) -> bool:
+    return (
+        (topic == pair.device_topic and payload.get("display_sleep") is True and not payload.get("display_wake"))
+        or (topic == pair.system_topic and payload.get("action") == "display_sleep")
+    )
+
+
 def command_counts_as_idle_activity(pair: PairConfig, topic: str, payload: dict[str, Any]) -> bool:
     if not topic.startswith(f"{pair.mqtt_prefix}/cmd/"):
         return False
     if not request_id_counts_as_idle_activity(optional_string(payload.get("request_id"))):
         return False
-    if topic == pair.device_topic and payload.get("display_sleep") is True and not payload.get("display_wake"):
-        return False
-    if topic == pair.system_topic and payload.get("action") == "display_sleep":
+    if command_requests_display_sleep(pair, topic, payload):
         return False
     return True
 
@@ -3342,6 +3347,12 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
                 if event in HUMAN_ACTIVITY_EVENTS:
                     display_sleeping = False
                     mark_activity(event)
+                return
+
+            if command_requests_display_sleep(pair, message.topic, payload):
+                display_sleeping = True
+                sleep_sent = True
+                pause_life_animation(pair.pair_id, 12.0, "display sleep command")
                 return
 
             if command_counts_as_idle_activity(pair, message.topic, payload):

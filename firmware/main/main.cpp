@@ -66,6 +66,8 @@ constexpr int kYawTargetMinPct = -100;
 constexpr int kYawTargetMaxPct = 100;
 constexpr int kPitchTargetMinPct = 0;
 constexpr int kPitchTargetMaxPct = 100;
+constexpr int kSleepHeadPitchPct = kPitchTargetMinPct;
+constexpr int kSleepHeadMoveDelayMs = 1900;
 constexpr int kVoiceStartGraceMs = 250;
 constexpr int kVoiceNoSpeechTimeoutMs = 5000;
 constexpr int kVoiceMinSpeechMs = 250;
@@ -138,6 +140,9 @@ volatile int g_pending_yaw_delta = 0;
 volatile int g_pending_pitch_delta = 0;
 volatile int g_pending_yaw_target_pct = 101;
 volatile int g_pending_pitch_target_pct = 101;
+volatile bool g_sleep_pose_saved = false;
+volatile int g_pre_sleep_yaw_pct = kDefaultIdleYawPct;
+volatile int g_pre_sleep_pitch_pct = kDefaultIdlePitchPct;
 char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
@@ -965,6 +970,7 @@ void draw_face_extras();
 void draw_tv_off_animation();
 void draw_tv_on_animation();
 void draw_face(const char* emotion, int intensity_pct);
+bool enqueue_motion_command(const MotionCommand& command);
 
 struct FrameGuard {
     bool active;
@@ -993,6 +999,53 @@ struct FaceFrameGuard {
     }
 };
 
+void queue_sleep_head_pose()
+{
+    if (!g_sleep_pose_saved) {
+        g_pre_sleep_yaw_pct = clamp_int(static_cast<int>(g_servo_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct);
+        g_pre_sleep_pitch_pct = clamp_int(static_cast<int>(g_servo_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct);
+        if (g_pre_sleep_pitch_pct <= kPitchTargetMinPct + 4) {
+            g_pre_sleep_pitch_pct = kDefaultIdlePitchPct;
+        }
+        g_sleep_pose_saved = true;
+    }
+
+    const int yaw_pct = clamp_int(static_cast<int>(g_servo_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct);
+    MotionCommand command = {};
+    command.curve = 1;
+    command.point_count = 2;
+    command.points[0] = {yaw_pct, clamp_int(static_cast<int>(g_servo_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct), 200, 18, 0};
+    command.points[1] = {yaw_pct, kSleepHeadPitchPct, 1200, 18, 0};
+    if (!enqueue_motion_command(command)) {
+        g_pending_pitch_target_pct = kSleepHeadPitchPct;
+    }
+}
+
+void queue_wake_head_pose_restore()
+{
+    if (!g_sleep_pose_saved) {
+        return;
+    }
+
+    const int yaw_pct = clamp_int(static_cast<int>(g_pre_sleep_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct);
+    const int pitch_pct = clamp_int(static_cast<int>(g_pre_sleep_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct);
+    g_sleep_pose_saved = false;
+
+    MotionCommand command = {};
+    command.curve = 1;
+    command.point_count = 2;
+    command.points[0] = {clamp_int(static_cast<int>(g_servo_yaw_pct), kYawTargetMinPct, kYawTargetMaxPct),
+                         clamp_int(static_cast<int>(g_servo_pitch_pct), kPitchTargetMinPct, kPitchTargetMaxPct),
+                         180,
+                         20,
+                         0};
+    command.points[1] = {yaw_pct, pitch_pct, 950, 22, 0};
+    if (!enqueue_motion_command(command)) {
+        g_pending_yaw_target_pct = yaw_pct;
+        g_pending_pitch_target_pct = pitch_pct;
+    }
+}
+
 void set_lcd_sleep(bool sleeping)
 {
     if (!g_panel || !g_panel_io) {
@@ -1003,6 +1056,9 @@ void set_lcd_sleep(bool sleeping)
     }
 
     if (sleeping) {
+        draw_face("sleep", 60);
+        queue_sleep_head_pose();
+        vTaskDelay(pdMS_TO_TICKS(kSleepHeadMoveDelayMs));
         draw_tv_off_animation();
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(g_panel_io, 0x28, nullptr, 0));
         vTaskDelay(pdMS_TO_TICKS(30));
@@ -1019,6 +1075,7 @@ void set_lcd_sleep(bool sleeping)
         g_display_sleeping = false;
         draw_tv_on_animation();
         draw_face(g_face_emotion, g_face_intensity_pct);
+        queue_wake_head_pose_restore();
     }
 }
 
@@ -1040,10 +1097,10 @@ void shutdown_stackchan()
 
     set_neon_range(0, 12, 0, 0, 0);
     show_neon_pixels();
-    set_servo_vm_power(false);
     draw_face("sad", 65);
     vTaskDelay(pdMS_TO_TICKS(450));
     set_lcd_sleep(true);
+    set_servo_vm_power(false);
 
     if (!g_pmic) {
         ESP_LOGW(kTag, "AXP2101 power off requested but PMIC is not available");
