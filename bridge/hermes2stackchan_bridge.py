@@ -1129,7 +1129,7 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             "url": url,
             "width": clamp_int(parse_int_value(action.get("width"), 320, "display_image.width"), 1, 320),
             "height": clamp_int(parse_int_value(action.get("height"), 240, "display_image.height"), 1, 240),
-            "format": optional_string(action.get("format")) or "rgb565le",
+            "format": optional_string(action.get("format")) or "jpeg",
             "duration_ms": parse_int_value(action.get("duration_ms"), 9000, "display_image.duration_ms"),
         }
         caption = optional_string(action.get("caption"))
@@ -3331,7 +3331,7 @@ def image_bytes_from_payload(payload: dict[str, Any], speech: SpeechConfig) -> t
     return data, content_type, source
 
 
-def convert_image_to_rgb565le(image_bytes: bytes) -> bytes:
+def convert_image_to_display_jpeg(image_bytes: bytes) -> bytes:
     try:
         from PIL import Image, ImageOps
     except ImportError as exc:
@@ -3347,17 +3347,9 @@ def convert_image_to_rgb565le(image_bytes: bytes) -> bytes:
             canvas.paste(image.convert("RGBA"), (x, y), image.convert("RGBA"))
         else:
             canvas.paste(image.convert("RGB"), (x, y))
-        pixels = canvas.tobytes()
-
-    out = bytearray(320 * 240 * 2)
-    j = 0
-    for i in range(0, len(pixels), 3):
-        r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out[j] = value & 0xFF
-        out[j + 1] = (value >> 8) & 0xFF
-        j += 2
-    return bytes(out)
+        out = io.BytesIO()
+        canvas.save(out, format="JPEG", quality=88, optimize=True)
+        return out.getvalue()
 
 
 def rgb565_to_jpeg(image_bytes: bytes, width: int, height: int) -> bytes:
@@ -3398,20 +3390,20 @@ def prepare_stackchan_image(
     image_id = f"{safe_asset_id(request_id)}-{hashlib.sha256(image_bytes).hexdigest()[:10]}"
     image_dir = image_dir_for(config.speech)
     raw_path = image_dir / f"{image_id}.source"
-    rgb_path = image_dir / f"{image_id}.rgb565"
+    display_path = image_dir / f"{image_id}.jpg"
     raw_path.write_bytes(image_bytes)
-    rgb_bytes = convert_image_to_rgb565le(image_bytes)
-    rgb_path.write_bytes(rgb_bytes)
+    display_bytes = convert_image_to_display_jpeg(image_bytes)
+    display_path.write_bytes(display_bytes)
     return {
         "id": image_id,
-        "path": str(rgb_path),
-        "url_path": f"/stackchan/images/{rgb_path.name}",
-        "url": f"{bridge_public_url_for_request(config, handler)}/stackchan/images/{rgb_path.name}",
+        "path": str(display_path),
+        "url_path": f"/stackchan/images/{display_path.name}",
+        "url": f"{bridge_public_url_for_request(config, handler)}/stackchan/images/{display_path.name}",
         "width": 320,
         "height": 240,
-        "format": "rgb565le",
-        "sha256": hashlib.sha256(rgb_bytes).hexdigest(),
-        "bytes": len(rgb_bytes),
+        "format": "jpeg",
+        "sha256": hashlib.sha256(display_bytes).hexdigest(),
+        "bytes": len(display_bytes),
     }
 
 
@@ -3740,7 +3732,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if path.startswith("/stackchan/images/") and path.endswith(".rgb565"):
+        if path.startswith("/stackchan/images/") and (path.endswith(".jpg") or path.endswith(".jpeg")):
             filename = Path(path).name
             image_path = image_dir_for(self.server.config.speech) / filename
             if not image_path.exists():
@@ -3748,11 +3740,11 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             body = image_path.read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-H2S-Image-Width", "320")
             self.send_header("X-H2S-Image-Height", "240")
-            self.send_header("X-H2S-Image-Format", "rgb565le")
+            self.send_header("X-H2S-Image-Format", "jpeg")
             self.send_header("Cache-Control", "public, max-age=86400")
             self.end_headers()
             self.wfile.write(body)

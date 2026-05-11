@@ -34,6 +34,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "jpeg_decoder.h"
 #include "model_path.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
@@ -71,6 +72,7 @@ constexpr int kVoiceMinSpeechMs = 250;
 constexpr int kVoiceSilenceAvgThreshold = 260;
 constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
+constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
 constexpr int kMaxTextPayloadBytes = 1600;
@@ -3048,11 +3050,11 @@ void handle_display_command(const char* data, int len)
     const char* mode = json_string(root, "mode");
     if (std::strcmp(mode, "image") == 0) {
         const char* url = json_string(root, "url");
-        const char* format = json_string(root, "format", "rgb565le");
+        const char* format = json_string(root, "format", "jpeg");
         const int width = clamp_int(json_int(root, "width", kWidth), 1, kWidth);
         const int height = clamp_int(json_int(root, "height", kHeight), 1, kHeight);
-        if (!url || !*url || std::strcmp(format, "rgb565le") != 0) {
-            publish_error(request_id, "display", "expected image url and format rgb565le");
+        if (!url || !*url || (std::strcmp(format, "jpeg") != 0 && std::strcmp(format, "jpg") != 0)) {
+            publish_error(request_id, "display", "expected image url and format jpeg");
             cJSON_Delete(root);
             return;
         }
@@ -3965,9 +3967,12 @@ esp_err_t image_http_event_handler(esp_http_client_event_t* evt)
     return ESP_OK;
 }
 
-bool download_rgb565_image(const char* url, uint8_t* target, int expected_bytes)
+bool download_binary_image(const char* url, uint8_t* target, int capacity, int* downloaded_len)
 {
-    if (!url || !*url || !target || expected_bytes <= 0) {
+    if (downloaded_len) {
+        *downloaded_len = 0;
+    }
+    if (!url || !*url || !target || capacity <= 0) {
         return false;
     }
     if (!wait_for_wifi(pdMS_TO_TICKS(5000))) {
@@ -3976,7 +3981,7 @@ bool download_rgb565_image(const char* url, uint8_t* target, int expected_bytes)
     }
     ImageDownloadState state = {};
     state.data = target;
-    state.capacity = expected_bytes;
+    state.capacity = capacity;
 
     esp_http_client_config_t config = {};
     config.url = url;
@@ -3998,9 +4003,12 @@ bool download_rgb565_image(const char* url, uint8_t* target, int expected_bytes)
              status,
              esp_err_to_name(err),
              state.len,
-             expected_bytes,
+             capacity,
              state.overflow ? "true" : "false");
-    return err == ESP_OK && status >= 200 && status < 300 && !state.overflow && state.len == expected_bytes;
+    if (downloaded_len) {
+        *downloaded_len = state.len;
+    }
+    return err == ESP_OK && status >= 200 && status < 300 && !state.overflow && state.len > 0;
 }
 
 void draw_image_from_url(const char* url, int width, int height, const char* caption, int duration_ms)
@@ -4011,41 +4019,92 @@ void draw_image_from_url(const char* url, int width, int height, const char* cap
 
     width = clamp_int(width, 1, kWidth);
     height = clamp_int(height, 1, kHeight);
-    const int expected_bytes = width * height * static_cast<int>(sizeof(uint16_t));
-    uint8_t* image = static_cast<uint8_t*>(heap_caps_malloc(expected_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!image) {
-        image = static_cast<uint8_t*>(heap_caps_malloc(expected_bytes, MALLOC_CAP_8BIT));
+    uint8_t* jpg = static_cast<uint8_t*>(heap_caps_malloc(kMaxDisplayJpegBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!jpg) {
+        jpg = static_cast<uint8_t*>(heap_caps_malloc(kMaxDisplayJpegBytes, MALLOC_CAP_8BIT));
     }
-    if (!image) {
-        ESP_LOGW(kTag, "image display failed: no memory for %d bytes", expected_bytes);
+    if (!jpg) {
+        ESP_LOGW(kTag, "image display failed: no memory for jpeg buffer");
         draw_wrapped_message("BILD", "SPEICHER FEHLT", rgb565(255, 50, 50));
         vTaskDelay(pdMS_TO_TICKS(1800));
         copy_ui_mode("face");
         return;
     }
 
-    const bool ok = download_rgb565_image(url, image, expected_bytes);
+    int jpg_len = 0;
+    const bool ok = download_binary_image(url, jpg, kMaxDisplayJpegBytes, &jpg_len);
     if (ok) {
-        bool locked = false;
-        if (g_display_mutex) {
-            locked = xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(250)) == pdTRUE;
+        esp_jpeg_image_cfg_t jpeg_cfg = {};
+        jpeg_cfg.indata = jpg;
+        jpeg_cfg.indata_size = static_cast<uint32_t>(jpg_len);
+        jpeg_cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
+        jpeg_cfg.out_scale = JPEG_IMAGE_SCALE_0;
+        jpeg_cfg.flags.swap_color_bytes = 1;
+
+        esp_jpeg_image_output_t info = {};
+        esp_err_t jpeg_err = esp_jpeg_get_image_info(&jpeg_cfg, &info);
+        if (jpeg_err != ESP_OK || info.output_len == 0 || info.width == 0 || info.height == 0) {
+            ESP_LOGW(kTag, "image jpeg info failed: %s", esp_err_to_name(jpeg_err));
+            draw_wrapped_message("BILD", "DECODE FEHLER", rgb565(255, 50, 50));
+            heap_caps_free(jpg);
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            copy_ui_mode("face");
+            return;
         }
-        const int x = (kWidth - width) / 2;
-        const int y = (kHeight - height) / 2;
-        draw_bitmap_dma(x, y, width, height, reinterpret_cast<const uint16_t*>(image));
-        if (g_display_mutex && locked) {
+
+        uint8_t* pixels = static_cast<uint8_t*>(heap_caps_malloc(info.output_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!pixels) {
+            pixels = static_cast<uint8_t*>(heap_caps_malloc(info.output_len, MALLOC_CAP_8BIT));
+        }
+        if (!pixels) {
+            ESP_LOGW(kTag, "image display failed: no decode buffer %u", static_cast<unsigned>(info.output_len));
+            draw_wrapped_message("BILD", "SPEICHER FEHLT", rgb565(255, 50, 50));
+            heap_caps_free(jpg);
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            copy_ui_mode("face");
+            return;
+        }
+
+        jpeg_cfg.outbuf = pixels;
+        jpeg_cfg.outbuf_size = static_cast<uint32_t>(info.output_len);
+        jpeg_cfg.priv.read = 0;
+        esp_jpeg_image_output_t decoded = {};
+        jpeg_err = esp_jpeg_decode(&jpeg_cfg, &decoded);
+        heap_caps_free(jpg);
+        if (jpeg_err != ESP_OK) {
+            ESP_LOGW(kTag, "image jpeg decode failed: %s", esp_err_to_name(jpeg_err));
+            draw_wrapped_message("BILD", "DECODE FEHLER", rgb565(255, 50, 50));
+            heap_caps_free(pixels);
+            vTaskDelay(pdMS_TO_TICKS(1800));
+            copy_ui_mode("face");
+            return;
+        }
+
+        const int draw_w = std::min<int>(decoded.width, width);
+        const int draw_h = std::min<int>(decoded.height, height);
+        const int x = (kWidth - draw_w) / 2;
+        const int y = (kHeight - draw_h) / 2;
+        if (g_display_mutex) {
+            xSemaphoreTake(g_display_mutex, pdMS_TO_TICKS(250));
+        }
+        if (draw_w < kWidth || draw_h < kHeight) {
+            clear(kBlack);
+        }
+        draw_bitmap_dma(x, y, draw_w, draw_h, reinterpret_cast<const uint16_t*>(pixels));
+        if (g_display_mutex) {
             xSemaphoreGive(g_display_mutex);
         }
         if (caption && *caption) {
             ESP_LOGI(kTag, "image caption: %s", caption);
         }
+        ESP_LOGI(kTag, "image jpeg shown: %ux%u bytes=%d", decoded.width, decoded.height, jpg_len);
+        heap_caps_free(pixels);
         vTaskDelay(pdMS_TO_TICKS(clamp_int(duration_ms, 500, 20000)));
     } else {
         draw_wrapped_message("BILD", "DOWNLOAD FEHLER", rgb565(255, 50, 50));
         vTaskDelay(pdMS_TO_TICKS(1800));
+        heap_caps_free(jpg);
     }
-
-    heap_caps_free(image);
     copy_ui_mode("face");
 }
 

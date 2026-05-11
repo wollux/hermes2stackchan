@@ -118,10 +118,10 @@ Accepted JSON fields:
 Expected success:
 
 - HTTP JSON contains `"ok": true`
-- JSON contains `image.url` under `/stackchan/images/...rgb565`
+- JSON contains `image.url` under `/stackchan/images/...jpg`
 - Bridge log contains `POST /stackchan/display-image`
 - Bridge publishes `cmd/display` with `mode:"image"`
-- StackChan fetches `/stackchan/images/...rgb565` and shows the image.
+- StackChan fetches `/stackchan/images/...jpg`, decodes JPEG locally, and shows the image.
 
 ## Camera Photo Endpoint
 
@@ -240,7 +240,7 @@ HTTP.
 Use these through Hermes JSON actions or through bridge helper commands:
 
 - `display`: show short text or UI state
-- `display_image`: show an image via bridge-converted RGB565 URL
+- `display_image`: show an image via bridge-hosted JPEG URL
 - `face`: set emotion/face, for example `neutral`, `happy`, `sad`, `question`,
   `speaking`, `sleep`, `battery`, `charging`, `blink`, `wink_left`,
   `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`,

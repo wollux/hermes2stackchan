@@ -178,7 +178,7 @@ class BridgeConfigTests(unittest.TestCase):
             config.pairs["desk"],
             {
                 "action": "display_image",
-                "url": "http://127.0.0.1:8788/stackchan/images/test.rgb565",
+                "url": "http://127.0.0.1:8788/stackchan/images/test.jpg",
                 "caption": "Kamera",
             },
             "img-1",
@@ -186,7 +186,7 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(topic, "hermes-stackchan/desk/cmd/display")
         self.assertEqual(payload["mode"], "image")
-        self.assertEqual(payload["format"], "rgb565le")
+        self.assertEqual(payload["format"], "jpeg")
         self.assertEqual(payload["width"], 320)
         self.assertEqual(payload["height"], 240)
         self.assertEqual(payload["request_id"], "img-1")

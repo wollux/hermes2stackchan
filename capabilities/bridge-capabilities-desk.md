@@ -107,10 +107,10 @@ Image display payload:
 {
   "schema_version": "1.0",
   "mode": "image",
-  "url": "http://127.0.0.1:8788/stackchan/images/example.rgb565",
+  "url": "http://127.0.0.1:8788/stackchan/images/example.jpg",
   "width": 320,
   "height": 240,
-  "format": "rgb565le",
+  "format": "jpeg",
   "duration_ms": 9000,
   "request_id": "image-001"
 }

@@ -42,7 +42,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Follow-up listening mode: when Hermes asks a real question, StackChan speaks first and then starts recording again.
 - Bridge image display endpoint: Hermes can send an image URL/base64/data URL and the bridge converts it for the StackChan display.
 - Bridge camera upload endpoint: StackChan photos can be posted to Hermes vision and answered through display/TTS/audio.
-- Physical StackChan camera capture: `system take_photo` captures QVGA RGB565, uploads it to the bridge, previews it on the display, sends it to Hermes vision, then speaks/displays the answer.
+- Physical StackChan camera capture: `system take_photo` captures QVGA RGB565, uploads it to the bridge, previews it as firmware-decoded JPEG on the display, sends it to Hermes vision, then speaks/displays the answer.
 - Debug cockpit script for bridge log plus serial monitor.
 - Raspberry Pi service installer for the unified bridge.
 
