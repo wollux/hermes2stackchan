@@ -47,6 +47,19 @@ EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
+SENSOR_PROXIMITY_ON_DELTA = 120
+SENSOR_PROXIMITY_OFF_DELTA = 65
+SENSOR_PROXIMITY_ON_RAW = 420
+SENSOR_PROXIMITY_OFF_RAW = 260
+SENSOR_PROXIMITY_STABLE_SAMPLES = 2
+SENSOR_PROXIMITY_CLEAR_SAMPLES = 3
+SENSOR_PROXIMITY_HEAD_DROP_PCT = 14
+SENSOR_SIDE_AXIS_MG = 650
+SENSOR_SIDE_STABLE_SAMPLES = 3
+SENSOR_SHAKE_SCORE_THRESHOLD = 55
+SENSOR_SHAKE_COOLDOWN_S = 4.0
+SENSOR_REACTION_COOLDOWN_S = 1.0
+SENSOR_WAKE_COOLDOWN_S = 2.0
 REMINDER_STORE_LOCK = RLock()
 LIFE_PAUSE_LOCK = RLock()
 LIFE_PAUSED_UNTIL: dict[str, float] = {}
@@ -180,6 +193,21 @@ class BridgeConfig:
     hermes: HermesConfig = field(default_factory=HermesConfig)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
     reminders: ReminderConfig = field(default_factory=ReminderConfig)
+
+
+@dataclass
+class SensorReactionState:
+    proximity_active: bool = False
+    proximity_seen_count: int = 0
+    proximity_clear_count: int = 0
+    proximity_restore_pitch_pct: int = DEFAULT_IDLE_PITCH_PCT
+    side_active: bool = False
+    side_seen_count: int = 0
+    upright_seen_count: int = 0
+    last_shake_at: float = -9999.0
+    last_side_at: float = -9999.0
+    last_proximity_at: float = -9999.0
+    last_wake_at: float = -9999.0
 
 
 LifeSequence = list[tuple[int, dict[str, Any]]]
@@ -1640,6 +1668,22 @@ def status_bool(value: Any) -> bool | None:
     return None
 
 
+def status_int_at(status: dict[str, Any] | None, path: str, default: int = 0) -> int:
+    if not isinstance(status, dict):
+        return default
+    value = nested_status_value(status, path)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(round(value))
+    if isinstance(value, str):
+        try:
+            return int(round(float(value.strip())))
+        except ValueError:
+            return default
+    return default
+
+
 def battery_snapshot(status: dict[str, Any]) -> dict[str, Any]:
     pct = status.get("battery_pct")
     if not isinstance(pct, int):
@@ -1818,6 +1862,137 @@ def status_is_busy(status: dict[str, Any]) -> bool:
         or status_bool(status.get("speaking")) is True
         or status_bool(nested_status_value(status, "audio.recording")) is True
     )
+
+
+def sensor_status_is_sideways(status: dict[str, Any]) -> bool:
+    ax = status_int_at(status, "sensors.imu.accel_mg.x")
+    return abs(ax) >= SENSOR_SIDE_AXIS_MG
+
+
+def build_sensor_reaction_actions(
+    status: dict[str, Any] | None,
+    state: SensorReactionState,
+    now_s: float | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if not isinstance(status, dict):
+        return [], []
+
+    now_s = time.monotonic() if now_s is None else now_s
+    actions: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    display_sleeping = status_bool(status.get("display_sleeping")) is True
+    busy = status_is_busy(status)
+
+    def maybe_wake(reason: str) -> None:
+        if display_sleeping and now_s - state.last_wake_at >= SENSOR_WAKE_COOLDOWN_S:
+            actions.append({"action": "system", "system_action": "display_wake"})
+            reasons.append(f"wake:{reason}")
+            state.last_wake_at = now_s
+
+    if busy:
+        return actions, reasons
+
+    proximity_ready = status_bool(nested_status_value(status, "sensors.ltr553.ready")) is True
+    proximity_delta = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
+    proximity_raw = status_int_at(status, "sensors.ltr553.proximity_raw", 0)
+    proximity_near = status_bool(nested_status_value(status, "sensors.ltr553.near")) is True
+    near_signal = proximity_ready and (
+        proximity_near
+        or proximity_delta >= SENSOR_PROXIMITY_ON_DELTA
+        or proximity_raw >= SENSOR_PROXIMITY_ON_RAW
+    )
+    clear_signal = (
+        not proximity_near
+        and proximity_delta <= SENSOR_PROXIMITY_OFF_DELTA
+        and proximity_raw <= SENSOR_PROXIMITY_OFF_RAW
+    )
+    if near_signal:
+        state.proximity_seen_count += 1
+        state.proximity_clear_count = 0
+    elif clear_signal:
+        state.proximity_clear_count += 1
+        state.proximity_seen_count = 0
+
+    if (
+        proximity_ready
+        and not state.proximity_active
+        and state.proximity_seen_count >= SENSOR_PROXIMITY_STABLE_SAMPLES
+        and now_s - state.last_proximity_at >= SENSOR_REACTION_COOLDOWN_S
+    ):
+        current_pitch = status_int_at(status, "head.tilt_pct", DEFAULT_IDLE_PITCH_PCT)
+        if current_pitch <= PITCH_TARGET_MIN_PCT + 4:
+            current_pitch = DEFAULT_IDLE_PITCH_PCT
+        state.proximity_restore_pitch_pct = clamp_int(current_pitch, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT)
+        target_pitch = clamp_int(
+            state.proximity_restore_pitch_pct - SENSOR_PROXIMITY_HEAD_DROP_PCT,
+            PITCH_TARGET_MIN_PCT,
+            PITCH_TARGET_MAX_PCT,
+        )
+        maybe_wake("proximity")
+        actions.extend([
+            {"action": "face", "emotion": "glance_down", "intensity_pct": 62},
+            {"action": "move", "pitch_target_pct": target_pitch},
+        ])
+        reasons.append("proximity_near")
+        state.proximity_active = True
+        state.last_proximity_at = now_s
+
+    if (
+        state.proximity_active
+        and state.proximity_clear_count >= SENSOR_PROXIMITY_CLEAR_SAMPLES
+        and now_s - state.last_proximity_at >= SENSOR_REACTION_COOLDOWN_S
+    ):
+        actions.append({"action": "move", "pitch_target_pct": state.proximity_restore_pitch_pct})
+        reasons.append("proximity_clear")
+        state.proximity_active = False
+        state.last_proximity_at = now_s
+
+    imu_ready = status_bool(nested_status_value(status, "sensors.imu.ready")) is True
+    motion_score = status_int_at(status, "sensors.imu.motion_score_pct", 0)
+    imu_motion = status_bool(nested_status_value(status, "sensors.imu.motion_active")) is True
+    if (
+        imu_ready
+        and imu_motion
+        and motion_score >= SENSOR_SHAKE_SCORE_THRESHOLD
+        and now_s - state.last_shake_at >= SENSOR_SHAKE_COOLDOWN_S
+    ):
+        maybe_wake("shake")
+        actions.append({"action": "face", "emotion": "surprise_pop", "intensity_pct": 88})
+        reasons.append("shake")
+        state.last_shake_at = now_s
+
+    sideways = imu_ready and sensor_status_is_sideways(status)
+    if sideways:
+        state.side_seen_count += 1
+        state.upright_seen_count = 0
+    else:
+        state.upright_seen_count += 1
+        state.side_seen_count = 0
+
+    if (
+        sideways
+        and not state.side_active
+        and state.side_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
+        and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
+    ):
+        maybe_wake("sideways")
+        actions.append({"action": "face", "emotion": "surprised", "intensity_pct": 78})
+        reasons.append("sideways")
+        state.side_active = True
+        state.last_side_at = now_s
+
+    if (
+        state.side_active
+        and not sideways
+        and state.upright_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
+        and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
+    ):
+        actions.append({"action": "face", "emotion": "neutral", "intensity_pct": 60})
+        reasons.append("upright")
+        state.side_active = False
+        state.last_side_at = now_s
+
+    return actions, reasons
 
 
 def build_idle_sleep_payload(request_id: str | None = None) -> dict[str, Any]:
@@ -3313,6 +3488,80 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         client.disconnect()
 
 
+def watch_sensors(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    state = SensorReactionState()
+    done = Event()
+    latest_status: dict[str, Any] | None = None
+
+    def publish_reactions(actions: list[dict[str, Any]], reasons: list[str]) -> None:
+        if not actions:
+            return
+        pause_life_animation(pair.pair_id, args.life_pause_s, f"sensor reaction {','.join(reasons)}")
+        messages = [
+            action_to_topic_payload(pair, action, f"sensor-{uuid.uuid4().hex[:10]}-{index:02d}")
+            for index, action in enumerate(actions, start=1)
+        ]
+        if args.verbose:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {actions}", flush=True)
+        publish_action_messages(client, messages, pair)
+        if args.once:
+            done.set()
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        nonlocal latest_status
+        try:
+            payload = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        if message.topic == pair.events_topic:
+            if payload.get("event") != "interaction":
+                return
+            source_value = payload.get("source")
+            source = source_value.strip() if isinstance(source_value, str) and source_value.strip() else "sensor"
+            if args.verbose:
+                print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor event: {json.dumps(payload, ensure_ascii=False)}", flush=True)
+            if isinstance(latest_status, dict) and status_bool(latest_status.get("display_sleeping")) is True:
+                now_s = time.monotonic()
+                if now_s - state.last_wake_at >= SENSOR_WAKE_COOLDOWN_S:
+                    state.last_wake_at = now_s
+                    publish_reactions(
+                        [{"action": "system", "system_action": "display_wake"}],
+                        [f"wake:{source}"],
+                    )
+            return
+
+        if message.topic != pair.status_topic:
+            return
+
+        latest_status = payload
+        actions, reasons = build_sensor_reaction_actions(payload, state)
+        publish_reactions(actions, reasons)
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe([(pair.status_topic, 0), (pair.events_topic, 0)])
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [bridge] sensor watcher active on {pair.status_topic}; "
+            "IMU shake/sideways + LTR553 proximity wake/reactions",
+            flush=True,
+        )
+        while not done.wait(0.25):
+            pass
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
 def watch_idle_sleep(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
@@ -4673,6 +4922,19 @@ def run_bridge(args: argparse.Namespace) -> int:
                 no_restore_face=args.power_no_restore_face,
             ),
         ))
+    if not args.no_sensors:
+        workers.append((
+            "sensor-watcher",
+            watch_sensors,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                verbose=args.sensor_verbose,
+                life_pause_s=args.sensor_life_pause_s,
+                once=False,
+            ),
+        ))
     if not args.no_reminders:
         workers.append((
             "reminders",
@@ -4929,6 +5191,13 @@ def build_parser() -> argparse.ArgumentParser:
     touch_lamp.add_argument("--off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     touch_lamp.set_defaults(func=watch_touch_lamp)
 
+    sensors = subcommands.add_parser("watch-sensors", help="React to IMU movement and LTR553 proximity with filtered wake/face/head actions.")
+    sensors.add_argument("--pair", default="desk", help="Pair id to watch.")
+    sensors.add_argument("--verbose", action="store_true", help="Log sensor events and generated actions.")
+    sensors.add_argument("--life-pause-s", type=float, default=5.0, help="Pause idle life animation after sensor reactions.")
+    sensors.add_argument("--once", action="store_true", help="Exit after the first emitted sensor reaction.")
+    sensors.set_defaults(func=watch_sensors)
+
     serve_audio_parser = subcommands.add_parser("serve-audio", help="Run HTTP audio endpoint and mirror STT text to StackChan display.")
     serve_audio_parser.add_argument("--pair", default="desk", help="Pair id to serve.")
     serve_audio_parser.add_argument("--host", default=os.environ.get("H2S_BRIDGE_HTTP_HOST", "0.0.0.0"), help="HTTP listen host.")
@@ -4996,6 +5265,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-audio", action="store_true", help="Disable the HTTP audio/STT/TTS worker.")
     run.add_argument("--no-touch-lamp", action="store_true", help="Disable the fast touch/recording LED worker.")
     run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
+    run.add_argument("--no-sensors", action="store_true", help="Disable IMU/LTR553 sensor reactions.")
     run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
     run.add_argument("--no-settings", action="store_true", help="Disable retained device settings restore worker.")
     run.add_argument("--no-idle-sleep", action="store_true", help="Disable automatic display sleep after quiet idle timeout.")
@@ -5005,6 +5275,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--power-debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
     run.add_argument("--power-announce-initial", action="store_true", help="Also show the current power state immediately.")
     run.add_argument("--power-no-restore-face", action="store_true", help="Do not run delayed face/motion reaction after battery overlay.")
+    run.add_argument("--sensor-verbose", action="store_true", help="Log IMU/LTR553 sensor reactions.")
+    run.add_argument("--sensor-life-pause-s", type=float, default=5.0, help="Pause idle life animation after sensor reactions.")
     run.add_argument("--reminder-poll-s", type=float, default=None, help="Reminder worker poll interval in seconds.")
     run.add_argument("--settings-timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
     run.add_argument("--settings-display-wake", action="store_true", help="Also wake display when restoring retained settings.")

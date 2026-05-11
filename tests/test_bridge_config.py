@@ -27,6 +27,7 @@ from bridge.hermes2stackchan_bridge import (
     build_power_change_actions,
     build_power_followup_actions,
     build_reminder,
+    build_sensor_reaction_actions,
     build_touch_lamp_payload,
     command_requests_display_sleep,
     direct_system_command_from_transcript,
@@ -59,6 +60,7 @@ from bridge.hermes2stackchan_bridge import (
     command_counts_as_idle_activity,
     request_id_counts_as_idle_activity,
     rgb565_to_jpeg,
+    SensorReactionState,
     status_allows_life_animation,
 )
 
@@ -655,6 +657,130 @@ class BridgeConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(payload, {"brightness_pct": 42, "volume_pct": 77, "display_wake": True})
+
+    def sensor_status(
+        self,
+        *,
+        display_sleeping: bool = False,
+        recording: bool = False,
+        speaking: bool = False,
+        tilt_pct: int = DEFAULT_IDLE_PITCH_PCT,
+        proximity_delta: int = 0,
+        proximity_raw: int = 0,
+        proximity_near: bool = False,
+        motion_score_pct: int = 0,
+        motion_active: bool = False,
+        accel_x: int = 0,
+    ) -> dict[str, object]:
+        return {
+            "display_sleeping": display_sleeping,
+            "recording": recording,
+            "speaking": speaking,
+            "audio": {"recording": recording},
+            "head": {"tilt_pct": tilt_pct},
+            "sensors": {
+                "imu": {
+                    "ready": True,
+                    "accel_mg": {"x": accel_x, "y": 0, "z": 1000},
+                    "gyro_dps": {"x": 0, "y": 0, "z": 0},
+                    "motion_score_pct": motion_score_pct,
+                    "motion_active": motion_active,
+                },
+                "ltr553": {
+                    "ready": True,
+                    "proximity_raw": proximity_raw,
+                    "ambient_raw": 100,
+                    "proximity_baseline": 8,
+                    "proximity_delta": proximity_delta,
+                    "near": proximity_near,
+                    "light_changed": False,
+                },
+            },
+        }
+
+    def test_sensor_reaction_filters_proximity_noise_and_restores_head(self) -> None:
+        state = SensorReactionState()
+        near = self.sensor_status(proximity_delta=160, proximity_raw=500, proximity_near=True)
+
+        first_actions, first_reasons = build_sensor_reaction_actions(near, state, now_s=10.0)
+        second_actions, second_reasons = build_sensor_reaction_actions(near, state, now_s=10.1)
+
+        self.assertEqual(first_actions, [])
+        self.assertEqual(first_reasons, [])
+        self.assertIn("proximity_near", second_reasons)
+        self.assertEqual([action["action"] for action in second_actions], ["face", "move"])
+        self.assertEqual(second_actions[0]["emotion"], "glance_down")
+        self.assertLess(second_actions[1]["pitch_target_pct"], DEFAULT_IDLE_PITCH_PCT)
+
+        clear = self.sensor_status(proximity_delta=8, proximity_raw=10, proximity_near=False)
+        self.assertEqual(build_sensor_reaction_actions(clear, state, now_s=11.2)[0], [])
+        self.assertEqual(build_sensor_reaction_actions(clear, state, now_s=11.3)[0], [])
+        restore_actions, restore_reasons = build_sensor_reaction_actions(clear, state, now_s=11.4)
+
+        self.assertEqual(restore_reasons, ["proximity_clear"])
+        self.assertEqual(restore_actions, [{"action": "move", "pitch_target_pct": DEFAULT_IDLE_PITCH_PCT}])
+
+    def test_sensor_reaction_wakes_sleeping_display_on_confirmed_proximity(self) -> None:
+        state = SensorReactionState()
+        near = self.sensor_status(display_sleeping=True, proximity_delta=160, proximity_raw=500, proximity_near=True)
+
+        self.assertEqual(build_sensor_reaction_actions(near, state, now_s=20.0)[0], [])
+        actions, reasons = build_sensor_reaction_actions(near, state, now_s=20.1)
+
+        self.assertIn("wake:proximity", reasons)
+        self.assertEqual(actions[0], {"action": "system", "system_action": "display_wake"})
+        self.assertEqual(actions[1]["action"], "face")
+        self.assertEqual(actions[2]["action"], "move")
+
+    def test_sensor_reaction_shake_uses_motion_score_and_cooldown(self) -> None:
+        state = SensorReactionState()
+        shake = self.sensor_status(motion_score_pct=75, motion_active=True)
+
+        actions, reasons = build_sensor_reaction_actions(shake, state, now_s=30.0)
+        immediate_actions, _ = build_sensor_reaction_actions(shake, state, now_s=30.5)
+        later_actions, later_reasons = build_sensor_reaction_actions(shake, state, now_s=35.0)
+
+        self.assertEqual(reasons, ["shake"])
+        self.assertEqual(actions, [{"action": "face", "emotion": "surprise_pop", "intensity_pct": 88}])
+        self.assertEqual(immediate_actions, [])
+        self.assertEqual(later_reasons, ["shake"])
+        self.assertEqual(later_actions[0]["emotion"], "surprise_pop")
+
+    def test_sensor_reaction_sideways_requires_stable_samples(self) -> None:
+        state = SensorReactionState()
+        side = self.sensor_status(accel_x=820)
+
+        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.0)[0], [])
+        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.1)[0], [])
+        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.2)
+
+        self.assertEqual(side_reasons, ["sideways"])
+        self.assertEqual(side_actions, [{"action": "face", "emotion": "surprised", "intensity_pct": 78}])
+
+        upright = self.sensor_status(accel_x=0)
+        self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.3)[0], [])
+        self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.4)[0], [])
+        upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=41.5)
+
+        self.assertEqual(upright_reasons, ["upright"])
+        self.assertEqual(upright_actions, [{"action": "face", "emotion": "neutral", "intensity_pct": 60}])
+
+    def test_sensor_reaction_ignores_busy_recording_status(self) -> None:
+        state = SensorReactionState()
+        busy = self.sensor_status(
+            recording=True,
+            proximity_delta=200,
+            proximity_raw=600,
+            proximity_near=True,
+            motion_score_pct=90,
+            motion_active=True,
+            accel_x=900,
+        )
+
+        actions, reasons = build_sensor_reaction_actions(busy, state, now_s=50.0)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(reasons, [])
 
     def test_audio_action_to_topic_payload_start_recording(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]

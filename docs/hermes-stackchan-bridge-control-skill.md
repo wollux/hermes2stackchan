@@ -311,6 +311,12 @@ LTR553 proximity wake StackChan through the CRT wake animation before continuing
 with recording or movement. The bridge treats the firmware `interaction` event as
 human activity for the five-minute idle-sleep timer.
 
+The bridge also runs a sensor watcher. It filters BMI270/LTR553 noise and reacts
+only to stable physical interaction: shake becomes a short surprise face, lying
+on the side becomes a surprised face, and proximity lowers the head a little
+until the object moves away. These reactions are bridge-owned helper behavior;
+Hermes should not duplicate them with extra LED or sound actions.
+
 Normal pitch/rest position is around `45`, not `0`. Yaw can move more freely than
 pitch; pitch must remain conservative.
 

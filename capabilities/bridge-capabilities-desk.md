@@ -153,7 +153,7 @@ Image display payload:
 
 Publishes to `hermes-stackchan/desk/cmd/face`.
 
-Supported emotions: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `wink`, `blink`, `look_left`, `look_right`, `look_up`, `look_down`, `breathe`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
+Supported emotions include: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `blink`, `wink`, `wink_left`, `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `breathe`, `deep_breathe`, `micro_sleep`, `surprise_pop`, `happy_squint`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
 
 ```json
 {
@@ -405,6 +405,13 @@ Battery fields:
 ```
 
 The bridge command `watch-power` watches `external_power`/`usb_power` in these retained status updates and reacts to plug/unplug transitions with a battery percentage/charge overlay plus immediate head motion. After about five seconds, plugging in triggers a happy face; unplugging triggers a neutral face. It must not change LEDs or sound for power changes. `battery_charging` only means active charging; a full battery can have `external_power: true` and `battery_charging: false`.
+
+The bridge command `watch-sensors` watches BMI270 and LTR553 fields in retained
+status plus `interaction` events. It is noise-filtered and only reacts to stable
+signals: shake triggers a short surprise face, lying on the side triggers a
+surprised face, and proximity lowers the head slightly until the object moves
+away. Confirmed sensor interaction wakes a sleeping display. It must not change
+LEDs or sound.
 
 Temperature fields:
 

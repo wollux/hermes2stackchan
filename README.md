@@ -30,6 +30,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Display brightness, display sleep, display wake, shutdown, reboot, ping, and status commands.
 - Battery and power status in retained MQTT state.
 - Interaction sensor status for BMI270 IMU motion and LTR553 proximity/ambient light.
+- Filtered bridge reactions for real sensor interaction: shake face, sideways surprise, proximity head dip, and sensor wake from sleep.
 - Power watcher reactions for plug/unplug without taking over LEDs.
 - Temperature fields for SoC and servos where available.
 - ES7210 microphone recording.
@@ -276,6 +277,7 @@ The service runs one multithreaded bridge process:
 - HTTP audio endpoint.
 - Fast touch/recording LED worker.
 - Power watcher.
+- IMU/LTR553 sensor watcher.
 - Persistent reminder worker.
 - Idle sleep watcher.
 - Idle life animator.
@@ -286,6 +288,7 @@ Disable individual workers for debugging:
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-life
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-idle-sleep
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-power
+h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --no-sensors
 h2s-bridge --env /opt/hermes2stackchan/.env run --pair desk --touch-verbose
 ```
 
@@ -422,6 +425,20 @@ The bridge keeps the latest useful device settings on
 Currently this restores speaker volume and display brightness. The unified
 bridge service also watches StackChan status and reapplies these settings after
 a reboot or reconnect.
+
+Sensor reactions:
+
+```bash
+scripts/h2s_bridge.sh watch-sensors --pair desk --verbose
+```
+
+The unified bridge service runs this by default. It watches retained status plus
+`events`, filters sensor noise with hysteresis, and only reacts to stable
+signals: a real shake makes a short surprise face, lying on the side makes a
+surprised face, and a hand/finger approaching the LTR553 proximity sensor lowers
+the head slightly until the object moves away. If the display is sleeping, a
+confirmed sensor interaction wakes StackChan first. It does not use LEDs or
+sound.
 
 ## 7: Test Hermes Integration
 
