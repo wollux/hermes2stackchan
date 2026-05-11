@@ -29,12 +29,14 @@ from bridge.hermes2stackchan_bridge import (
     due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
     DEFAULT_IDLE_YAW_PCT,
+    external_reply_actions,
     face_snapshot,
     add_reminder,
     LIFE_VARIANT_NAMES,
     load_config,
     missing_status_paths,
     motion_action_duration_ms,
+    mqtt_settle_delay_after_publish_s,
     normalize_motion_points,
     pending_reminders,
     reminder_actions,
@@ -241,6 +243,37 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(parsed["actions"][0]["action"], "say")
         self.assertEqual(parsed["actions"][0]["text"], "Hallo Wolfgang.")
+
+    def test_external_tts_reply_uses_display_instead_of_say(self) -> None:
+        actions = external_reply_actions(
+            [{"action": "say", "text": "Hallo Wolfgang.", "emotion": "speaking"}],
+            "Hallo Wolfgang.",
+            tts_enabled=True,
+        )
+
+        self.assertEqual(actions[0]["action"], "display")
+        self.assertNotIn("say", {action["action"] for action in actions})
+
+    def test_external_non_tts_reply_keeps_say(self) -> None:
+        actions = [{"action": "say", "text": "Hallo Wolfgang.", "emotion": "speaking"}]
+
+        self.assertEqual(external_reply_actions(actions, "Hallo Wolfgang.", tts_enabled=False), actions)
+
+    def test_mqtt_settle_delay_spaces_text_before_followup_actions(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        self.assertGreater(
+            mqtt_settle_delay_after_publish_s(pair.say_topic, {"text": "Hallo von Hermes."}, pair),
+            0.8,
+        )
+        self.assertGreater(
+            mqtt_settle_delay_after_publish_s(pair.display_topic, {"text": "Direkte Nachricht"}, pair),
+            0.6,
+        )
+        self.assertEqual(
+            mqtt_settle_delay_after_publish_s(pair.audio_topic, {"action": "play_tts_url"}, pair),
+            0.0,
+        )
 
     def test_followup_listen_detects_explicit_flag(self) -> None:
         self.assertTrue(should_listen_for_followup({"follow_up_listen": True, "actions": []}, "Alles klar."))

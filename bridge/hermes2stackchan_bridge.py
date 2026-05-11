@@ -2118,6 +2118,34 @@ def ensure_reply_action(response: dict[str, Any]) -> list[dict[str, Any]]:
     return actions
 
 
+def external_reply_actions(actions: list[dict[str, Any]], display_text: str, tts_enabled: bool) -> list[dict[str, Any]]:
+    if not tts_enabled:
+        return actions
+    filtered = [action for action in actions if action_name(action) != "say"]
+    has_display = any(action_name(action) == "display" for action in filtered)
+    if display_text and not has_display:
+        filtered.insert(0, {"action": "display", "text": display_text, "duration_ms": 9000})
+    return filtered
+
+
+def mqtt_settle_delay_after_publish_s(topic: str, payload: dict[str, Any], pair: PairConfig | None = None) -> float:
+    if pair is None:
+        return 0.0
+    if topic == pair.system_topic and payload.get("action") in {"display_wake", "display_sleep"}:
+        return 0.25
+    if topic == pair.face_topic:
+        return 0.12
+    if topic == pair.display_topic:
+        text = optional_string(payload.get("text")) or ""
+        return min(2.2, 0.7 + len(text) / 420.0)
+    if topic == pair.say_topic:
+        text = optional_string(payload.get("text")) or ""
+        return min(2.6, 0.9 + len(text) / 360.0)
+    if topic == pair.motion_topic:
+        return life_action_settle_delay_s({"action": "motion", "points": payload.get("points")})
+    return 0.0
+
+
 def dispatch_mqtt_actions(
     config: BridgeConfig,
     pair: PairConfig,
@@ -2155,6 +2183,9 @@ def dispatch_mqtt_actions(
             print(f"[bridge] sent {topic}: {body}")
             if topic == pair.device_topic:
                 publish_device_settings_snapshot(client, pair, payload, "dispatch")
+            settle_delay = mqtt_settle_delay_after_publish_s(topic, payload, pair)
+            if settle_delay > 0:
+                time.sleep(settle_delay)
         if not wait_ack or not pending:
             return 0
         deadline = time.monotonic() + timeout_s
@@ -2200,6 +2231,9 @@ def ask_hermes(args: argparse.Namespace) -> int:
             actions,
             f"hermes-reminder-{uuid.uuid4().hex[:8]}",
         )
+    spoken_text = speech_text_from_hermes_response(response, user_text)
+    tts_enabled = bool(spoken_text and config.speech.bridge_public_url)
+    actions = external_reply_actions(actions, spoken_text, tts_enabled)
     if args.show_response or args.dry_run:
         print(json.dumps(
             {"hermes": response, "actions": actions, "scheduled_reminders": scheduled_reminders, "reminder_errors": reminder_errors},
@@ -2210,8 +2244,7 @@ def ask_hermes(args: argparse.Namespace) -> int:
         action_to_topic_payload(pair, action, f"hermes-{uuid.uuid4().hex[:12]}")
         for action in actions
     ]
-    spoken_text = speech_text_from_hermes_response(response, user_text)
-    if spoken_text and config.speech.bridge_public_url:
+    if tts_enabled:
         try:
             tts_request_id = f"hermes-tts-{uuid.uuid4().hex[:12]}"
             tts_path = make_tts_wav(safe_tts_text(spoken_text), config.speech, tts_request_id)
@@ -2253,6 +2286,9 @@ def publish_action_messages(
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] sent {topic}: {body}", flush=True)
         if pair is not None and topic == pair.device_topic:
             publish_device_settings_snapshot(client, pair, payload, "action")
+        settle_delay = mqtt_settle_delay_after_publish_s(topic, payload, pair)
+        if settle_delay > 0:
+            time.sleep(settle_delay)
 
 
 def watch_power(args: argparse.Namespace) -> int:
