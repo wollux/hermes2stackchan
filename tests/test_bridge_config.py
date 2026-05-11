@@ -37,6 +37,8 @@ from bridge.hermes2stackchan_bridge import (
     missing_status_paths,
     motion_action_duration_ms,
     mqtt_settle_delay_after_publish_s,
+    notify_actions_from_payload,
+    notify_text_from_payload,
     normalize_motion_points,
     pending_reminders,
     reminder_actions,
@@ -292,6 +294,19 @@ class BridgeConfigTests(unittest.TestCase):
         _topic, payload = action_to_topic_payload(pair, {"action": "display", "text": long_text}, "display-001")
 
         self.assertLessEqual(len(payload["text"]), 320)
+
+    def test_notify_payload_extracts_text_and_maps_say_to_display(self) -> None:
+        text = notify_text_from_payload({"reply": "Hallo vom externen Hermes."})
+        actions = notify_actions_from_payload(
+            {"actions": [{"action": "say", "text": "Bitte nicht say."}, {"action": "face", "emotion": "happy"}]},
+            text,
+            tts_enabled=True,
+        )
+
+        self.assertEqual(text, "Hallo vom externen Hermes.")
+        self.assertEqual(actions[0]["action"], "display")
+        self.assertIn("face", {action["action"] for action in actions})
+        self.assertNotIn("say", {action["action"] for action in actions})
 
     def test_mqtt_settle_delay_spaces_text_before_followup_actions(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]

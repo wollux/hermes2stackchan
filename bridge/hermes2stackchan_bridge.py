@@ -2127,6 +2127,26 @@ def external_reply_actions(actions: list[dict[str, Any]], display_text: str, tts
     return filtered
 
 
+def notify_text_from_payload(payload: dict[str, Any]) -> str:
+    for key in ("text", "reply", "message"):
+        text = optional_string(payload.get(key))
+        if text:
+            return text
+    return ""
+
+
+def notify_actions_from_payload(payload: dict[str, Any], display_text: str, tts_enabled: bool) -> list[dict[str, Any]]:
+    actions = payload.get("actions")
+    if actions is None:
+        actions = []
+    elif isinstance(actions, dict):
+        actions = [actions]
+    elif not isinstance(actions, list):
+        actions = []
+    actions = [action for action in actions if isinstance(action, dict)]
+    return external_reply_actions(actions, display_text, tts_enabled)
+
+
 def mqtt_settle_delay_after_publish_s(topic: str, payload: dict[str, Any], pair: PairConfig | None = None) -> float:
     if pair is None:
         return 0.0
@@ -3165,6 +3185,104 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def read_json_body(self, request_id: str, max_bytes: int = 65536) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.send_json(400, {"ok": False, "error": "invalid content length", "request_id": request_id})
+            return None
+        if length <= 0:
+            self.send_json(400, {"ok": False, "error": "missing json body", "request_id": request_id})
+            return None
+        if length > max_bytes:
+            self.send_json(413, {"ok": False, "error": "json body too large", "request_id": request_id})
+            return None
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self.send_json(400, {"ok": False, "error": f"invalid json: {exc}", "request_id": request_id})
+            return None
+        if not isinstance(payload, dict):
+            self.send_json(400, {"ok": False, "error": "json body must be an object", "request_id": request_id})
+            return None
+        return payload
+
+    def public_tts_url(self, tts_path: str) -> str:
+        if not tts_path:
+            return ""
+        try:
+            return tts_public_url(self.server.config, tts_path)
+        except ConfigError:
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            return f"http://{host}{tts_path}"
+
+    def handle_notify_post(self, request_id: str) -> None:
+        payload = self.read_json_body(request_id)
+        if payload is None:
+            return
+        request_id = optional_string(payload.get("request_id")) or request_id
+        pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
+        if pair_id != self.server.pair.pair_id:
+            self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+
+        started = time.monotonic()
+        display_text = safe_stackchan_text(notify_text_from_payload(payload), MAX_STACKCHAN_DISPLAY_CHARS)
+        spoken_text = safe_tts_text(notify_text_from_payload(payload))
+        if not spoken_text:
+            self.send_json(400, {"ok": False, "error": "notify needs text, reply, or message", "request_id": request_id})
+            return
+
+        pause_life_animation(self.server.pair.pair_id, 45.0, f"external notify {request_id}")
+        time.sleep(0.45)
+        try:
+            tts_started = time.monotonic()
+            tts_path = make_tts_wav(spoken_text, self.server.config.speech, f"notify-{request_id}")
+            tts_ms = round((time.monotonic() - tts_started) * 1000)
+            tts_url = self.public_tts_url(tts_path)
+            actions = notify_actions_from_payload(payload, display_text, bool(tts_url))
+            action_messages, action_errors = actions_to_topic_payloads(
+                self.server.pair,
+                actions,
+                f"notify-{request_id}",
+            )
+            action_messages.append(
+                action_to_topic_payload(
+                    self.server.pair,
+                    {"action": "audio", "audio_action": "play_tts_url", "url": tts_url},
+                    f"notify-tts-{request_id}",
+                )
+            )
+            publish_started = time.monotonic()
+            publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+            mqtt_ms = round((time.monotonic() - publish_started) * 1000)
+            total_ms = round((time.monotonic() - started) * 1000)
+            print(
+                f"[bridge-http] notify request_id={request_id} chars={len(spoken_text)} "
+                f"actions={len(action_messages)} mqtt={mqtt_ms}ms tts={tts_ms}ms total={total_ms}ms",
+                flush=True,
+            )
+            if action_errors:
+                print(f"[bridge-http] notify ignored invalid actions request_id={request_id}: {action_errors}", flush=True)
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "request_id": request_id,
+                    "reply": display_text,
+                    "tts_path": tts_path,
+                    "tts_url": tts_url,
+                    "tts_ms": tts_ms,
+                    "mqtt_ms": mqtt_ms,
+                    "total_ms": total_ms,
+                    "actions_published": len(action_messages),
+                    "action_errors": action_errors,
+                },
+            )
+        except Exception as exc:
+            print(f"[bridge-http] notify error request_id={request_id}: {exc}", flush=True)
+            self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/health":
@@ -3187,6 +3305,14 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path in {"/stackchan/notify", "/hermes/notify"}:
+            request_id = (
+                self.headers.get("X-H2S-Request-Id")
+                or self.headers.get("X-StackChan-Request-Id")
+                or uuid.uuid4().hex
+            ).strip()
+            self.handle_notify_post(request_id)
+            return
         if path != "/stackchan/audio":
             self.send_json(404, {"ok": False, "error": "not found"})
             return
@@ -3346,6 +3472,7 @@ def serve_audio(args: argparse.Namespace) -> int:
     server.mqtt_client = client
     print(f"[bridge-http] listening on http://{args.host}:{args.port}", flush=True)
     print(f"[bridge-http] endpoint: POST /stackchan/audio (audio/wav)", flush=True)
+    print(f"[bridge-http] endpoint: POST /stackchan/notify (application/json)", flush=True)
     print(f"[bridge-http] Hermes API: {hermes_chat_url(config.hermes.base_url)}", flush=True)
     print(f"[bridge-http] dispatch Hermes actions to {pair.mqtt_prefix}/cmd/*", flush=True)
     try:
