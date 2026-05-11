@@ -62,6 +62,7 @@ SENSOR_SHAKE_SCORE_THRESHOLD = 20
 SENSOR_SHAKE_COOLDOWN_S = 4.0
 SENSOR_REACTION_COOLDOWN_S = 1.0
 SENSOR_WAKE_COOLDOWN_S = 2.0
+SENSOR_SIDE_HELP_TEXT = "Hilfe! Ich bin umgekippt!"
 REMINDER_STORE_LOCK = RLock()
 LIFE_PAUSE_LOCK = RLock()
 LIFE_PAUSED_UNTIL: dict[str, float] = {}
@@ -1177,6 +1178,17 @@ def actions_to_topic_payloads(
                 }
                 messages.append(action_to_topic_payload(pair, display_action, f"{request_id_prefix}-{index:02d}"))
                 continue
+            if name in {"local_tts", "tts", "speak"}:
+                if config is None:
+                    raise ConfigError("local_tts action needs bridge config")
+                text = optional_string(action.get("text") or action.get("message"))
+                if not text:
+                    raise ConfigError("local_tts action needs text")
+                tts_path = make_tts_wav(safe_tts_text(text), config.speech, f"{request_id_prefix}-{index:02d}")
+                tts_url = tts_public_url(config, tts_path)
+                audio_action = {"action": "audio", "audio_action": "play_tts_url", "url": tts_url}
+                messages.append(action_to_topic_payload(pair, audio_action, f"{request_id_prefix}-{index:02d}"))
+                continue
             messages.append(action_to_topic_payload(pair, action, f"{request_id_prefix}-{index:02d}"))
         except ConfigError as exc:
             errors.append(str(exc))
@@ -2279,7 +2291,12 @@ def build_sensor_reaction_actions(
             and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
         ):
             maybe_wake("sideways")
-            actions.append({"action": "face", "emotion": "surprised", "intensity_pct": 86})
+            actions.extend([
+                {"action": "led", "mode": "blink", "r": 255, "g": 0, "b": 0},
+                {"action": "face", "emotion": "surprise_pop", "intensity_pct": 94},
+                {"action": "display", "mode": "text", "text": "HILFE!", "duration_ms": 4500},
+                {"action": "local_tts", "text": SENSOR_SIDE_HELP_TEXT},
+            ])
             reasons.append("sideways")
             state.side_active = True
             state.last_side_at = now_s
@@ -2290,7 +2307,10 @@ def build_sensor_reaction_actions(
             and state.upright_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
             and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
         ):
-            actions.append({"action": "face", "emotion": "neutral", "intensity_pct": 60})
+            actions.extend([
+                {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
+                {"action": "face", "emotion": "neutral", "intensity_pct": 60},
+            ])
             reasons.append("upright")
             state.side_active = False
             state.last_side_at = now_s
@@ -3080,11 +3100,13 @@ def publish_action_messages(
     client: Any,
     action_messages: list[tuple[str, dict[str, Any]]],
     pair: PairConfig | None = None,
+    wait: bool = True,
 ) -> None:
     for topic, payload in action_messages:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         result = client.publish(topic, body, qos=1, retain=False)
-        result.wait_for_publish(timeout=5)
+        if wait:
+            result.wait_for_publish(timeout=5)
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] sent {topic}: {body}", flush=True)
         if pair is not None and topic == pair.device_topic:
             publish_device_settings_snapshot(client, pair, payload, "action")
@@ -3804,26 +3826,49 @@ def watch_sensors(args: argparse.Namespace) -> int:
         if not actions:
             return
         fresh_status = read_latest_status(config, pair, timeout_s=0.25)
+        urgent_orientation = any(reason in {"sideways", "upright"} for reason in reasons)
         if isinstance(fresh_status, dict):
-            if status_is_busy(fresh_status):
+            if status_is_busy(fresh_status) and not urgent_orientation:
                 if args.verbose:
                     print(
                         f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction skipped while busy: {reasons}",
                         flush=True,
                     )
                 return
-            if fresh_status:
-                latest_status = fresh_status
+        if fresh_status:
+            latest_status = fresh_status
         pause_life_animation(pair.pair_id, args.life_pause_s, f"sensor reaction {','.join(reasons)}")
-        messages = [
-            action_to_topic_payload(pair, action, f"sensor-{uuid.uuid4().hex[:10]}-{index:02d}")
-            for index, action in enumerate(actions, start=1)
+        immediate_actions = [
+            action for action in actions
+            if action_name(action) not in {"local_tts", "tts", "speak"}
         ]
+        delayed_tts_actions = [
+            action for action in actions
+            if action_name(action) in {"local_tts", "tts", "speak"}
+        ]
+        messages, errors = actions_to_topic_payloads(
+            pair,
+            immediate_actions,
+            f"sensor-{uuid.uuid4().hex[:10]}",
+            config=config,
+        )
+        for error in errors:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction ignored action: {error}", file=sys.stderr, flush=True)
         if args.verbose:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {actions}", flush=True)
         else:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {len(actions)} action(s)", flush=True)
-        publish_action_messages(client, messages, pair)
+        publish_action_messages(client, messages, pair, wait=False)
+        if delayed_tts_actions:
+            tts_messages, tts_errors = actions_to_topic_payloads(
+                pair,
+                delayed_tts_actions,
+                f"sensor-{uuid.uuid4().hex[:10]}",
+                config=config,
+            )
+            for error in tts_errors:
+                print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction ignored tts: {error}", file=sys.stderr, flush=True)
+            publish_action_messages(client, tts_messages, pair, wait=False)
         if args.once:
             done.set()
 

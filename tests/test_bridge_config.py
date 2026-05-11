@@ -814,14 +814,21 @@ class BridgeConfigTests(unittest.TestCase):
         side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.1, source_hint="orientation")
 
         self.assertEqual(side_reasons, ["sideways"])
-        self.assertEqual(side_actions, [{"action": "face", "emotion": "surprised", "intensity_pct": 86}])
+        self.assertEqual([action["action"] for action in side_actions], ["led", "face", "display", "local_tts"])
+        self.assertEqual(side_actions[0], {"action": "led", "mode": "blink", "r": 255, "g": 0, "b": 0})
+        self.assertEqual(side_actions[1]["emotion"], "surprise_pop")
+        self.assertEqual(side_actions[2]["text"], "HILFE!")
+        self.assertIn("umgekippt", side_actions[3]["text"])
 
         upright = self.sensor_status(accel_x=0)
         self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.3)[0], [])
         upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=41.4, source_hint="orientation")
 
         self.assertEqual(upright_reasons, ["upright"])
-        self.assertEqual(upright_actions, [{"action": "face", "emotion": "neutral", "intensity_pct": 60}])
+        self.assertEqual(upright_actions, [
+            {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
+            {"action": "face", "emotion": "neutral", "intensity_pct": 60},
+        ])
 
     def test_sensor_reaction_ignores_busy_recording_status(self) -> None:
         state = SensorReactionState()
