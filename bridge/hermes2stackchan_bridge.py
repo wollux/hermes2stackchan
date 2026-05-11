@@ -34,6 +34,8 @@ MAX_STACKCHAN_DISPLAY_CHARS = 320
 MAX_STACKCHAN_TTS_CHARS = 2500
 STACKCHAN_DISPLAY_ASPECT = 320 / 240
 OPENVERSE_IMAGE_SEARCH_URL = "https://api.openverse.org/v1/images/"
+WIKIMEDIA_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
+HTTP_USER_AGENT = "hermes2stackchan-bridge/1.0 (https://github.com/wollux/hermes2stackchan)"
 DEFAULT_IDLE_YAW_PCT = 0
 DEFAULT_IDLE_PITCH_PCT = 45
 YAW_TARGET_MIN_PCT = -100
@@ -3324,7 +3326,7 @@ def parse_data_url(data_url: str) -> tuple[bytes, str]:
 
 
 def download_image_bytes(url: str, max_bytes: int, timeout_s: float = 12.0) -> tuple[bytes, str]:
-    request = urllib.request.Request(url, headers={"User-Agent": "hermes2stackchan-bridge/1.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout_s) as response:
         content_type = response.headers.get_content_type() or content_type_from_filename(url)
         data = response.read(max_bytes + 1)
@@ -3358,10 +3360,113 @@ def re_like_image_url(url: str) -> bool:
     return clean.endswith((".jpg", ".jpeg", ".png", ".webp"))
 
 
-def search_openverse_image(query: str, speech: SpeechConfig, limit: int = 20) -> tuple[bytes, str, dict[str, Any]]:
-    query = query.strip()
-    if not query:
-        raise ConfigError("image search needs query")
+IMAGE_QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "aus",
+    "bild",
+    "der",
+    "die",
+    "ein",
+    "eine",
+    "einen",
+    "en",
+    "foto",
+    "from",
+    "image",
+    "im",
+    "in",
+    "mir",
+    "of",
+    "photo",
+    "photograph",
+    "picture",
+    "show",
+    "the",
+    "von",
+    "zeig",
+}
+
+
+def image_search_queries(query: str) -> list[str]:
+    words = [word.strip(" ,.;:!?()[]{}\"'").strip() for word in query.split()]
+    words = [word for word in words if word]
+    clean_words = [word for word in words if word.lower() not in IMAGE_QUERY_STOPWORDS]
+    variants: list[str] = []
+
+    def add(value: str) -> None:
+        value = " ".join(value.split()).strip()
+        if value and value.lower() not in {item.lower() for item in variants}:
+            variants.append(value)
+
+    add(query)
+    if clean_words and clean_words != words:
+        add(" ".join(clean_words))
+    if len(clean_words) > 3:
+        add(" ".join(clean_words[:3]))
+        add(" ".join(clean_words[-3:]))
+    if len(clean_words) > 1:
+        add(" ".join(clean_words[:2]))
+    if clean_words:
+        add(clean_words[0])
+    return variants
+
+
+def wikimedia_commons_candidates(query: str, speech: SpeechConfig, limit: int) -> list[dict[str, Any]]:
+    params = urllib.parse.urlencode(
+        {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 6,
+            "gsrlimit": clamp_int(limit, 1, 20),
+            "prop": "imageinfo",
+            "iiprop": "url|size|mime|extmetadata",
+            "format": "json",
+        }
+    )
+    request = urllib.request.Request(
+        f"{WIKIMEDIA_COMMONS_API_URL}?{params}",
+        headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=speech.timeout_s) as response:
+        payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    pages = ((payload.get("query") or {}).get("pages") or {}) if isinstance(payload, dict) else {}
+    if not isinstance(pages, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for page in pages.values():
+        if not isinstance(page, dict):
+            continue
+        image_info = page.get("imageinfo") or []
+        if not image_info or not isinstance(image_info[0], dict):
+            continue
+        info = image_info[0]
+        mime = optional_string(info.get("mime")) or ""
+        if mime and not mime.startswith("image/"):
+            continue
+        title = optional_string(page.get("title")) or ""
+        if title.lower().endswith((".svg", ".gif", ".pdf", ".tif", ".tiff")):
+            continue
+        candidates.append(
+            {
+                "url": optional_string(info.get("url")) or "",
+                "title": title.removeprefix("File:"),
+                "width": parse_int(info.get("width"), 0, "commons.width"),
+                "height": parse_int(info.get("height"), 0, "commons.height"),
+                "mime": mime,
+                "foreign_landing_url": optional_string(info.get("descriptionurl")) or "",
+                "creator": "",
+                "license": "",
+                "license_url": "",
+                "provider": "wikimedia-commons",
+            }
+        )
+    return [item for item in candidates if optional_string(item.get("url"))]
+
+
+def openverse_candidates(query: str, speech: SpeechConfig, limit: int) -> list[dict[str, Any]]:
     params = urllib.parse.urlencode({
         "q": query,
         "page_size": clamp_int(limit, 1, 20),
@@ -3369,44 +3474,75 @@ def search_openverse_image(query: str, speech: SpeechConfig, limit: int = 20) ->
     })
     request = urllib.request.Request(
         f"{OPENVERSE_IMAGE_SEARCH_URL}?{params}",
-        headers={"User-Agent": "hermes2stackchan-bridge/1.0"},
+        headers={"User-Agent": HTTP_USER_AGENT, "Accept": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=speech.timeout_s) as response:
         payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
     results = payload.get("results") if isinstance(payload, dict) else []
-    if not isinstance(results, list) or not results:
-        raise ConfigError(f"no image search results for {query!r}")
+    if not isinstance(results, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict) or not optional_string(item.get("url")):
+            continue
+        normalized = dict(item)
+        normalized["provider"] = "openverse"
+        candidates.append(normalized)
+    return candidates
 
-    candidates = [item for item in results if isinstance(item, dict) and optional_string(item.get("url"))]
-    candidates.sort(key=image_result_aspect_score)
+
+def search_openverse_image(query: str, speech: SpeechConfig, limit: int = 20) -> tuple[bytes, str, dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        raise ConfigError("image search needs query")
     errors: list[str] = []
-    for item in candidates:
-        for url_key in ("url", "thumbnail"):
-            image_url = optional_string(item.get(url_key))
-            if not image_url:
-                continue
+    searched: list[str] = []
+    for variant in image_search_queries(query):
+        candidates: list[dict[str, Any]] = []
+        for provider, loader in (("openverse", openverse_candidates), ("wikimedia-commons", wikimedia_commons_candidates)):
             try:
-                data, content_type = download_image_bytes(image_url, speech.max_image_bytes, speech.timeout_s)
-                if not content_type.startswith("image/"):
-                    raise ConfigError(f"not an image: {content_type}")
-                meta = {
-                    "provider": "openverse",
-                    "query": query,
-                    "title": optional_string(item.get("title")) or "",
-                    "source_url": image_url,
-                    "foreign_landing_url": optional_string(item.get("foreign_landing_url")) or "",
-                    "creator": optional_string(item.get("creator")) or "",
-                    "license": optional_string(item.get("license")) or "",
-                    "license_url": optional_string(item.get("license_url")) or "",
-                    "width": parse_int(item.get("width"), 0, "image.width"),
-                    "height": parse_int(item.get("height"), 0, "image.height"),
-                    "aspect_score": round(image_result_aspect_score(item), 3),
-                }
-                return data, content_type, meta
+                found = loader(variant, speech, limit)
+                for item in found:
+                    item["provider"] = optional_string(item.get("provider")) or provider
+                    candidates.append(item)
             except Exception as exc:
-                errors.append(f"{image_url}: {exc}")
-                continue
-    raise ConfigError(f"image search found results but none were downloadable: {'; '.join(errors[:3])}")
+                errors.append(f"{provider} {variant!r}: {exc}")
+        searched.append(variant)
+        if not candidates:
+            continue
+        candidates.sort(key=image_result_aspect_score)
+        for item in candidates:
+            for url_key in ("url", "thumbnail"):
+                image_url = optional_string(item.get(url_key))
+                if not image_url:
+                    continue
+                try:
+                    data, content_type = download_image_bytes(image_url, speech.max_image_bytes, speech.timeout_s)
+                    if not content_type.startswith("image/"):
+                        raise ConfigError(f"not an image: {content_type}")
+                    meta = {
+                        "provider": optional_string(item.get("provider")) or "openverse",
+                        "query": query,
+                        "matched_query": variant,
+                        "searched_queries": searched,
+                        "title": optional_string(item.get("title")) or "",
+                        "source_url": image_url,
+                        "foreign_landing_url": optional_string(item.get("foreign_landing_url")) or "",
+                        "creator": optional_string(item.get("creator")) or "",
+                        "license": optional_string(item.get("license")) or "",
+                        "license_url": optional_string(item.get("license_url")) or "",
+                        "width": parse_int(item.get("width"), 0, "image.width"),
+                        "height": parse_int(item.get("height"), 0, "image.height"),
+                        "aspect_score": round(image_result_aspect_score(item), 3),
+                    }
+                    return data, content_type, meta
+                except Exception as exc:
+                    errors.append(f"{image_url}: {exc}")
+                    continue
+    reason = "; ".join(errors[:4])
+    if reason:
+        raise ConfigError(f"no downloadable image search result for {query!r}; tried {searched}; {reason}")
+    raise ConfigError(f"no image search results for {query!r}; tried {searched}")
 
 
 def image_bytes_from_payload(payload: dict[str, Any], speech: SpeechConfig) -> tuple[bytes, str, str]:

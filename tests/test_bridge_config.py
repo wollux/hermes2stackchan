@@ -51,6 +51,7 @@ from bridge.hermes2stackchan_bridge import (
     build_hermes_vision_messages,
     image_data_url,
     image_result_aspect_score,
+    image_search_queries,
     rgb565_to_jpeg,
     status_allows_life_animation,
 )
@@ -199,6 +200,14 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertLess(image_result_aspect_score(good), image_result_aspect_score(tall))
         self.assertLess(image_result_aspect_score(good), image_result_aspect_score(tiny))
+
+    def test_image_search_queries_simplifies_long_photo_requests(self) -> None:
+        queries = image_search_queries("Spandau Berlin Altstadt Havel Zitadelle Foto")
+
+        self.assertEqual(queries[0], "Spandau Berlin Altstadt Havel Zitadelle Foto")
+        self.assertIn("Spandau Berlin Altstadt Havel Zitadelle", queries)
+        self.assertIn("Spandau Berlin Altstadt", queries)
+        self.assertIn("Spandau", queries)
 
     def test_hermes_vision_messages_include_data_url(self) -> None:
         config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})

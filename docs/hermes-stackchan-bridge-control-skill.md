@@ -128,7 +128,9 @@ Expected success:
 When the user asks for an image from the internet and gives no direct URL, call
 the bridge search endpoint or emit an `image_search` action. The bridge searches
 Openverse, prefers images close to StackChan's 4:3 display ratio, converts the
-chosen image to a 320x240 JPEG, and sends it to StackChan.
+chosen image to a 320x240 JPEG, and sends it to StackChan. Long or decorated
+queries are simplified automatically, and Wikimedia Commons is used as a
+fallback source when Openverse has no useful result.
 
 Hermes action:
 

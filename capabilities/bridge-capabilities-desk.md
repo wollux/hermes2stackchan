@@ -66,7 +66,9 @@ Content-Type: application/json
 If the user asks for an image from the internet and does not provide a URL, use
 the bridge image search action. The bridge searches Openverse, prefers results
 close to StackChan's 4:3 display ratio, converts the chosen result to a 320x240
-JPEG preview, and sends it to StackChan.
+JPEG preview, and sends it to StackChan. If a long search phrase returns no
+result, the bridge automatically tries shorter variants and can fall back to
+Wikimedia Commons.
 
 Hermes action:
 
