@@ -962,6 +962,9 @@ void flush_frame()
 }
 
 void draw_face_extras();
+void draw_tv_off_animation();
+void draw_tv_on_animation();
+void draw_face(const char* emotion, int intensity_pct);
 
 struct FrameGuard {
     bool active;
@@ -1000,6 +1003,7 @@ void set_lcd_sleep(bool sleeping)
     }
 
     if (sleeping) {
+        draw_tv_off_animation();
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(g_panel_io, 0x28, nullptr, 0));
         vTaskDelay(pdMS_TO_TICKS(30));
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_io_tx_param(g_panel_io, 0x10, nullptr, 0));
@@ -1013,6 +1017,8 @@ void set_lcd_sleep(bool sleeping)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_lcd_panel_disp_on_off(g_panel, true));
         set_backlight_brightness(g_display_brightness_pct);
         g_display_sleeping = false;
+        draw_tv_on_animation();
+        draw_face(g_face_emotion, g_face_intensity_pct);
     }
 }
 
@@ -1106,6 +1112,96 @@ void draw_mouth_curve(int cx, int cy, int width, int height, bool smile, uint16_
 void clear(uint16_t color)
 {
     draw_rect(0, 0, kWidth, kHeight, color);
+}
+
+void draw_tv_off_animation()
+{
+    if (!g_panel || !g_framebuffer) {
+        return;
+    }
+
+    const uint16_t background = kBlack;
+    const uint16_t flash = rgb565(235, 250, 255);
+    const uint16_t accent = rgb565(20, 180, 255);
+
+    {
+        FrameGuard frame;
+        clear(flash);
+    }
+    vTaskDelay(pdMS_TO_TICKS(55));
+
+    for (int step = 0; step <= 16; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int strip_h = std::max(2, (kHeight * (16 - step)) / 16);
+            const int y = (kHeight - strip_h) / 2;
+            draw_rect(0, y, kWidth, strip_h, flash);
+            draw_rect(0, y, kWidth, 2, accent);
+            draw_rect(0, y + strip_h - 2, kWidth, 2, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(24));
+    }
+
+    for (int step = 0; step <= 22; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int line_w = std::max(0, (kWidth * (22 - step)) / 22);
+            draw_rect((kWidth - line_w) / 2, kHeight / 2 - 1, line_w, 3, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(28));
+    }
+
+    {
+        FrameGuard frame;
+        clear(background);
+    }
+}
+
+void draw_tv_on_animation()
+{
+    if (!g_panel || !g_framebuffer) {
+        return;
+    }
+
+    const uint16_t background = kBlack;
+    const uint16_t flash = rgb565(220, 245, 255);
+    const uint16_t accent = rgb565(20, 180, 255);
+
+    {
+        FrameGuard frame;
+        clear(background);
+    }
+    vTaskDelay(pdMS_TO_TICKS(35));
+
+    for (int step = 0; step <= 18; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int line_w = std::max(3, (kWidth * step) / 18);
+            draw_rect((kWidth - line_w) / 2, kHeight / 2 - 1, line_w, 3, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(24));
+    }
+
+    for (int step = 0; step <= 14; ++step) {
+        {
+            FrameGuard frame;
+            clear(background);
+            const int strip_h = std::max(3, (kHeight * step) / 14);
+            const int y = (kHeight - strip_h) / 2;
+            draw_rect(0, y, kWidth, strip_h, flash);
+            draw_rect(0, y, kWidth, 2, accent);
+            draw_rect(0, y + strip_h - 2, kWidth, 2, accent);
+        }
+        vTaskDelay(pdMS_TO_TICKS(22));
+    }
+
+    {
+        FrameGuard frame;
+        clear(flash);
+    }
 }
 
 void reset_voice_meter()
