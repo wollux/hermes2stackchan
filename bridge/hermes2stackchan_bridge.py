@@ -1397,6 +1397,9 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             "frequency_hz": parse_int_value(action.get("frequency_hz"), 880, "sound.frequency_hz"),
             "duration_ms": parse_int_value(action.get("duration_ms"), 140, "sound.duration_ms"),
         }
+        pattern = optional_string(action.get("pattern") or action.get("kind") or action.get("sound"))
+        if pattern:
+            payload["pattern"] = pattern
         if action.get("volume_pct") is not None:
             payload["volume_pct"] = action["volume_pct"]
         return pair.sound_topic, with_request_id(payload, action_request_id)
@@ -3809,6 +3812,8 @@ def send_sound(args: argparse.Namespace) -> int:
         "frequency_hz": args.frequency_hz,
         "duration_ms": args.duration_ms,
     }
+    if args.pattern:
+        payload["pattern"] = args.pattern
     if args.volume_pct is not None:
         payload["volume_pct"] = args.volume_pct
     return send_payload(args, pair.sound_topic, with_request_id(payload, args.request_id))
@@ -5760,6 +5765,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_send_options(sound)
     sound.add_argument("--frequency-hz", type=int, default=880, help="Tone frequency.")
     sound.add_argument("--duration-ms", type=int, default=140, help="Tone duration.")
+    sound.add_argument(
+        "--pattern",
+        choices=["tone", "good", "success", "ok", "error", "fail", "question", "ask", "followup", "camera", "photo", "shutter", "alarm", "notify", "message"],
+        default=None,
+        help="Named safe tone pattern.",
+    )
     sound.add_argument("--volume-pct", type=int, default=None, help="Optional volume update before tone.")
     sound.set_defaults(func=send_sound)
 

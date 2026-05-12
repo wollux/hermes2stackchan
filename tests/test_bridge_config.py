@@ -936,6 +936,22 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["action"], "play_tts_url")
         self.assertEqual(payload["url"], "http://example.test/tts.wav")
 
+    def test_sound_action_to_topic_payload_supports_safe_patterns(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(
+            pair,
+            {"action": "sound", "pattern": "question", "volume_pct": 65},
+            "sound-001",
+        )
+
+        self.assertEqual(topic, "hermes-stackchan/desk/cmd/sound")
+        self.assertEqual(payload["pattern"], "question")
+        self.assertEqual(payload["frequency_hz"], 880)
+        self.assertEqual(payload["duration_ms"], 140)
+        self.assertEqual(payload["volume_pct"], 65)
+        self.assertEqual(payload["request_id"], "sound-001")
+
     def test_reminder_builds_from_delay_and_fires_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = load_config(

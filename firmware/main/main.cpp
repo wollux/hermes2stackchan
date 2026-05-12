@@ -245,6 +245,7 @@ struct SoundCommand {
     int frequency_hz;
     int duration_ms;
     int volume_pct;
+    char pattern[24];
 };
 
 struct MotionPoint {
@@ -310,6 +311,7 @@ struct UiCommand {
 QueueHandle_t g_sound_queue = nullptr;
 QueueHandle_t g_motion_queue = nullptr;
 QueueHandle_t g_ui_queue = nullptr;
+SemaphoreHandle_t g_audio_output_mutex = nullptr;
 
 enum class FaceExtraMode : uint8_t {
     None,
@@ -2871,7 +2873,39 @@ bool init_microphone()
     return true;
 }
 
-void play_tone(int frequency_hz, int duration_ms)
+bool lock_audio_output(TickType_t timeout_ticks)
+{
+    if (!g_audio_output_mutex) {
+        return true;
+    }
+    return xSemaphoreTake(g_audio_output_mutex, timeout_ticks) == pdTRUE;
+}
+
+void unlock_audio_output()
+{
+    if (g_audio_output_mutex) {
+        xSemaphoreGive(g_audio_output_mutex);
+    }
+}
+
+void write_silence_unlocked(int duration_ms)
+{
+    duration_ms = clamp_int(duration_ms, 0, 1000);
+    if (duration_ms <= 0 || !g_audio_output_ready || !g_audio_output) {
+        return;
+    }
+    static constexpr int kChunkSamples = 160;
+    std::array<int16_t, kChunkSamples> silence = {};
+    int sample_index = 0;
+    const int total_samples = kAudioSampleRate * duration_ms / 1000;
+    while (sample_index < total_samples) {
+        const int count = std::min(kChunkSamples, total_samples - sample_index);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, silence.data(), count * sizeof(int16_t)));
+        sample_index += count;
+    }
+}
+
+void play_tone_unlocked(int frequency_hz, int duration_ms, int amplitude = 3600)
 {
     if (!g_audio_output_ready || !g_audio_output) {
         ESP_LOGW(kTag, "sound skipped: speaker not ready");
@@ -2880,24 +2914,79 @@ void play_tone(int frequency_hz, int duration_ms)
 
     frequency_hz = clamp_int(frequency_hz, 120, 4000);
     duration_ms = clamp_int(duration_ms, 20, 2000);
-    static constexpr int kChunkSamples = 240;
-    static constexpr int kAmplitude = 4800;
+    amplitude = clamp_int(amplitude, 800, 9000);
+    static constexpr int kChunkSamples = 160;
     std::array<int16_t, kChunkSamples> tone = {};
-    std::array<int16_t, kChunkSamples> silence = {};
 
     int sample_index = 0;
     const int total_samples = kAudioSampleRate * duration_ms / 1000;
-    const int half_period = std::max(1, kAudioSampleRate / (2 * frequency_hz));
+    const float phase_step = 2.0f * static_cast<float>(M_PI) * static_cast<float>(frequency_hz) / static_cast<float>(kAudioSampleRate);
+    const int fade_samples = std::max(1, std::min(total_samples / 2, kAudioSampleRate * 8 / 1000));
     while (sample_index < total_samples) {
         const int count = std::min(kChunkSamples, total_samples - sample_index);
         for (int i = 0; i < count; ++i) {
-            tone[i] = (((sample_index + i) / half_period) % 2 == 0) ? kAmplitude : -kAmplitude;
+            const int absolute_index = sample_index + i;
+            float envelope = 1.0f;
+            if (absolute_index < fade_samples) {
+                envelope = static_cast<float>(absolute_index) / static_cast<float>(fade_samples);
+            } else if (total_samples - absolute_index < fade_samples) {
+                envelope = static_cast<float>(std::max(0, total_samples - absolute_index)) / static_cast<float>(fade_samples);
+            }
+            tone[i] = static_cast<int16_t>(std::sin(phase_step * static_cast<float>(absolute_index)) * amplitude * envelope);
         }
         std::fill(tone.begin() + count, tone.end(), 0);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, tone.data(), tone.size() * sizeof(int16_t)));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, tone.data(), count * sizeof(int16_t)));
         sample_index += count;
     }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, silence.data(), silence.size() * sizeof(int16_t)));
+}
+
+bool play_sound_pattern(const SoundCommand& command)
+{
+    if (!g_audio_output_ready || !g_audio_output) {
+        ESP_LOGW(kTag, "sound skipped: speaker not ready");
+        return false;
+    }
+    if (!lock_audio_output(pdMS_TO_TICKS(250))) {
+        ESP_LOGW(kTag, "sound skipped: audio output busy");
+        return false;
+    }
+
+    const char* pattern = command.pattern[0] ? command.pattern : "tone";
+    if (std::strcmp(pattern, "good") == 0 || std::strcmp(pattern, "success") == 0 || std::strcmp(pattern, "ok") == 0) {
+        play_tone_unlocked(660, 70, 3200);
+        write_silence_unlocked(28);
+        play_tone_unlocked(880, 95, 3400);
+    } else if (std::strcmp(pattern, "error") == 0 || std::strcmp(pattern, "fail") == 0) {
+        play_tone_unlocked(240, 95, 3600);
+        write_silence_unlocked(35);
+        play_tone_unlocked(180, 150, 3400);
+    } else if (std::strcmp(pattern, "question") == 0 || std::strcmp(pattern, "ask") == 0 || std::strcmp(pattern, "followup") == 0) {
+        play_tone_unlocked(560, 65, 3000);
+        write_silence_unlocked(25);
+        play_tone_unlocked(740, 70, 3200);
+        write_silence_unlocked(25);
+        play_tone_unlocked(620, 110, 3000);
+    } else if (std::strcmp(pattern, "camera") == 0 || std::strcmp(pattern, "photo") == 0 || std::strcmp(pattern, "shutter") == 0) {
+        play_tone_unlocked(1250, 35, 3400);
+        write_silence_unlocked(35);
+        play_tone_unlocked(920, 50, 3000);
+    } else if (std::strcmp(pattern, "alarm") == 0) {
+        for (int i = 0; i < 3; ++i) {
+            play_tone_unlocked(880, 90, 4300);
+            write_silence_unlocked(35);
+            play_tone_unlocked(440, 90, 3900);
+            write_silence_unlocked(45);
+        }
+    } else if (std::strcmp(pattern, "notify") == 0 || std::strcmp(pattern, "message") == 0) {
+        play_tone_unlocked(760, 60, 3100);
+        write_silence_unlocked(30);
+        play_tone_unlocked(1020, 85, 3200);
+    } else {
+        play_tone_unlocked(command.frequency_hz, command.duration_ms, 3200);
+    }
+    write_silence_unlocked(30);
+    unlock_audio_output();
+    return true;
 }
 
 void queue_led_command(int mode, int r, int g, int b)
@@ -4254,7 +4343,10 @@ void handle_sound_command(const char* data, int len)
         .frequency_hz = json_int(root, "frequency_hz", json_int(root, "hz", 880)),
         .duration_ms = json_int(root, "duration_ms", 140),
         .volume_pct = json_int(root, "volume_pct", -1),
+        .pattern = {},
     };
+    const char* pattern = json_string(root, "pattern", json_string(root, "kind", json_string(root, "sound", "")));
+    copy_cstr(command.pattern, sizeof(command.pattern), pattern && *pattern ? pattern : "tone");
 
     if (!g_audio_output_ready) {
         publish_error(request_id, "sound", "speaker not ready");
@@ -5140,6 +5232,11 @@ bool play_wav_url(const char* url)
     if (!client) {
         return false;
     }
+    if (!lock_audio_output(pdMS_TO_TICKS(1000))) {
+        ESP_LOGW(kTag, "tts playback skipped: audio output busy");
+        esp_http_client_cleanup(client);
+        return false;
+    }
     ESP_LOGI(kTag, "tts playback start: %s", url);
     g_tts_playing = true;
     copy_ui_mode("speaking");
@@ -5151,6 +5248,7 @@ bool play_wav_url(const char* url)
         uint8_t sample[2] = {playback.pending_byte, 0};
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, sample, sizeof(sample)));
     }
+    unlock_audio_output();
     g_tts_playing = false;
     copy_ui_mode("face");
     publish_status();
@@ -5251,11 +5349,14 @@ void sound_task(void*)
     SoundCommand command = {};
     while (true) {
         if (xQueueReceive(g_sound_queue, &command, portMAX_DELAY) == pdTRUE) {
+            const bool volume_changed = command.volume_pct >= 0;
             if (command.volume_pct >= 0) {
                 set_speaker_volume_pct(command.volume_pct);
             }
-            play_tone(command.frequency_hz, command.duration_ms);
-            publish_status();
+            play_sound_pattern(command);
+            if (volume_changed) {
+                publish_status();
+            }
         }
     }
 }
@@ -5290,7 +5391,8 @@ void ui_task(void*)
             draw_wrapped_message("STACKCHAN", command.text, command.accent);
             copy_face_emotion(command.emotion, command.intensity_pct);
             if (command.beep && g_audio_output_ready && g_sound_queue) {
-                SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1};
+                SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1, .pattern = {}};
+                copy_cstr(sound.pattern, sizeof(sound.pattern), "notify");
                 xQueueSend(g_sound_queue, &sound, 0);
             }
             publish_status();
@@ -6142,11 +6244,12 @@ extern "C" void app_main()
     init_temperature_sensor();
     init_speaker();
     init_microphone();
+    g_audio_output_mutex = xSemaphoreCreateMutex();
     g_sound_queue = xQueueCreate(4, sizeof(SoundCommand));
     g_motion_queue = xQueueCreate(3, sizeof(MotionCommand));
     g_ui_queue = xQueueCreate(6, sizeof(UiCommand));
     if (g_sound_queue) {
-        xTaskCreate(sound_task, "sound", 4096, nullptr, 3, nullptr);
+        xTaskCreate(sound_task, "sound", 8192, nullptr, 3, nullptr);
     }
     if (g_ui_queue) {
         xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
