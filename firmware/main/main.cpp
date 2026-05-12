@@ -1484,6 +1484,26 @@ void draw_line(int x0, int y0, int x1, int y1, uint16_t color, int thickness = 4
     }
 }
 
+void draw_quadratic_curve(int x0, int y0, int cx, int cy, int x1, int y1, uint16_t color, int thickness = 4, int steps = 18)
+{
+    steps = clamp_int(steps, 4, 32);
+    int prev_x = x0;
+    int prev_y = y0;
+    for (int i = 1; i <= steps; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(steps);
+        const float inv = 1.0f - t;
+        const int x = static_cast<int>(std::lround(inv * inv * x0 + 2.0f * inv * t * cx + t * t * x1));
+        const int y = static_cast<int>(std::lround(inv * inv * y0 + 2.0f * inv * t * cy + t * t * y1));
+        draw_line(prev_x, prev_y, x, y, color, thickness);
+        prev_x = x;
+        prev_y = y;
+    }
+
+    const int cap = std::max(2, thickness);
+    draw_rect(x0 - cap / 2, y0 - cap / 2, cap, cap, color);
+    draw_rect(x1 - cap / 2, y1 - cap / 2, cap, cap, color);
+}
+
 void draw_ellipse(int cx, int cy, int rx, int ry, uint16_t color)
 {
     if (rx <= 0 || ry <= 0) {
@@ -1499,13 +1519,8 @@ void draw_ellipse(int cx, int cy, int rx, int ry, uint16_t color)
 void draw_mouth_curve(int cx, int cy, int width, int height, bool smile, uint16_t color)
 {
     const int half = std::max(4, width / 2);
-    const int direction = smile ? 1 : -1;
-    const int shoulder = cy + direction * height * 2 / 3;
-    const int center = cy + direction * height;
-    draw_line(cx - half, cy, cx - half / 2, shoulder, color, 3);
-    draw_line(cx - half / 2, shoulder, cx, center, color, 3);
-    draw_line(cx, center, cx + half / 2, shoulder, color, 3);
-    draw_line(cx + half / 2, shoulder, cx + half, cy, color, 3);
+    const int control_y = cy + (smile ? height : -height);
+    draw_quadratic_curve(cx - half, cy, cx, control_y, cx + half, cy, color, 4, 24);
 }
 
 void clear(uint16_t color)
@@ -2149,9 +2164,7 @@ void draw_simple_mouth(int cx, int y, int width, int height, int mode, uint16_t 
 		draw_line(cx - width / 2, y, cx + width / 2, y, color, 4);
 	} else if (mode == 5) {
 		const int half = std::max(12, width / 2);
-		draw_line(cx - half, y + 6, cx - half / 3, y + 3, color, 3);
-		draw_line(cx - half / 3, y + 3, cx + half / 4, y + 5, color, 3);
-		draw_line(cx + half / 4, y + 5, cx + half, y - 5, color, 3);
+		draw_quadratic_curve(cx - half, y + 4, cx + half / 8, y + height, cx + half, y - 4, color, 4, 20);
 	} else if (mode == 6) {
 		draw_ellipse(cx, y, width / 5, height / 2, color);
 		draw_ellipse(cx, y, clamp_int(width / 9, 4, 9), clamp_int(height / 4, 3, 7), kBlack);
