@@ -93,6 +93,20 @@ scripts/h2s_bridge.sh watch-power --pair desk
 
 `watch-power` listens to `hermes-stackchan/desk/status`. When the AXP2101 reports a transition from battery to external power or back, the bridge displays the battery percentage and charge state for about five seconds and starts the matching head motion immediately. After the overlay, it switches to the matching face: external power becomes happy; unplugging becomes neutral. It does not change LEDs or sound, so Hermes can keep using those channels.
 
+React to physical sensor interaction:
+
+```sh
+scripts/h2s_bridge.sh watch-sensors --pair desk --verbose
+```
+
+`watch-sensors` listens to retained `status` and `events`. It uses the BMI270 IMU
+for shake/sideways detection and the LTR553 for proximity. The bridge filters
+noise with stable-sample counters, hysteresis thresholds, and short cooldowns:
+tiny motion is ignored, a real shake shows a surprise face, side position shows
+a surprised face, and proximity lowers the head a little until the object moves
+away. If StackChan is asleep, confirmed interaction wakes the display first.
+The watcher does not change LEDs or play sounds.
+
 For normal local use, start it as a background process:
 
 ```sh
@@ -244,4 +258,6 @@ idf.py -p /dev/cu.usbmodem21301 flash monitor
 3. StackChan publishes retained status.
 4. The bridge sends a `cmd/display` message.
 5. StackChan shows the text and publishes an ACK with the same `request_id`.
-6. Hardware commands publish ACK/Error and the retained `status` reflects the new state, including `battery_pct`, `battery_charging`, `battery_discharging`, `temperature.soc_c`, `temperature.servo_yaw_c`, and `temperature.servo_pitch_c`.
+6. Hardware commands publish ACK/Error and the retained `status` reflects the new state, including `battery_pct`, `battery_charging`, `battery_discharging`, `temperature.soc_c`, `temperature.servo_yaw_c`, `temperature.servo_pitch_c`, `interaction`, and `sensors`.
+
+The firmware publishes an `interaction` event when the BMI270 IMU detects real device movement or the LTR553 proximity sensor sees something close in front of StackChan. These events reset the bridge idle-sleep timer and wake a sleeping display. Internal head-servo motion is ignored for IMU interaction detection so idle animations do not keep waking the device by themselves.

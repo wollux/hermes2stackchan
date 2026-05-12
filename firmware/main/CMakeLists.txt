@@ -1,11 +1,16 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "drivers/bmi270/bmi270.cpp"
+        "drivers/bmi270/BMI270_SensorAPI/bmi2.c"
+        "drivers/bmi270/BMI270_SensorAPI/bmi270.c"
         "drivers/SCServo_lib/src/SCS.cpp"
         "drivers/SCServo_lib/src/SCSCL.cpp"
         "drivers/SCServo_lib/src/SCSerial.cpp"
     INCLUDE_DIRS
         "."
+        "drivers/bmi270"
+        "drivers/bmi270/BMI270_SensorAPI"
         "drivers/SCServo_lib/src"
     REQUIRES
         driver

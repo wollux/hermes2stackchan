@@ -39,6 +39,7 @@
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "es7210_adc.h"
+#include "drivers/bmi270/bmi270.h"
 #include "SCSCL.h"
 
 namespace {
@@ -53,6 +54,8 @@ constexpr uint8_t kPmicAddr = 0x34;
 constexpr uint8_t kAw9523Addr = 0x58;
 constexpr uint8_t kPy32Addr = 0x6F;
 constexpr uint8_t kHeadTouchAddr = 0x68;
+constexpr uint8_t kBmi270Addr = 0x69;
+constexpr uint8_t kLtr553Addr = 0x23;
 constexpr uint8_t kAw88298Addr = AW88298_CODEC_DEFAULT_ADDR;
 constexpr uint8_t kEs7210Addr = ES7210_CODEC_DEFAULT_ADDR;
 constexpr uint16_t kBlack = 0x0000;
@@ -74,6 +77,18 @@ constexpr int kVoiceMinSpeechMs = 250;
 constexpr int kVoiceSilenceAvgThreshold = 260;
 constexpr int kVoiceSilencePeakThreshold = 900;
 constexpr int kDefaultSpeakerVolumePct = 80;
+constexpr int kInteractionPollIntervalMs = 50;
+constexpr int kInteractionEventCooldownMs = 1500;
+constexpr int kSensorPauseAfterHeadMotionMs = 50;
+constexpr int kLtr553NearRawThreshold = 120;
+constexpr int kLtr553NearDeltaThreshold = 55;
+constexpr int kImuSideAxisMg = 760;
+constexpr int kImuSideUprightMaxMg = 560;
+constexpr int kImuFaceDownAxisMg = 900;
+constexpr int kImuFaceDownOtherMaxMg = 650;
+constexpr int kServoMoveStepRaw = 12;
+constexpr int kMotionMaxSpeedPct = 24;
+constexpr int kMotionMinSegmentMs = 180;
 constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
@@ -120,6 +135,25 @@ bool g_temperature_sensor_ready = false;
 volatile int g_temperature_soc_c = -1;
 volatile int g_temperature_servo_yaw_c = -1;
 volatile int g_temperature_servo_pitch_c = -1;
+volatile bool g_imu_ready = false;
+volatile int g_imu_accel_x_mg = 0;
+volatile int g_imu_accel_y_mg = 0;
+volatile int g_imu_accel_z_mg = 0;
+volatile int g_imu_gyro_x_dps = 0;
+volatile int g_imu_gyro_y_dps = 0;
+volatile int g_imu_gyro_z_dps = 0;
+volatile int g_imu_motion_score_pct = 0;
+volatile bool g_imu_motion_active = false;
+volatile bool g_ltr553_ready = false;
+volatile int g_ltr553_proximity_raw = -1;
+volatile int g_ltr553_ambient_raw = -1;
+volatile int g_ltr553_proximity_baseline = -1;
+volatile int g_ltr553_proximity_delta = 0;
+volatile bool g_ltr553_near = false;
+volatile bool g_ltr553_light_changed = false;
+volatile bool g_interaction_active = false;
+volatile int64_t g_last_interaction_ms = 0;
+char g_last_interaction_source[24] = "none";
 volatile int g_battery_pct = -1;
 volatile bool g_battery_charging = false;
 volatile bool g_battery_discharging = false;
@@ -132,6 +166,7 @@ volatile int g_led_mode = 0;
 volatile int g_led_r = 0;
 volatile int g_led_g = 0;
 volatile int g_led_b = 0;
+volatile int g_touch_side_light = 0;
 bool g_neon_ready = false;
 volatile int g_servo_yaw_pct = 0;
 volatile int g_servo_pitch_pct = 0;
@@ -140,6 +175,8 @@ volatile int g_pending_yaw_delta = 0;
 volatile int g_pending_pitch_delta = 0;
 volatile int g_pending_yaw_target_pct = 101;
 volatile int g_pending_pitch_target_pct = 101;
+volatile bool g_head_motion_active = false;
+volatile int64_t g_last_head_motion_ms = 0;
 volatile bool g_sleep_pose_saved = false;
 volatile int g_pre_sleep_yaw_pct = kDefaultIdleYawPct;
 volatile int g_pre_sleep_pitch_pct = kDefaultIdlePitchPct;
@@ -209,6 +246,7 @@ struct SoundCommand {
     int frequency_hz;
     int duration_ms;
     int volume_pct;
+    char pattern[24];
 };
 
 struct MotionPoint {
@@ -274,6 +312,7 @@ struct UiCommand {
 QueueHandle_t g_sound_queue = nullptr;
 QueueHandle_t g_motion_queue = nullptr;
 QueueHandle_t g_ui_queue = nullptr;
+SemaphoreHandle_t g_audio_output_mutex = nullptr;
 
 enum class FaceExtraMode : uint8_t {
     None,
@@ -366,6 +405,7 @@ void update_soc_temperature()
 class I2cDevice {
 public:
     I2cDevice(i2c_master_bus_handle_t bus, uint8_t address, uint32_t speed_hz = 400 * 1000)
+        : address_(address)
     {
         i2c_device_config_t config = {};
         config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
@@ -376,7 +416,17 @@ public:
 
     void write_reg(uint8_t reg, uint8_t value)
     {
-        ESP_ERROR_CHECK(try_write_reg(reg, value));
+        esp_err_t err = ESP_FAIL;
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            err = try_write_reg(reg, value);
+            if (err == ESP_OK) {
+                return;
+            }
+            ESP_LOGW(kTag, "i2c write retry addr=0x%02x reg=0x%02x attempt=%d err=%s",
+                     address_, reg, attempt, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(10 * attempt));
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(err);
     }
 
     esp_err_t try_write_reg(uint8_t reg, uint8_t value)
@@ -430,12 +480,98 @@ private:
     }
 
     i2c_master_dev_handle_t device_ = nullptr;
+    uint8_t address_ = 0;
 };
 
 std::unique_ptr<I2cDevice> g_pmic;
 std::unique_ptr<I2cDevice> g_py32;
 std::unique_ptr<I2cDevice> g_head_touch;
 std::unique_ptr<I2cDevice> g_display_touch;
+std::unique_ptr<I2cDevice> g_ltr553;
+std::unique_ptr<BMI270> g_bmi270;
+
+bool init_ltr553()
+{
+    if (!g_i2c_bus) {
+        return false;
+    }
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, kLtr553Addr, 200);
+    if (probe != ESP_OK) {
+        ESP_LOGW(kTag, "LTR553 proximity/light sensor not found at 0x%02x: %s",
+                 kLtr553Addr, esp_err_to_name(probe));
+        g_ltr553_ready = false;
+        return false;
+    }
+
+    g_ltr553 = std::make_unique<I2cDevice>(g_i2c_bus, kLtr553Addr, 400 * 1000);
+    I2cDevice& dev = *g_ltr553;
+
+    bool ok = true;
+    ok = (dev.try_write_reg(0x81, 0x00) == ESP_OK) && ok;  // PS standby during setup
+    ok = (dev.try_write_reg(0x80, 0x00) == ESP_OK) && ok;  // ALS standby during setup
+    ok = (dev.try_write_reg(0x82, 0x7B) == ESP_OK) && ok;  // LED: moderate current, 40 kHz pulse
+    ok = (dev.try_write_reg(0x83, 0x04) == ESP_OK) && ok;  // four PS pulses
+    ok = (dev.try_write_reg(0x84, 0x02) == ESP_OK) && ok;  // PS measurement around 50 ms
+    ok = (dev.try_write_reg(0x85, 0x03) == ESP_OK) && ok;  // ALS measurement around 100 ms
+    ok = (dev.try_write_reg(0x80, 0x19) == ESP_OK) && ok;  // ALS active, high gain
+    ok = (dev.try_write_reg(0x81, 0x03) == ESP_OK) && ok;  // PS active
+
+    uint8_t part_id = 0;
+    uint8_t manufacturer_id = 0;
+    dev.try_read_reg(0x86, part_id);
+    dev.try_read_reg(0x87, manufacturer_id);
+    g_ltr553_ready = ok;
+    ESP_LOGI(kTag, "LTR553 %s part=0x%02x manufacturer=0x%02x",
+             ok ? "ready" : "setup failed", part_id, manufacturer_id);
+    return ok;
+}
+
+bool read_ltr553(uint16_t& proximity, uint16_t& ambient)
+{
+    proximity = 0;
+    ambient = 0;
+    if (!g_ltr553_ready || !g_ltr553) {
+        return false;
+    }
+
+    uint8_t ps[2] = {};
+    uint8_t als[4] = {};
+    if (g_ltr553->try_read(0x8D, ps, sizeof(ps)) != ESP_OK ||
+        g_ltr553->try_read(0x88, als, sizeof(als)) != ESP_OK) {
+        return false;
+    }
+
+    proximity = static_cast<uint16_t>(ps[0] | ((ps[1] & 0x07) << 8));
+    const uint16_t als_ch1 = static_cast<uint16_t>(als[0] | (als[1] << 8));
+    const uint16_t als_ch0 = static_cast<uint16_t>(als[2] | (als[3] << 8));
+    ambient = std::max(als_ch0, als_ch1);
+    return true;
+}
+
+bool init_imu()
+{
+    if (!g_i2c_bus) {
+        return false;
+    }
+    const esp_err_t probe = i2c_master_probe(g_i2c_bus, kBmi270Addr, 200);
+    if (probe != ESP_OK) {
+        ESP_LOGW(kTag, "BMI270 IMU not found at 0x%02x: %s",
+                 kBmi270Addr, esp_err_to_name(probe));
+        g_imu_ready = false;
+        return false;
+    }
+
+    g_bmi270 = std::make_unique<BMI270>(g_i2c_bus, kBmi270Addr);
+    if (!g_bmi270->begin()) {
+        ESP_LOGW(kTag, "BMI270 init failed");
+        g_bmi270.reset();
+        g_imu_ready = false;
+        return false;
+    }
+    g_imu_ready = true;
+    ESP_LOGI(kTag, "BMI270 IMU ready");
+    return true;
+}
 
 bool init_head_touch()
 {
@@ -474,24 +610,135 @@ bool init_head_touch()
     return true;
 }
 
-bool read_head_touch_pressed(uint8_t* raw_out = nullptr)
+enum class HeadTouchZone {
+    None,
+    Left,
+    Center,
+    Right,
+    Ambiguous,
+};
+
+struct HeadTouchSample {
+    uint8_t raw = 0;
+    uint8_t intensity[3] = {0, 0, 0};
+    int position_pct = 0;
+    HeadTouchZone zone = HeadTouchZone::None;
+};
+
+int head_touch_position_from_intensity(const uint8_t intensity[3])
+{
+    const int total = static_cast<int>(intensity[0]) + static_cast<int>(intensity[1]) + static_cast<int>(intensity[2]);
+    if (total <= 0) {
+        return 0;
+    }
+    const int weighted = static_cast<int>(intensity[0]) * -100 + static_cast<int>(intensity[2]) * 100;
+    return weighted / total;
+}
+
+HeadTouchZone head_touch_zone_from_position(int position_pct, const uint8_t intensity[3])
+{
+    int max_intensity = static_cast<int>(intensity[0]);
+    if (static_cast<int>(intensity[1]) > max_intensity) {
+        max_intensity = static_cast<int>(intensity[1]);
+    }
+    if (static_cast<int>(intensity[2]) > max_intensity) {
+        max_intensity = static_cast<int>(intensity[2]);
+    }
+    if (max_intensity <= 0) {
+        return HeadTouchZone::None;
+    }
+    if (position_pct <= -40) {
+        return HeadTouchZone::Left;
+    }
+    if (position_pct >= 40) {
+        return HeadTouchZone::Right;
+    }
+    return HeadTouchZone::Center;
+}
+
+HeadTouchSample parse_head_touch_sample(uint8_t raw)
+{
+    HeadTouchSample sample = {};
+    sample.raw = raw;
+    for (int zone = 0; zone < 3; ++zone) {
+        sample.intensity[zone] = (raw >> (zone * 2)) & 0x03;
+    }
+    sample.position_pct = head_touch_position_from_intensity(sample.intensity);
+    sample.zone = head_touch_zone_from_position(sample.position_pct, sample.intensity);
+    return sample;
+}
+
+const char* head_touch_source_from_position(HeadTouchZone zone, int position_pct)
+{
+    switch (zone) {
+    case HeadTouchZone::Left:
+        return "head_touch_left";
+    case HeadTouchZone::Right:
+        return "head_touch_right";
+    case HeadTouchZone::Center:
+        return "head_touch";
+    case HeadTouchZone::Ambiguous:
+        return "head_touch";
+    case HeadTouchZone::None:
+    default:
+        return "head_touch";
+    }
+}
+
+const char* head_touch_zone_name(HeadTouchZone zone)
+{
+    switch (zone) {
+    case HeadTouchZone::Left:
+        return "left";
+    case HeadTouchZone::Center:
+        return "center";
+    case HeadTouchZone::Right:
+        return "right";
+    case HeadTouchZone::Ambiguous:
+        return "ambiguous";
+    case HeadTouchZone::None:
+    default:
+        return "none";
+    }
+}
+
+bool head_touch_zone_starts_recording(HeadTouchZone zone)
+{
+    return zone == HeadTouchZone::Center || zone == HeadTouchZone::Ambiguous;
+}
+
+bool read_head_touch_pressed(uint8_t* raw_out = nullptr, HeadTouchZone* zone_out = nullptr, HeadTouchSample* sample_out = nullptr)
 {
     if (!g_head_touch_ready || !g_head_touch) {
+        if (zone_out) {
+            *zone_out = HeadTouchZone::None;
+        }
+        if (sample_out) {
+            *sample_out = {};
+        }
         return false;
     }
     uint8_t raw = 0;
     if (g_head_touch->try_read_reg(0x10, raw) != ESP_OK) {
+        if (zone_out) {
+            *zone_out = HeadTouchZone::None;
+        }
+        if (sample_out) {
+            *sample_out = {};
+        }
         return false;
     }
     if (raw_out) {
         *raw_out = raw;
     }
-    for (int zone = 0; zone < 3; ++zone) {
-        if (((raw >> (zone * 2)) & 0x03) != 0) {
-            return true;
-        }
+    const HeadTouchSample sample = parse_head_touch_sample(raw);
+    if (zone_out) {
+        *zone_out = sample.zone;
     }
-    return false;
+    if (sample_out) {
+        *sample_out = sample;
+    }
+    return sample.zone != HeadTouchZone::None;
 }
 
 bool init_display_touch()
@@ -617,6 +864,26 @@ bool show_neon_pixels()
     bool ok = g_py32->try_read_reg(0x24, led_cfg) == ESP_OK;
     ok = (g_py32->try_write_reg(0x24, led_cfg | (1 << 6)) == ESP_OK) && ok;
     return ok;
+}
+
+void set_touch_side_light_now(int side)
+{
+    g_touch_side_light = side;
+    if (!g_neon_ready) {
+        return;
+    }
+    if (side < 0) {
+        set_neon_range(0, 6, 0, 185, 110);
+        set_neon_range(6, 6, 0, 0, 0);
+        show_neon_pixels();
+    } else if (side > 0) {
+        set_neon_range(0, 6, 0, 0, 0);
+        set_neon_range(6, 6, 0, 185, 110);
+        show_neon_pixels();
+    } else {
+        set_neon_range(0, 12, 0, 0, 0);
+        show_neon_pixels();
+    }
 }
 
 void color_wheel(int pos, uint8_t* r, uint8_t* g, uint8_t* b)
@@ -813,6 +1080,8 @@ void init_power_and_reset_panel()
 
     init_head_touch();
     init_display_touch();
+    init_ltr553();
+    init_imu();
     init_robot_body_power();
 }
 
@@ -1600,11 +1869,21 @@ bool is_transient_face_emotion(const char* emotion)
            std::strcmp(emotion, "deep_breathe") == 0 ||
            std::strcmp(emotion, "micro_sleep") == 0 ||
            std::strcmp(emotion, "wink_left") == 0 ||
-           std::strcmp(emotion, "wink_right") == 0 ||
-           std::strcmp(emotion, "surprise_pop") == 0 ||
-           std::strcmp(emotion, "grumble") == 0 ||
-           std::strcmp(emotion, "yawn") == 0 ||
-           std::strcmp(emotion, "happy_squint") == 0;
+	           std::strcmp(emotion, "wink_right") == 0 ||
+	           std::strcmp(emotion, "surprise_pop") == 0 ||
+	           std::strcmp(emotion, "grumble") == 0 ||
+	           std::strcmp(emotion, "yawn") == 0 ||
+	           std::strcmp(emotion, "happy_squint") == 0 ||
+	           std::strcmp(emotion, "cross_eyes") == 0 ||
+	           std::strcmp(emotion, "eye_swap") == 0 ||
+	           std::strcmp(emotion, "derp") == 0 ||
+	           std::strcmp(emotion, "boing_eyes") == 0 ||
+	           std::strcmp(emotion, "suspicious_squint") == 0 ||
+	           std::strcmp(emotion, "confused_dots") == 0 ||
+	           std::strcmp(emotion, "mouth_pop") == 0 ||
+	           std::strcmp(emotion, "smirk_slide") == 0 ||
+	           std::strcmp(emotion, "silent_giggle") == 0 ||
+	           std::strcmp(emotion, "sleepy_snapback") == 0;
 }
 
 void draw_face(const char* emotion, int intensity_pct);
@@ -1624,6 +1903,142 @@ void draw_open_eyes(int left_x, int right_x, int eye_y, int rx, int ry,
     draw_ellipse(right_x + pupil_dx, eye_y + pupil_dy, pupil_rx, pupil_ry, kBlack);
 }
 
+void draw_single_eye(int x, int y, int rx, int ry, int pupil_dx, int pupil_dy, uint16_t eye_color)
+{
+	rx = clamp_int(rx, 4, 32);
+	ry = clamp_int(ry, 3, 38);
+	draw_ellipse(x, y, rx, ry, eye_color);
+	if (ry <= 5) {
+		return;
+	}
+	const int pupil_rx = clamp_int(rx / 2, 4, 10);
+	const int pupil_ry = clamp_int(ry / 3, 5, 13);
+	const int max_dx = clamp_int(rx - pupil_rx - 2, 0, 18);
+	const int max_dy = clamp_int(ry - pupil_ry - 2, 0, 14);
+	draw_ellipse(x + clamp_int(pupil_dx, -max_dx, max_dx),
+	             y + clamp_int(pupil_dy, -max_dy, max_dy),
+	             pupil_rx,
+	             pupil_ry,
+	             kBlack);
+}
+
+void draw_single_eye_line(int x, int y, int tilt, uint16_t eye_color, int width = 46)
+{
+	draw_line(x - width / 2, y - tilt, x + width / 2, y + tilt, eye_color, 5);
+}
+
+void draw_designed_eyes(int left_x, int right_x, int eye_y,
+                        int rx, int ry, int pupil_dx, int pupil_dy,
+                        uint16_t eye_color)
+{
+	rx = clamp_int(rx, 10, 34);
+	ry = clamp_int(ry, 12, 42);
+	draw_single_eye(left_x, eye_y, rx, ry, pupil_dx, pupil_dy, eye_color);
+	draw_single_eye(right_x, eye_y, rx, ry, pupil_dx, pupil_dy, eye_color);
+}
+
+void draw_happy_eye(int x, int y, int width, int lift, uint16_t eye_color)
+{
+	width = clamp_int(width, 36, 70);
+	lift = clamp_int(lift, 10, 26);
+	draw_mouth_curve(x, y - lift / 2, width, lift, false, eye_color);
+	draw_mouth_curve(x, y - lift / 2 + 2, width - 8, lift - 3, false, eye_color);
+}
+
+void draw_flat_eye(int x, int y, int width, int tilt, uint16_t eye_color)
+{
+	draw_single_eye_line(x, y, tilt, eye_color, clamp_int(width, 40, 68));
+}
+
+uint16_t emotion_eye_color(const char* emotion)
+{
+	if (!emotion) {
+		return rgb565(245, 250, 255);
+	}
+	if (std::strcmp(emotion, "happy") == 0 ||
+	    std::strcmp(emotion, "love") == 0 ||
+	    std::strcmp(emotion, "happy_squint") == 0 ||
+	    std::strcmp(emotion, "silent_giggle") == 0 ||
+	    std::strcmp(emotion, "tiny_laugh") == 0 ||
+	    std::strcmp(emotion, "wink") == 0 ||
+	    std::strcmp(emotion, "wink_left") == 0 ||
+	    std::strcmp(emotion, "wink_right") == 0) {
+		return rgb565(255, 224, 116);
+	}
+	if (std::strcmp(emotion, "angry") == 0 ||
+	    std::strcmp(emotion, "error") == 0 ||
+	    std::strcmp(emotion, "battery_low") == 0 ||
+	    std::strcmp(emotion, "grumble") == 0) {
+		return rgb565(255, 76, 88);
+	}
+	if (std::strcmp(emotion, "sad") == 0 ||
+	    std::strcmp(emotion, "sleep") == 0 ||
+	    std::strcmp(emotion, "micro_sleep") == 0 ||
+	    std::strcmp(emotion, "sleepy_snapback") == 0 ||
+	    std::strcmp(emotion, "bored_sigh") == 0) {
+		return rgb565(126, 188, 255);
+	}
+	if (std::strcmp(emotion, "question") == 0 ||
+	    std::strcmp(emotion, "confused") == 0 ||
+	    std::strcmp(emotion, "confused_dots") == 0 ||
+	    std::strcmp(emotion, "look_up_think") == 0) {
+		return rgb565(120, 236, 255);
+	}
+	if (std::strcmp(emotion, "surprised") == 0 ||
+	    std::strcmp(emotion, "surprise_pop") == 0 ||
+	    std::strcmp(emotion, "boing_eyes") == 0) {
+		return rgb565(255, 246, 150);
+	}
+	if (std::strcmp(emotion, "speaking") == 0 ||
+	    std::strcmp(emotion, "thinking") == 0 ||
+	    std::strcmp(emotion, "listening") == 0) {
+		return rgb565(145, 255, 230);
+	}
+	if (std::strcmp(emotion, "charging") == 0 ||
+	    std::strcmp(emotion, "battery") == 0) {
+		return rgb565(112, 255, 150);
+	}
+	if (std::strcmp(emotion, "suspicious_squint") == 0 ||
+	    std::strcmp(emotion, "smirk_slide") == 0 ||
+	    std::strcmp(emotion, "derp") == 0 ||
+	    std::strcmp(emotion, "cross_eyes") == 0 ||
+	    std::strcmp(emotion, "eye_swap") == 0) {
+		return rgb565(222, 210, 255);
+	}
+	return rgb565(245, 250, 255);
+}
+
+void draw_simple_mouth(int cx, int y, int width, int height, int mode, uint16_t color)
+{
+	width = clamp_int(width, 20, 96);
+	height = clamp_int(height, 6, 38);
+	if (mode == 1) {
+		draw_mouth_curve(cx, y - 6, width + 8, height + 5, true, color);
+		draw_mouth_curve(cx, y - 5, width, height + 2, true, color);
+	} else if (mode == 2) {
+		draw_mouth_curve(cx, y, width - 20, 10, true, color);
+	} else if (mode == 3) {
+		draw_line(cx - width / 2, y - 2, cx - width / 4, y + 7, color, 3);
+		draw_line(cx - width / 4, y + 7, cx, y - 2, color, 3);
+		draw_line(cx, y - 2, cx + width / 4, y + 7, color, 3);
+		draw_line(cx + width / 4, y + 7, cx + width / 2, y - 2, color, 3);
+	} else if (mode == 4) {
+		draw_line(cx - width / 2, y, cx + width / 2, y, color, 4);
+	} else if (mode == 5) {
+		draw_line(cx - width / 2, y + 3, cx - 4, y + 7, color, 4);
+		draw_mouth_curve(cx + 18, y - 4, width / 2, height, true, color);
+	} else if (mode == 6) {
+		draw_ellipse(cx, y, width / 5, height / 2, color);
+		draw_ellipse(cx, y, clamp_int(width / 9, 4, 9), clamp_int(height / 4, 3, 7), kBlack);
+	} else if (mode == 7) {
+		draw_mouth_curve(cx - 12, y + 8, width / 2, height, false, color);
+		draw_mouth_curve(cx + 18, y - 2, width / 2, height, true, color);
+	} else {
+		draw_mouth_curve(cx, y - 3, width, height, true, color);
+		draw_mouth_curve(cx, y - 2, width - 10, height - 5, true, color);
+	}
+}
+
 void draw_life_face_frame(const char* base_emotion, int intensity_pct,
                           int eye_dx, int eye_dy, int eye_ry,
                           int pupil_dx = 0, int pupil_dy = 0,
@@ -1633,43 +2048,69 @@ void draw_life_face_frame(const char* base_emotion, int intensity_pct,
     copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
     FaceFrameGuard frame;
 
-    const uint16_t white = rgb565(245, 250, 255);
-    const uint16_t warm = rgb565(255, 230, 120);
-    const uint16_t face_color = std::strcmp(base_emotion, "happy") == 0 ||
-                                        std::strcmp(base_emotion, "love") == 0
-                                    ? warm
-                                    : white;
+	    const uint16_t white = rgb565(245, 250, 255);
+		    const uint16_t face_color = emotion_eye_color(base_emotion);
     const int pulse = clamp_int(intensity_pct / 18, 0, 6);
-    const int left_x = 105 + eye_dx;
-    const int right_x = 215 + eye_dx;
-    const int eye_y = 92 + eye_dy;
-    const int mouth_y = 154 + eye_dy / 4;
+	    const int left_x = 100 + eye_dx;
+	    const int right_x = 220 + eye_dx;
+	    const int eye_y = 84 + eye_dy;
+	    const int mouth_y = 168 + eye_dy / 4;
 
     clear(kBlack);
 
     if (eye_ry <= 4) {
-        draw_line(left_x - 24, eye_y, left_x + 24, eye_y, face_color, 5);
-        draw_line(right_x - 24, eye_y, right_x + 24, eye_y, face_color, 5);
-    } else {
-        draw_open_eyes(left_x, right_x, eye_y, 13 + pulse, eye_ry,
-                       pupil_dx, pupil_dy, face_color);
-    }
+	        draw_flat_eye(left_x, eye_y, 56, 0, face_color);
+	        draw_flat_eye(right_x, eye_y, 56, 0, face_color);
+	    } else {
+	        draw_designed_eyes(left_x, right_x, eye_y, 17 + pulse, eye_ry + 2,
+	                           pupil_dx, pupil_dy, face_color);
+	    }
 
-    if (mouth_mode == 1) {
-        draw_mouth_curve(160 + eye_dx / 4, mouth_y - 10, 82, 32 + pulse, true, white);
-    } else if (mouth_mode == 2) {
-        draw_mouth_curve(160 + eye_dx / 4, mouth_y, 42, 10, true, white);
-    } else if (mouth_mode == 3) {
-        draw_line(126, mouth_y - 2, 146, mouth_y + 7, white, 3);
-        draw_line(146, mouth_y + 7, 166, mouth_y - 2, white, 3);
-        draw_line(166, mouth_y - 2, 188, mouth_y + 7, white, 3);
-    } else if (std::strcmp(base_emotion, "sad") == 0) {
-        draw_mouth_curve(160 + eye_dx / 4, mouth_y + 22, 72, 24, false, white);
-    } else if (std::strcmp(base_emotion, "happy") == 0 || std::strcmp(base_emotion, "love") == 0) {
-        draw_mouth_curve(160 + eye_dx / 4, mouth_y - 8, 76, 28 + pulse, true, white);
-    } else {
-        draw_mouth_curve(160 + eye_dx / 4, mouth_y - 4, 62, 18, true, white);
-    }
+	if (mouth_mode == 1) {
+		draw_simple_mouth(160 + eye_dx / 4, mouth_y - 2, 82, 30 + pulse, 1, white);
+	} else if (mouth_mode == 2) {
+		draw_simple_mouth(160 + eye_dx / 4, mouth_y, 42, 10, 2, white);
+	} else if (mouth_mode == 3) {
+		draw_simple_mouth(160 + eye_dx / 4, mouth_y, 64, 14, 3, white);
+	} else if (std::strcmp(base_emotion, "sad") == 0) {
+		draw_mouth_curve(160 + eye_dx / 4, mouth_y + 16, 64, 20, false, white);
+	} else if (std::strcmp(base_emotion, "happy") == 0 || std::strcmp(base_emotion, "love") == 0) {
+		draw_simple_mouth(160 + eye_dx / 4, mouth_y - 1, 70, 24 + pulse, 1, white);
+	} else {
+		draw_simple_mouth(160 + eye_dx / 4, mouth_y, 54, 14, 0, white);
+	}
+}
+
+void draw_custom_life_face_frame(int left_rx, int left_ry, int left_pupil_dx, int left_pupil_dy,
+                                 int right_rx, int right_ry, int right_pupil_dx, int right_pupil_dy,
+                                 int mouth_mode, int mouth_dx, int mouth_dy,
+                                 int left_tilt, int right_tilt, int intensity_pct)
+{
+	wake_display_if_needed();
+	copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
+	FaceFrameGuard frame;
+
+	const uint16_t white = rgb565(245, 250, 255);
+	const uint16_t eye_color = emotion_eye_color(g_face_emotion);
+	const uint16_t warm = rgb565(255, 230, 120);
+	const int pulse = clamp_int(intensity_pct / 22, 0, 5);
+		const int left_x = 100;
+		const int right_x = 220;
+		const int eye_y = 84;
+		const int mouth_y = 168;
+
+	clear(kBlack);
+	if (left_ry <= 5) {
+		draw_single_eye_line(left_x, eye_y, left_tilt, eye_color);
+	} else {
+			draw_single_eye(left_x, eye_y, left_rx + pulse + 3, left_ry + pulse + 2, left_pupil_dx, left_pupil_dy, eye_color);
+	}
+	if (right_ry <= 5) {
+		draw_single_eye_line(right_x, eye_y, right_tilt, eye_color);
+	} else {
+			draw_single_eye(right_x, eye_y, right_rx + pulse + 3, right_ry + pulse + 2, right_pupil_dx, right_pupil_dy, eye_color);
+	}
+	draw_simple_mouth(160 + mouth_dx, mouth_y + mouth_dy, 64 + pulse * 3, 18 + pulse, mouth_mode, mouth_mode == 1 ? warm : white);
 }
 
 void animate_transient_face(const char* emotion, int intensity_pct)
@@ -1755,8 +2196,8 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             const int pulse = clamp_int(base_intensity / 18, 0, 6);
             const int left_x = 105;
             const int right_x = 215;
-            const int eye_y = 92;
-            const int mouth_y = 154;
+	    const int eye_y = 90;
+	    const int mouth_y = 162;
             if (left_closed) {
                 draw_line(left_x - 24, eye_y, left_x + 24, eye_y + phase, white, 5);
                 draw_open_eyes(right_x, right_x, eye_y, 13 + pulse, 28 + pulse, pupil_shift, 0, white);
@@ -1789,9 +2230,9 @@ void animate_transient_face(const char* emotion, int intensity_pct)
         return;
     }
 
-    if (std::strcmp(emotion, "happy_squint") == 0) {
-        const int offsets[] = {0, 2, 4, 4, 2, 0};
-        for (int offset : offsets) {
+	if (std::strcmp(emotion, "happy_squint") == 0) {
+		const int offsets[] = {0, 2, 4, 4, 2, 0};
+		for (int offset : offsets) {
             FaceFrameGuard frame;
             clear(kBlack);
             const uint16_t warm = rgb565(255, 230, 120);
@@ -1802,12 +2243,115 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             vTaskDelay(pdMS_TO_TICKS(105));
         }
         draw_face(base_emotion, base_intensity);
-        return;
-    }
+		return;
+	}
 
-    if (std::strcmp(emotion, "grumble") == 0) {
-        const int wiggles[] = {0, 3, -2, 2, 0};
-        for (int wiggle : wiggles) {
+	if (std::strcmp(emotion, "cross_eyes") == 0) {
+			const int shifts[] = {0, 4, 8, 10, 10, 6, 0};
+		for (int shift : shifts) {
+			draw_custom_life_face_frame(14, 29, shift, 0, 14, 29, -shift, 0, 2, 0, 0, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(88));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "eye_swap") == 0) {
+			const int shifts[] = {0, 6, 12, 8, -8, -12, -6, 0};
+		for (int shift : shifts) {
+			draw_custom_life_face_frame(14, 29, shift, 0, 14, 29, -shift, 0, 5, shift / 5, 0, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(74));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "derp") == 0) {
+		const int phases[] = {0, 1, 2, 2, 1, 0};
+		for (int phase : phases) {
+				draw_custom_life_face_frame(14, 28, -3, -8 + phase, 14, 28, 7, 8 - phase, 5, -3 + phase, 1, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(115));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "boing_eyes") == 0) {
+			const int sizes[] = {0, 6, -4, 4, -2, 0};
+		for (int size : sizes) {
+			draw_custom_life_face_frame(14 + size / 3, 29 + size, 0, -size / 4,
+			                            14 + size / 3, 29 + size, 0, -size / 4,
+			                            size > 2 ? 6 : 0, 0, -size / 4, 0, 0, base_intensity + size);
+			vTaskDelay(pdMS_TO_TICKS(82));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "suspicious_squint") == 0) {
+			const int phases[] = {0, 1, 2, 2, 1, 0};
+			for (int phase : phases) {
+				draw_custom_life_face_frame(15, 24 - phase * 4, -7, 0, 15, 29, -7, 0, 7, -4, 1, 2, -1, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(120));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "confused_dots") == 0) {
+			const int dots[][4] = {{-7, -4, 7, 4}, {6, -7, -6, 7}, {-2, 7, 2, -7}, {8, 0, -8, 0}, {0, 0, 0, 0}};
+		for (const auto& dot : dots) {
+			draw_custom_life_face_frame(12, 26, dot[0], dot[1], 12, 26, dot[2], dot[3], 6, 0, 0, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(92));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "mouth_pop") == 0) {
+		const int modes[] = {2, 6, 6, 1, 0};
+		for (int mode : modes) {
+			draw_custom_life_face_frame(14, 29, 0, 0, 14, 29, 0, 0, mode, 0, mode == 6 ? 2 : 0, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(105));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "smirk_slide") == 0) {
+			const int shifts[] = {0, 6, 11, 11, 5, 0};
+		for (int shift : shifts) {
+			draw_custom_life_face_frame(14, 28, shift / 2, 0, 14, 28, shift / 2, 0, 5, shift, 0, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(100));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "silent_giggle") == 0) {
+			const int bounces[] = {0, 2, 0, 3, 0, 2, 0};
+		for (int bounce : bounces) {
+			draw_custom_life_face_frame(15, 5, 0, 0, 15, 5, 0, 0, bounce > 0 ? 1 : 2, 0, -bounce, 2, -2, base_intensity + 8);
+			vTaskDelay(pdMS_TO_TICKS(78));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "sleepy_snapback") == 0) {
+		const int heights[] = {22, 12, 4, 4, 34, 26};
+		for (int height : heights) {
+			draw_custom_life_face_frame(14, height, 0, height < 8 ? 0 : 3, 14, height, 0, height < 8 ? 0 : 3,
+			                            height > 30 ? 6 : 2, 0, height > 30 ? -2 : 2, 0, 0, base_intensity);
+			vTaskDelay(pdMS_TO_TICKS(height < 8 ? 165 : 92));
+		}
+		draw_face(base_emotion, base_intensity);
+		return;
+	}
+
+	if (std::strcmp(emotion, "grumble") == 0) {
+		const int wiggles[] = {0, 3, -2, 2, 0};
+		for (int wiggle : wiggles) {
             draw_life_face_frame(base_emotion,
                                  clamp_int(base_intensity - 6, 0, 100),
                                  0,
@@ -1927,37 +2471,27 @@ void draw_face(const char* emotion, int intensity_pct)
     copy_face_emotion(emotion, intensity_pct);
     FaceFrameGuard frame;
 
-    const uint16_t white = rgb565(245, 250, 255);
-    const uint16_t cyan = rgb565(20, 180, 255);
-    const uint16_t warm = rgb565(255, 230, 120);
-    const uint16_t green = rgb565(80, 255, 130);
-    const uint16_t red = rgb565(255, 55, 70);
-    const uint16_t face_color = std::strcmp(g_face_emotion, "angry") == 0 ||
-                                        std::strcmp(g_face_emotion, "error") == 0 ||
-                                        std::strcmp(g_face_emotion, "battery_low") == 0
-                                    ? red
-                                : std::strcmp(g_face_emotion, "happy") == 0 ||
-                                        std::strcmp(g_face_emotion, "love") == 0
-                                    ? warm
-                                : std::strcmp(g_face_emotion, "charging") == 0 ||
-                                        std::strcmp(g_face_emotion, "battery") == 0
-                                    ? green
-                                    : white;
+	    const uint16_t white = rgb565(245, 250, 255);
+	    const uint16_t cyan = rgb565(20, 180, 255);
+	    const uint16_t warm = rgb565(255, 230, 120);
+	    const uint16_t green = rgb565(80, 255, 130);
+	    const uint16_t red = rgb565(255, 55, 70);
+	    const uint16_t face_color = emotion_eye_color(g_face_emotion);
     const uint16_t accent = std::strcmp(g_face_emotion, "sleep") == 0 ? rgb565(80, 130, 160) : cyan;
     const int pulse = clamp_int(intensity_pct / 18, 0, 6);
-    const int left_x = 105;
-    const int right_x = 215;
-    const int eye_y = 92;
-    const int mouth_y = 154;
+	    const int left_x = 100;
+	    const int right_x = 220;
+	    const int eye_y = 84;
+	    const int mouth_y = 168;
 
     clear(kBlack);
 
-    if (std::strcmp(g_face_emotion, "blink") == 0) {
-        draw_line(left_x - 26, eye_y, left_x + 26, eye_y, face_color, 5);
-        draw_line(right_x - 26, eye_y, right_x + 26, eye_y, face_color, 5);
-        draw_mouth_curve(160, mouth_y - 4, 62, 18, true, white);
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "blink") == 0) {
+			draw_flat_eye(left_x, eye_y, 58, 0, face_color);
+			draw_flat_eye(right_x, eye_y, 58, 0, face_color);
+			draw_simple_mouth(160, mouth_y, 68, 18, 0, white);
+			return;
+		}
 
     if (std::strcmp(g_face_emotion, "look_left") == 0 ||
         std::strcmp(g_face_emotion, "look_right") == 0 ||
@@ -1965,74 +2499,77 @@ void draw_face(const char* emotion, int intensity_pct)
         std::strcmp(g_face_emotion, "look_down") == 0) {
         const int dx = std::strcmp(g_face_emotion, "look_left") == 0 ? -18 :
                        std::strcmp(g_face_emotion, "look_right") == 0 ? 18 : 0;
-        const int dy = std::strcmp(g_face_emotion, "look_up") == 0 ? -10 :
-                       std::strcmp(g_face_emotion, "look_down") == 0 ? 12 : 0;
-        draw_open_eyes(left_x + dx, right_x + dx, eye_y + dy,
-                       13 + pulse, 28 + pulse, 0, 0, face_color);
-        draw_mouth_curve(160 + dx / 3, mouth_y - 4 + dy / 3, 62, 18, true, white);
-        return;
-    }
+		const int dy = std::strcmp(g_face_emotion, "look_up") == 0 ? -10 :
+		               std::strcmp(g_face_emotion, "look_down") == 0 ? 12 : 0;
+			draw_designed_eyes(left_x, right_x, eye_y,
+			                   18 + pulse, 32 + pulse, dx, dy, face_color);
+			draw_simple_mouth(160 + dx / 5, mouth_y + dy / 4, 68, 18, 0, white);
+			return;
+		}
 
-    if (std::strcmp(g_face_emotion, "sleep") == 0) {
-        draw_line(left_x - 24, eye_y, left_x + 24, eye_y, accent, 5);
-        draw_line(right_x - 24, eye_y, right_x + 24, eye_y, accent, 5);
-        draw_line(150, mouth_y, 170, mouth_y + 6, white, 3);
-        draw_line(170, mouth_y + 6, 190, mouth_y, white, 3);
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "sleep") == 0) {
+			draw_flat_eye(left_x, eye_y + 2, 52, -2, accent);
+			draw_flat_eye(right_x, eye_y + 2, 52, 2, accent);
+			draw_simple_mouth(160, mouth_y + 5, 52, 12, 3, white);
+			return;
+		}
 
-    if (std::strcmp(g_face_emotion, "happy") == 0) {
-        draw_mouth_curve(left_x, eye_y - 10, 44 + pulse, 18, false, face_color);
-        draw_mouth_curve(right_x, eye_y - 10, 44 + pulse, 18, false, face_color);
-        draw_mouth_curve(160, mouth_y - 8, 76, 28 + pulse, true, white);
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "happy") == 0) {
+			draw_happy_eye(left_x, eye_y, 58 + pulse, 20, face_color);
+			draw_happy_eye(right_x, eye_y, 58 + pulse, 20, face_color);
+			draw_simple_mouth(160, mouth_y - 1, 82, 28 + pulse, 1, white);
+			return;
+		}
 
-    if (std::strcmp(g_face_emotion, "angry") == 0) {
-        draw_line(left_x - 26, eye_y - 22, left_x + 20, eye_y + 16, face_color, 6);
-        draw_line(right_x + 26, eye_y - 22, right_x - 20, eye_y + 16, face_color, 6);
-        draw_line(125, mouth_y + 8, 195, mouth_y + 2, face_color, 5);
-        return;
-    }
+	    if (std::strcmp(g_face_emotion, "angry") == 0) {
+	        draw_line(left_x - 30, eye_y - 24, left_x + 22, eye_y + 16, face_color, 7);
+	        draw_line(right_x + 30, eye_y - 24, right_x - 22, eye_y + 16, face_color, 7);
+	        draw_line(122, mouth_y + 8, 198, mouth_y + 2, face_color, 5);
+	        return;
+	    }
 
-    if (std::strcmp(g_face_emotion, "sad") == 0) {
-        draw_open_eyes(left_x, right_x, eye_y, 13, 28 + pulse, 0, 2, face_color);
-        draw_mouth_curve(160, mouth_y + 22, 72, 24, false, white);
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "sad") == 0) {
+			draw_designed_eyes(left_x, right_x, eye_y + 2, 17, 31 + pulse, 0, 7, face_color);
+			draw_mouth_curve(160, mouth_y + 17, 72, 22, false, white);
+			return;
+		}
 
-    if (std::strcmp(g_face_emotion, "surprised") == 0 || std::strcmp(g_face_emotion, "question") == 0) {
-        draw_open_eyes(left_x, right_x, eye_y, 22 + pulse, 30 + pulse, 0, 0, face_color);
-        if (std::strcmp(g_face_emotion, "question") == 0) {
-            draw_centered_text(mouth_y - 20, "?", 5, white);
-        } else {
-            draw_ellipse(160, mouth_y, 20 + pulse, 24 + pulse, white);
-        }
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "surprised") == 0 || std::strcmp(g_face_emotion, "question") == 0) {
+			if (std::strcmp(g_face_emotion, "question") == 0) {
+				draw_single_eye(left_x, eye_y, 18 + pulse, 34 + pulse, -3, -3, face_color);
+				draw_flat_eye(right_x, eye_y - 1, 56, -6, face_color);
+			} else {
+				draw_designed_eyes(left_x, right_x, eye_y, 27 + pulse, 34 + pulse, 0, 0, face_color);
+			}
+			if (std::strcmp(g_face_emotion, "question") == 0) {
+				draw_simple_mouth(160, mouth_y + 2, 66, 20, 7, white);
+			} else {
+				draw_simple_mouth(160, mouth_y, 62 + pulse, 30 + pulse, 6, white);
+			}
+			return;
+		}
 
-    if (std::strcmp(g_face_emotion, "wink") == 0) {
-        draw_line(left_x - 22, eye_y, left_x + 22, eye_y, face_color, 5);
-        draw_open_eyes(right_x, right_x, eye_y, 13 + pulse, 28 + pulse, 0, 0, face_color);
-        draw_mouth_curve(160, mouth_y - 8, 62, 22, true, white);
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "wink") == 0) {
+			draw_flat_eye(left_x, eye_y, 56, -4, face_color);
+			draw_single_eye(right_x, eye_y, 19 + pulse, 33 + pulse, -2, 0, face_color);
+			draw_simple_mouth(164, mouth_y - 2, 70, 22, 5, white);
+			return;
+		}
 
-    if (std::strcmp(g_face_emotion, "speaking") == 0) {
-        draw_open_eyes(left_x, right_x, eye_y, 14 + pulse, 29 + pulse, 0, 0, face_color);
-        draw_ellipse(160, mouth_y, 38 + pulse * 2, 18 + pulse, accent);
-        draw_ellipse(160, mouth_y, 24 + pulse, 10 + pulse / 2, kBlack);
-        return;
-    }
+		if (std::strcmp(g_face_emotion, "speaking") == 0) {
+			draw_designed_eyes(left_x, right_x, eye_y, 18 + pulse, 32 + pulse, 0, 0, face_color);
+			draw_simple_mouth(160, mouth_y, 68 + pulse * 3, 25 + pulse, 6, accent);
+			return;
+		}
 
     if (std::strcmp(g_face_emotion, "error") == 0) {
-        draw_line(left_x - 20, eye_y - 20, left_x + 20, eye_y + 20, red, 5);
-        draw_line(left_x + 20, eye_y - 20, left_x - 20, eye_y + 20, red, 5);
-        draw_line(right_x - 20, eye_y - 20, right_x + 20, eye_y + 20, red, 5);
-        draw_line(right_x + 20, eye_y - 20, right_x - 20, eye_y + 20, red, 5);
-        draw_mouth_curve(160, mouth_y + 20, 74, 24, false, red);
-        return;
-    }
+	        draw_line(left_x - 24, eye_y - 24, left_x + 24, eye_y + 24, red, 6);
+	        draw_line(left_x + 24, eye_y - 24, left_x - 24, eye_y + 24, red, 6);
+	        draw_line(right_x - 24, eye_y - 24, right_x + 24, eye_y + 24, red, 6);
+	        draw_line(right_x + 24, eye_y - 24, right_x - 24, eye_y + 24, red, 6);
+	        draw_mouth_curve(160, mouth_y + 20, 74, 24, false, red);
+	        return;
+	    }
 
     if (std::strcmp(g_face_emotion, "battery") == 0 ||
         std::strcmp(g_face_emotion, "charging") == 0 ||
@@ -2042,7 +2579,7 @@ void draw_face(const char* emotion, int intensity_pct)
                                        : std::strcmp(g_face_emotion, "charging") == 0
                                            ? green
                                            : warm;
-        draw_open_eyes(left_x, right_x, eye_y, 13 + pulse, 28 + pulse, 0, 0, face_color);
+	        draw_designed_eyes(left_x, right_x, eye_y, 17 + pulse, 31 + pulse, 0, 0, face_color);
         const int x0 = 112;
         const int x1 = 204;
         const int y0 = mouth_y - 16;
@@ -2066,9 +2603,9 @@ void draw_face(const char* emotion, int intensity_pct)
         return;
     }
 
-    draw_open_eyes(left_x, right_x, eye_y, 13 + pulse, 28 + pulse, 0, 0, face_color);
-    draw_mouth_curve(160, mouth_y - 4, 62, 18, true, white);
-}
+		draw_designed_eyes(left_x, right_x, eye_y, 18 + pulse, 32 + pulse, 0, 0, face_color);
+		draw_simple_mouth(160, mouth_y, 68, 18, 0, white);
+	}
 
 void display_boot()
 {
@@ -2387,7 +2924,39 @@ bool init_microphone()
     return true;
 }
 
-void play_tone(int frequency_hz, int duration_ms)
+bool lock_audio_output(TickType_t timeout_ticks)
+{
+    if (!g_audio_output_mutex) {
+        return true;
+    }
+    return xSemaphoreTake(g_audio_output_mutex, timeout_ticks) == pdTRUE;
+}
+
+void unlock_audio_output()
+{
+    if (g_audio_output_mutex) {
+        xSemaphoreGive(g_audio_output_mutex);
+    }
+}
+
+void write_silence_unlocked(int duration_ms)
+{
+    duration_ms = clamp_int(duration_ms, 0, 1000);
+    if (duration_ms <= 0 || !g_audio_output_ready || !g_audio_output) {
+        return;
+    }
+    static constexpr int kChunkSamples = 160;
+    std::array<int16_t, kChunkSamples> silence = {};
+    int sample_index = 0;
+    const int total_samples = kAudioSampleRate * duration_ms / 1000;
+    while (sample_index < total_samples) {
+        const int count = std::min(kChunkSamples, total_samples - sample_index);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, silence.data(), count * sizeof(int16_t)));
+        sample_index += count;
+    }
+}
+
+void play_tone_unlocked(int frequency_hz, int duration_ms, int amplitude = 3600)
 {
     if (!g_audio_output_ready || !g_audio_output) {
         ESP_LOGW(kTag, "sound skipped: speaker not ready");
@@ -2396,24 +2965,79 @@ void play_tone(int frequency_hz, int duration_ms)
 
     frequency_hz = clamp_int(frequency_hz, 120, 4000);
     duration_ms = clamp_int(duration_ms, 20, 2000);
-    static constexpr int kChunkSamples = 240;
-    static constexpr int kAmplitude = 4800;
+    amplitude = clamp_int(amplitude, 800, 9000);
+    static constexpr int kChunkSamples = 160;
     std::array<int16_t, kChunkSamples> tone = {};
-    std::array<int16_t, kChunkSamples> silence = {};
 
     int sample_index = 0;
     const int total_samples = kAudioSampleRate * duration_ms / 1000;
-    const int half_period = std::max(1, kAudioSampleRate / (2 * frequency_hz));
+    const float phase_step = 2.0f * static_cast<float>(M_PI) * static_cast<float>(frequency_hz) / static_cast<float>(kAudioSampleRate);
+    const int fade_samples = std::max(1, std::min(total_samples / 2, kAudioSampleRate * 8 / 1000));
     while (sample_index < total_samples) {
         const int count = std::min(kChunkSamples, total_samples - sample_index);
         for (int i = 0; i < count; ++i) {
-            tone[i] = (((sample_index + i) / half_period) % 2 == 0) ? kAmplitude : -kAmplitude;
+            const int absolute_index = sample_index + i;
+            float envelope = 1.0f;
+            if (absolute_index < fade_samples) {
+                envelope = static_cast<float>(absolute_index) / static_cast<float>(fade_samples);
+            } else if (total_samples - absolute_index < fade_samples) {
+                envelope = static_cast<float>(std::max(0, total_samples - absolute_index)) / static_cast<float>(fade_samples);
+            }
+            tone[i] = static_cast<int16_t>(std::sin(phase_step * static_cast<float>(absolute_index)) * amplitude * envelope);
         }
         std::fill(tone.begin() + count, tone.end(), 0);
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, tone.data(), tone.size() * sizeof(int16_t)));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, tone.data(), count * sizeof(int16_t)));
         sample_index += count;
     }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, silence.data(), silence.size() * sizeof(int16_t)));
+}
+
+bool play_sound_pattern(const SoundCommand& command)
+{
+    if (!g_audio_output_ready || !g_audio_output) {
+        ESP_LOGW(kTag, "sound skipped: speaker not ready");
+        return false;
+    }
+    if (!lock_audio_output(pdMS_TO_TICKS(250))) {
+        ESP_LOGW(kTag, "sound skipped: audio output busy");
+        return false;
+    }
+
+    const char* pattern = command.pattern[0] ? command.pattern : "tone";
+    if (std::strcmp(pattern, "good") == 0 || std::strcmp(pattern, "success") == 0 || std::strcmp(pattern, "ok") == 0) {
+        play_tone_unlocked(660, 70, 3200);
+        write_silence_unlocked(28);
+        play_tone_unlocked(880, 95, 3400);
+    } else if (std::strcmp(pattern, "error") == 0 || std::strcmp(pattern, "fail") == 0) {
+        play_tone_unlocked(240, 95, 3600);
+        write_silence_unlocked(35);
+        play_tone_unlocked(180, 150, 3400);
+    } else if (std::strcmp(pattern, "question") == 0 || std::strcmp(pattern, "ask") == 0 || std::strcmp(pattern, "followup") == 0) {
+        play_tone_unlocked(560, 65, 3000);
+        write_silence_unlocked(25);
+        play_tone_unlocked(740, 70, 3200);
+        write_silence_unlocked(25);
+        play_tone_unlocked(620, 110, 3000);
+    } else if (std::strcmp(pattern, "camera") == 0 || std::strcmp(pattern, "photo") == 0 || std::strcmp(pattern, "shutter") == 0) {
+        play_tone_unlocked(1250, 35, 3400);
+        write_silence_unlocked(35);
+        play_tone_unlocked(920, 50, 3000);
+    } else if (std::strcmp(pattern, "alarm") == 0) {
+        for (int i = 0; i < 3; ++i) {
+            play_tone_unlocked(880, 90, 4300);
+            write_silence_unlocked(35);
+            play_tone_unlocked(440, 90, 3900);
+            write_silence_unlocked(45);
+        }
+    } else if (std::strcmp(pattern, "notify") == 0 || std::strcmp(pattern, "message") == 0) {
+        play_tone_unlocked(760, 60, 3100);
+        write_silence_unlocked(30);
+        play_tone_unlocked(1020, 85, 3200);
+    } else {
+        play_tone_unlocked(command.frequency_hz, command.duration_ms, 3200);
+    }
+    write_silence_unlocked(30);
+    unlock_audio_output();
+    return true;
 }
 
 void queue_led_command(int mode, int r, int g, int b)
@@ -2624,12 +3248,12 @@ void move_axes_toward(const ServoAxis& yaw, const ServoAxis& pitch,
     while (yaw_current != yaw_target || pitch_current != pitch_target) {
         if (yaw_current != yaw_target) {
             const int direction = yaw_target > yaw_current ? 1 : -1;
-            yaw_current += direction * std::min(18, std::abs(yaw_target - yaw_current));
+            yaw_current += direction * std::min(kServoMoveStepRaw, std::abs(yaw_target - yaw_current));
             write_safe_servo_position(yaw, yaw_current);
         }
         if (pitch_current != pitch_target) {
             const int direction = pitch_target > pitch_current ? 1 : -1;
-            pitch_current += direction * std::min(18, std::abs(pitch_target - pitch_current));
+            pitch_current += direction * std::min(kServoMoveStepRaw, std::abs(pitch_target - pitch_current));
             write_safe_servo_position(pitch, pitch_current);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -2658,9 +3282,12 @@ int motion_segment_duration_ms(const ServoAxis& yaw, const ServoAxis& pitch,
     const int pitch_start_pct = raw_position_to_target_pct(pitch, pitch_start_raw);
     const int pct_distance = std::max(std::abs(target.yaw_pct - yaw_start_pct),
                                       std::abs(target.pitch_pct - pitch_start_pct));
-    const int speed_pct = clamp_int(target.speed_pct, 1, 100);
+    const int speed_pct = clamp_int(target.speed_pct, 1, kMotionMaxSpeedPct);
     const float ms_per_pct = 5.0f + (100 - speed_pct) * 0.30f;
-    return clamp_int(static_cast<int>(std::lround(std::max(1, pct_distance) * ms_per_pct)), 40, 4000);
+    return clamp_int(
+        static_cast<int>(std::lround(std::max(1, pct_distance) * ms_per_pct)),
+        kMotionMinSegmentMs,
+        4000);
 }
 
 int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
@@ -2669,7 +3296,7 @@ int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
 {
     const int raw_distance = std::max(std::abs(yaw_target_raw - yaw_start_raw),
                                       std::abs(pitch_target_raw - pitch_start_raw));
-    const int min_safe_steps = std::max(1, (raw_distance + 17) / 18);
+    const int min_safe_steps = std::max(1, (raw_distance + kServoMoveStepRaw - 1) / kServoMoveStepRaw);
     const int requested_steps = std::max(1, duration_ms / 20);
     return std::max(min_safe_steps, requested_steps);
 }
@@ -2866,15 +3493,67 @@ void publish_event(const char* event, const char* source, const char* request_id
     publish_json(g_topic_events, payload);
 }
 
-void publish_touch_event(const char* event, const char* source, uint8_t raw, bool pressed, int x, int y)
+void publish_interaction_event(const char* source, const char* message)
+{
+    char payload[1400] = {};
+    std::snprintf(payload,
+                  sizeof(payload),
+                  "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
+                  "\"event\":\"interaction\",\"source\":\"%s\",\"request_id\":\"\","
+                  "\"uptime_ms\":%lld,\"recording\":%s,\"speaking\":%s,\"display_sleeping\":%s,"
+                  "\"message\":\"%s\","
+                  "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
+                  "\"sensors\":{\"imu\":{\"ready\":%s,"
+                  "\"accel_mg\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"gyro_dps\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"motion_score_pct\":%d,\"motion_active\":%s},"
+                  "\"ltr553\":{\"ready\":%s,\"proximity_raw\":%d,\"ambient_raw\":%d,"
+                  "\"proximity_baseline\":%d,\"proximity_delta\":%d,"
+                  "\"near\":%s,\"light_changed\":%s}}}",
+                  CONFIG_STACKCHAN_PAIR_ID,
+                  CONFIG_STACKCHAN_STACKCHAN_ID,
+                  source && *source ? source : "sensor",
+                  static_cast<long long>(esp_timer_get_time() / 1000),
+                  g_recording ? "true" : "false",
+                  g_tts_playing ? "true" : "false",
+                  g_display_sleeping ? "true" : "false",
+                  message && *message ? message : "",
+                  static_cast<int>(g_servo_yaw_pct),
+                  static_cast<int>(g_servo_pitch_pct),
+                  g_servo_ready ? "true" : "false",
+                  g_imu_ready ? "true" : "false",
+                  static_cast<int>(g_imu_accel_x_mg),
+                  static_cast<int>(g_imu_accel_y_mg),
+                  static_cast<int>(g_imu_accel_z_mg),
+                  static_cast<int>(g_imu_gyro_x_dps),
+                  static_cast<int>(g_imu_gyro_y_dps),
+                  static_cast<int>(g_imu_gyro_z_dps),
+                  static_cast<int>(g_imu_motion_score_pct),
+                  g_imu_motion_active ? "true" : "false",
+                  g_ltr553_ready ? "true" : "false",
+                  static_cast<int>(g_ltr553_proximity_raw),
+                  static_cast<int>(g_ltr553_ambient_raw),
+                  static_cast<int>(g_ltr553_proximity_baseline),
+                  static_cast<int>(g_ltr553_proximity_delta),
+                  g_ltr553_near ? "true" : "false",
+                  g_ltr553_light_changed ? "true" : "false");
+    publish_json(g_topic_events, payload);
+}
+
+void publish_touch_event(const char* event, const char* source, const char* zone, uint8_t raw, int position_pct, bool pressed, int x, int y)
 {
     char payload[640] = {};
+    const int ch1 = raw & 0x03;
+    const int ch2 = (raw >> 2) & 0x03;
+    const int ch3 = (raw >> 4) & 0x03;
+    const int ch4 = (raw >> 6) & 0x03;
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
                   "\"event\":\"%s\",\"source\":\"%s\",\"uptime_ms\":%lld,"
                   "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
-                  "\"pressed\":%s,\"raw\":%u,\"x\":%d,\"y\":%d},"
+                  "\"pressed\":%s,\"zone\":\"%s\",\"raw\":%u,\"raw_hex\":\"0x%02X\","
+                  "\"ch1\":%d,\"ch2\":%d,\"ch3\":%d,\"ch4\":%d,\"position_pct\":%d,\"x\":%d,\"y\":%d},"
                   "\"message\":\"%s\"}",
                   CONFIG_STACKCHAN_PAIR_ID,
                   CONFIG_STACKCHAN_STACKCHAN_ID,
@@ -2885,14 +3564,27 @@ void publish_touch_event(const char* event, const char* source, uint8_t raw, boo
                   g_head_touch_ready ? "true" : "false",
                   g_display_touch_ready ? "true" : "false",
                   pressed ? "true" : "false",
+                  zone && *zone ? zone : "none",
                   static_cast<unsigned>(raw),
+                  static_cast<unsigned>(raw),
+                  ch1,
+                  ch2,
+                  ch3,
+                  ch4,
+                  position_pct,
                   x,
                   y,
                   pressed ? "head touch pressed" : "head touch released");
-    ESP_LOGI(kTag, "touch event=%s source=%s raw=0x%02x pressed=%s x=%d y=%d",
+    ESP_LOGI(kTag, "touch event=%s source=%s zone=%s raw=0x%02x ch=%d,%d,%d,%d pos=%d pressed=%s x=%d y=%d",
              event,
              source && *source ? source : "touch",
+             zone && *zone ? zone : "none",
              raw,
+             ch1,
+             ch2,
+             ch3,
+             ch4,
+             position_pct,
              pressed ? "true" : "false",
              x,
              y);
@@ -2910,7 +3602,7 @@ void publish_status()
     update_soc_temperature();
     update_battery_status();
 
-    char payload[2300] = {};
+    char payload[3600] = {};
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
@@ -2929,6 +3621,14 @@ void publish_status()
                   "\"voice_active\":%s,\"voice_level_pct\":%d,\"voice_avg_level\":%d,\"voice_peak_level\":%d},"
                   "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
                   "\"pressed\":%s,\"raw\":%d,\"x\":%d,\"y\":%d},"
+                  "\"interaction\":{\"active\":%s,\"last_source\":\"%s\",\"last_ms\":%lld},"
+                  "\"sensors\":{\"imu\":{\"ready\":%s,"
+                  "\"accel_mg\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"gyro_dps\":{\"x\":%d,\"y\":%d,\"z\":%d},"
+                  "\"motion_score_pct\":%d,\"motion_active\":%s},"
+                  "\"ltr553\":{\"ready\":%s,\"proximity_raw\":%d,\"ambient_raw\":%d,"
+                  "\"proximity_baseline\":%d,\"proximity_delta\":%d,"
+                  "\"near\":%s,\"light_changed\":%s}},"
                   "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
                   "\"led\":{\"mode\":\"%s\",\"mode_id\":%d,\"r\":%d,\"g\":%d,\"b\":%d,\"ready\":%s},"
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
@@ -2982,6 +3682,25 @@ void publish_status()
                   static_cast<int>(g_touch_raw),
                   static_cast<int>(g_touch_x),
                   static_cast<int>(g_touch_y),
+                  g_interaction_active ? "true" : "false",
+                  g_last_interaction_source,
+                  static_cast<long long>(g_last_interaction_ms),
+                  g_imu_ready ? "true" : "false",
+                  static_cast<int>(g_imu_accel_x_mg),
+                  static_cast<int>(g_imu_accel_y_mg),
+                  static_cast<int>(g_imu_accel_z_mg),
+                  static_cast<int>(g_imu_gyro_x_dps),
+                  static_cast<int>(g_imu_gyro_y_dps),
+                  static_cast<int>(g_imu_gyro_z_dps),
+                  static_cast<int>(g_imu_motion_score_pct),
+                  g_imu_motion_active ? "true" : "false",
+                  g_ltr553_ready ? "true" : "false",
+                  static_cast<int>(g_ltr553_proximity_raw),
+                  static_cast<int>(g_ltr553_ambient_raw),
+                  static_cast<int>(g_ltr553_proximity_baseline),
+                  static_cast<int>(g_ltr553_proximity_delta),
+                  g_ltr553_near ? "true" : "false",
+                  g_ltr553_light_changed ? "true" : "false",
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
@@ -3032,8 +3751,8 @@ bool append_motion_point(MotionCommand& command, int yaw_pct, int pitch_pct,
     MotionPoint& point = command.points[command.point_count++];
     point.yaw_pct = clamp_int(yaw_pct, kYawTargetMinPct, kYawTargetMaxPct);
     point.pitch_pct = clamp_int(pitch_pct, kPitchTargetMinPct, kPitchTargetMaxPct);
-    point.duration_ms = duration_ms > 0 ? clamp_int(duration_ms, 40, 4000) : 0;
-    point.speed_pct = clamp_int(speed_pct, 1, 100);
+    point.duration_ms = duration_ms > 0 ? clamp_int(duration_ms, kMotionMinSegmentMs, 4000) : 0;
+    point.speed_pct = clamp_int(speed_pct, 1, kMotionMaxSpeedPct);
     point.hold_ms = clamp_int(hold_ms, 0, 4000);
     return true;
 }
@@ -3046,7 +3765,10 @@ bool build_path_motion(cJSON* root, MotionCommand& command)
     }
 
     const int default_segment_ms = clamp_int(json_int(root, "segment_ms", 0), 0, 4000);
-    const int default_speed_pct = clamp_int(json_int(root, "speed_pct", json_int(root, "default_speed_pct", 45)), 1, 100);
+    const int default_speed_pct = clamp_int(
+        json_int(root, "speed_pct", json_int(root, "default_speed_pct", 45)),
+        1,
+        kMotionMaxSpeedPct);
     const char* curve = json_string(root, "curve", "linear");
     command.curve = (std::strcmp(curve, "spline") == 0 ||
                      std::strcmp(curve, "smooth") == 0 ||
@@ -3104,6 +3826,25 @@ bool enqueue_motion_command(const MotionCommand& command)
     return g_motion_queue && xQueueSend(g_motion_queue, &command, pdMS_TO_TICKS(50)) == pdTRUE;
 }
 
+void begin_head_motion_ignore()
+{
+    g_head_motion_active = true;
+    g_last_head_motion_ms = esp_timer_get_time() / 1000;
+}
+
+void end_head_motion_ignore()
+{
+    g_head_motion_active = false;
+    g_last_head_motion_ms = esp_timer_get_time() / 1000;
+}
+
+bool sensors_paused_for_head_motion()
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    return g_head_motion_active ||
+           (now_ms - g_last_head_motion_ms) < kSensorPauseAfterHeadMotionMs;
+}
+
 void copy_cstr(char* destination, size_t destination_len, const char* source)
 {
     if (!destination || destination_len == 0) {
@@ -3112,6 +3853,199 @@ void copy_cstr(char* destination, size_t destination_len, const char* source)
     source = source ? source : "";
     std::strncpy(destination, source, destination_len - 1);
     destination[destination_len - 1] = '\0';
+}
+
+void mark_sensor_interaction(const char* source, const char* message)
+{
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const bool orientation_event = source && std::strcmp(source, "orientation") == 0;
+    if (!orientation_event && now_ms - g_last_interaction_ms < kInteractionEventCooldownMs) {
+        g_interaction_active = true;
+        return;
+    }
+
+    copy_cstr(g_last_interaction_source, sizeof(g_last_interaction_source), source);
+    g_last_interaction_ms = now_ms;
+    g_interaction_active = true;
+    ESP_LOGI(kTag, "interaction detected source=%s message=%s",
+             source ? source : "sensor",
+             message ? message : "");
+
+    if (g_display_sleeping) {
+        ESP_LOGI(kTag, "sensor interaction wakes display");
+        set_lcd_sleep(false);
+    }
+
+    publish_interaction_event(source, message);
+    publish_status();
+}
+
+void update_ltr553_interaction(bool& previous_near, int& previous_ambient)
+{
+    uint16_t proximity = 0;
+    uint16_t ambient = 0;
+    bool near = false;
+    bool light_changed = false;
+
+    if (read_ltr553(proximity, ambient)) {
+        const int ps = static_cast<int>(proximity);
+        const int als = static_cast<int>(ambient);
+        g_ltr553_proximity_raw = ps;
+        g_ltr553_ambient_raw = als;
+
+        int baseline = static_cast<int>(g_ltr553_proximity_baseline);
+        if (baseline < 0) {
+            baseline = ps;
+        }
+        const int delta = std::max(0, ps - baseline);
+        near = ps >= kLtr553NearRawThreshold || delta >= kLtr553NearDeltaThreshold;
+        if (!near) {
+            baseline = (baseline * 31 + ps) / 32;
+        }
+        g_ltr553_proximity_baseline = baseline;
+        g_ltr553_proximity_delta = delta;
+        g_ltr553_near = near;
+
+        if (previous_ambient >= 0) {
+            const int ambient_delta = std::abs(als - previous_ambient);
+            light_changed = ambient_delta > std::max(100, previous_ambient / 6);
+        }
+        previous_ambient = als;
+        g_ltr553_light_changed = light_changed;
+
+        if (near && !previous_near) {
+            mark_sensor_interaction("proximity", "object near LTR553");
+        }
+        previous_near = near;
+    } else {
+        g_ltr553_near = false;
+        g_ltr553_light_changed = false;
+        previous_near = false;
+    }
+}
+
+void update_imu_interaction(bool& previous_motion, bool& has_previous,
+                            float& previous_ax, float& previous_ay, float& previous_az)
+{
+    bool motion = false;
+    int motion_score = 0;
+
+    if (g_imu_ready && g_bmi270 && g_bmi270->update()) {
+        const BMI270_Data& data = g_bmi270->getData();
+        g_imu_accel_x_mg = static_cast<int>(std::round(data.accel_x * 1000.0f / 9.80665f));
+        g_imu_accel_y_mg = static_cast<int>(std::round(data.accel_y * 1000.0f / 9.80665f));
+        g_imu_accel_z_mg = static_cast<int>(std::round(data.accel_z * 1000.0f / 9.80665f));
+        g_imu_gyro_x_dps = static_cast<int>(std::round(data.gyro_x));
+        g_imu_gyro_y_dps = static_cast<int>(std::round(data.gyro_y));
+        g_imu_gyro_z_dps = static_cast<int>(std::round(data.gyro_z));
+
+        if (has_previous) {
+            const float acc_diff = std::fabs(data.accel_x - previous_ax) +
+                                   std::fabs(data.accel_y - previous_ay) +
+                                   std::fabs(data.accel_z - previous_az);
+            const float gyro_abs = std::max({std::fabs(data.gyro_x),
+                                             std::fabs(data.gyro_y),
+                                             std::fabs(data.gyro_z)});
+            motion_score = clamp_int(static_cast<int>(std::round(acc_diff * 7.0f + gyro_abs * 0.55f)), 0, 100);
+            motion = (acc_diff >= 1.25f || gyro_abs >= 42.0f);
+        }
+
+        previous_ax = data.accel_x;
+        previous_ay = data.accel_y;
+        previous_az = data.accel_z;
+        has_previous = true;
+    } else {
+        has_previous = false;
+    }
+
+    g_imu_motion_score_pct = motion_score;
+    g_imu_motion_active = motion;
+    if (motion && !previous_motion) {
+        mark_sensor_interaction("imu", "stackchan moved");
+    }
+    previous_motion = motion;
+}
+
+enum class ImuOrientation {
+    Upright = 0,
+    Sideways = 1,
+    FaceDown = 2,
+};
+
+ImuOrientation imu_orientation()
+{
+    if (!g_imu_ready) {
+        return ImuOrientation::Upright;
+    }
+    const int ax = std::abs(static_cast<int>(g_imu_accel_x_mg));
+    const int ay = std::abs(static_cast<int>(g_imu_accel_y_mg));
+    const int az = std::abs(static_cast<int>(g_imu_accel_z_mg));
+    if (az >= kImuFaceDownAxisMg && ax <= kImuFaceDownOtherMaxMg && ay <= kImuFaceDownOtherMaxMg) {
+        return ImuOrientation::FaceDown;
+    }
+    if (ax >= kImuSideAxisMg && ay <= kImuSideUprightMaxMg) {
+        return ImuOrientation::Sideways;
+    }
+    return ImuOrientation::Upright;
+}
+
+const char* imu_orientation_message(ImuOrientation orientation)
+{
+    switch (orientation) {
+    case ImuOrientation::FaceDown:
+        return "stackchan face_down";
+    case ImuOrientation::Sideways:
+        return "stackchan sideways";
+    case ImuOrientation::Upright:
+    default:
+        return "stackchan upright";
+    }
+}
+
+void sensor_interaction_task(void*)
+{
+    bool previous_near = false;
+    bool previous_imu_motion = false;
+    ImuOrientation previous_orientation = ImuOrientation::Upright;
+    bool has_previous_imu = false;
+    float previous_ax = 0.0f;
+    float previous_ay = 0.0f;
+    float previous_az = 0.0f;
+    int previous_ambient = -1;
+    bool previous_combined = false;
+
+    while (true) {
+        if (sensors_paused_for_head_motion()) {
+            previous_near = false;
+            previous_imu_motion = false;
+            has_previous_imu = false;
+            g_imu_motion_score_pct = 0;
+            g_imu_motion_active = false;
+            g_ltr553_near = false;
+            g_ltr553_light_changed = false;
+            g_interaction_active = g_touch_pressed;
+            vTaskDelay(pdMS_TO_TICKS(kInteractionPollIntervalMs));
+            continue;
+        }
+
+        update_ltr553_interaction(previous_near, previous_ambient);
+        update_imu_interaction(previous_imu_motion, has_previous_imu,
+                               previous_ax, previous_ay, previous_az);
+
+        const ImuOrientation orientation = imu_orientation();
+        if (orientation != previous_orientation) {
+            mark_sensor_interaction("orientation", imu_orientation_message(orientation));
+            previous_orientation = orientation;
+        }
+
+        const bool combined = g_ltr553_near || g_imu_motion_active || g_touch_pressed;
+        g_interaction_active = combined;
+        if (combined != previous_combined) {
+            publish_status();
+            previous_combined = combined;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kInteractionPollIntervalMs));
+    }
 }
 
 void append_ascii_text(char* destination, size_t destination_len, size_t& offset, const char* text)
@@ -3476,7 +4410,10 @@ void handle_sound_command(const char* data, int len)
         .frequency_hz = json_int(root, "frequency_hz", json_int(root, "hz", 880)),
         .duration_ms = json_int(root, "duration_ms", 140),
         .volume_pct = json_int(root, "volume_pct", -1),
+        .pattern = {},
     };
+    const char* pattern = json_string(root, "pattern", json_string(root, "kind", json_string(root, "sound", "")));
+    copy_cstr(command.pattern, sizeof(command.pattern), pattern && *pattern ? pattern : "tone");
 
     if (!g_audio_output_ready) {
         publish_error(request_id, "sound", "speaker not ready");
@@ -4362,6 +5299,11 @@ bool play_wav_url(const char* url)
     if (!client) {
         return false;
     }
+    if (!lock_audio_output(pdMS_TO_TICKS(1000))) {
+        ESP_LOGW(kTag, "tts playback skipped: audio output busy");
+        esp_http_client_cleanup(client);
+        return false;
+    }
     ESP_LOGI(kTag, "tts playback start: %s", url);
     g_tts_playing = true;
     copy_ui_mode("speaking");
@@ -4373,6 +5315,7 @@ bool play_wav_url(const char* url)
         uint8_t sample[2] = {playback.pending_byte, 0};
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(g_audio_output, sample, sizeof(sample)));
     }
+    unlock_audio_output();
     g_tts_playing = false;
     copy_ui_mode("face");
     publish_status();
@@ -4473,11 +5416,14 @@ void sound_task(void*)
     SoundCommand command = {};
     while (true) {
         if (xQueueReceive(g_sound_queue, &command, portMAX_DELAY) == pdTRUE) {
+            const bool volume_changed = command.volume_pct >= 0;
             if (command.volume_pct >= 0) {
                 set_speaker_volume_pct(command.volume_pct);
             }
-            play_tone(command.frequency_hz, command.duration_ms);
-            publish_status();
+            play_sound_pattern(command);
+            if (volume_changed) {
+                publish_status();
+            }
         }
     }
 }
@@ -4512,7 +5458,8 @@ void ui_task(void*)
             draw_wrapped_message("STACKCHAN", command.text, command.accent);
             copy_face_emotion(command.emotion, command.intensity_pct);
             if (command.beep && g_audio_output_ready && g_sound_queue) {
-                SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1};
+                SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1, .pattern = {}};
+                copy_cstr(sound.pattern, sizeof(sound.pattern), "notify");
                 xQueueSend(g_sound_queue, &sound, 0);
             }
             publish_status();
@@ -4883,29 +5830,44 @@ void touch_event_task(void*)
     bool last_pressed = false;
     int stable_count = 0;
     bool stable_pressed = false;
+    bool active_head_touch = false;
+    bool swipe_reported = false;
+    bool active_touch_started_recording = false;
+    int active_start_position_pct = 0;
     uint8_t last_debug_raw = 0;
     int last_debug_x = -1;
     int last_debug_y = -1;
     int64_t last_debug_ms = 0;
-    char active_source[16] = "none";
+    char active_source[24] = "none";
+    char active_zone[16] = "none";
     while (true) {
         uint8_t head_raw = 0;
         uint8_t display_points = 0;
         int x = -1;
         int y = -1;
-        const bool head_pressed = read_head_touch_pressed(&head_raw);
+        HeadTouchZone head_zone = HeadTouchZone::None;
+        HeadTouchSample head_sample = {};
+        const bool head_pressed = read_head_touch_pressed(&head_raw, &head_zone, &head_sample);
         const bool display_pressed = read_display_touch_pressed(&x, &y, &display_points);
         const bool pressed = head_pressed || display_pressed;
         const uint8_t raw = head_pressed ? head_raw : display_points;
-        const char* source = head_pressed ? "head_touch" : (display_pressed ? "display_touch" : active_source);
+        const int touch_position_pct = head_pressed ? head_sample.position_pct : 0;
+        const char* source = head_pressed ? head_touch_source_from_position(head_zone, touch_position_pct) : (display_pressed ? "display_touch" : active_source);
+        const char* zone = head_pressed ? head_touch_zone_name(head_zone) : (display_pressed ? "display" : active_zone);
+        const bool touch_starts_recording = head_pressed ? head_touch_zone_starts_recording(head_zone) : display_pressed;
         g_touch_raw = raw;
         g_touch_x = display_pressed ? x : -1;
         g_touch_y = display_pressed ? y : -1;
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (raw != last_debug_raw || x != last_debug_x || y != last_debug_y || now_ms - last_debug_ms >= 1000) {
-            ESP_LOGI(kTag, "touch sample source=%s head_raw=0x%02x display_points=%u x=%d y=%d pressed=%s stable=%s head_ready=%s display_ready=%s",
+            ESP_LOGI(kTag, "touch sample source=%s zone=%s head_raw=0x%02x ch=%d,%d,%d pos=%d display_points=%u x=%d y=%d pressed=%s stable=%s head_ready=%s display_ready=%s",
                      source,
+                     zone,
                      head_raw,
+                     head_sample.intensity[0],
+                     head_sample.intensity[1],
+                     head_sample.intensity[2],
+                     touch_position_pct,
                      static_cast<unsigned>(display_points),
                      x,
                      y,
@@ -4920,6 +5882,7 @@ void touch_event_task(void*)
         }
         if (pressed && !stable_pressed) {
             copy_cstr(active_source, sizeof(active_source), source);
+            copy_cstr(active_zone, sizeof(active_zone), zone);
         }
         if (pressed == last_pressed) {
             stable_count++;
@@ -4933,14 +5896,28 @@ void touch_event_task(void*)
             g_touch_pressed = pressed;
             if (pressed) {
                 wake_display_if_needed();
+                active_head_touch = head_pressed;
+                swipe_reported = false;
+                active_touch_started_recording = touch_starts_recording;
+                active_start_position_pct = touch_position_pct;
             }
             publish_touch_event(pressed ? "touch_down" : "touch_up",
                                 pressed ? source : active_source,
+                                pressed ? zone : active_zone,
                                 raw,
+                                pressed ? touch_position_pct : active_start_position_pct,
                                 pressed,
                                 display_pressed ? x : -1,
                                 display_pressed ? y : -1);
-            if (pressed) {
+            if (pressed && head_pressed && head_zone == HeadTouchZone::Left) {
+                set_touch_side_light_now(-1);
+            } else if (pressed && head_pressed && head_zone == HeadTouchZone::Right) {
+                set_touch_side_light_now(1);
+            } else if (!pressed && (std::strcmp(active_source, "head_touch_left") == 0
+                                    || std::strcmp(active_source, "head_touch_right") == 0)) {
+                set_touch_side_light_now(0);
+            }
+            if (pressed && touch_starts_recording) {
                 if (g_audio_input_ready && g_audio_input) {
                     set_recording_state(true,
                                         source,
@@ -4952,9 +5929,29 @@ void touch_event_task(void*)
                 }
             }
             if (!pressed) {
+                active_head_touch = false;
+                swipe_reported = false;
+                active_touch_started_recording = false;
                 copy_cstr(active_source, sizeof(active_source), "none");
+                copy_cstr(active_zone, sizeof(active_zone), "none");
             }
             publish_status();
+        }
+        if (stable_pressed && active_head_touch && head_pressed && !active_touch_started_recording && !swipe_reported) {
+            const int delta = touch_position_pct - active_start_position_pct;
+            if (delta >= 40 || delta <= -40) {
+                const char* swipe_event = delta >= 40 ? "touch_swipe_forward" : "touch_swipe_backward";
+                const char* swipe_source = delta >= 40 ? "head_touch_right" : "head_touch_left";
+                publish_touch_event(swipe_event,
+                                    swipe_source,
+                                    zone,
+                                    raw,
+                                    touch_position_pct,
+                                    true,
+                                    -1,
+                                    -1);
+                swipe_reported = true;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(25));
     }
@@ -4968,6 +5965,19 @@ void led_effect_task(void*)
     bool voice_led_active = false;
     while (true) {
         const int mode = static_cast<int>(g_led_mode);
+        const int touch_side_light = static_cast<int>(g_touch_side_light);
+        if (g_neon_ready && touch_side_light != 0 && !g_recording) {
+            if (touch_side_light < 0) {
+                set_neon_range(0, 6, 0, 185, 110);
+                set_neon_range(6, 6, 0, 0, 0);
+            } else {
+                set_neon_range(0, 6, 0, 0, 0);
+                set_neon_range(6, 6, 0, 185, 110);
+            }
+            show_neon_pixels();
+            vTaskDelay(pdMS_TO_TICKS(35));
+            continue;
+        }
         if (g_neon_ready && g_recording) {
             const int level = clamp_int(static_cast<int>(g_voice_level_pct), 0, 100);
             const int base = g_voice_active ? 12 : 3;
@@ -5112,9 +6122,12 @@ void hardware_servo_task(void*)
             g_pending_pitch_target_pct = 101;
         }
 
+        begin_head_motion_ignore();
+
         if (!servo_powered) {
             if (!set_servo_vm_power(true)) {
                 ESP_LOGW(kTag, "servo power unavailable; movement skipped");
+                end_head_motion_ignore();
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
@@ -5125,6 +6138,7 @@ void hardware_servo_task(void*)
             bus_started = g_servo_bus.begin(UART_NUM_1, 1000000, 6, 7);
             if (!bus_started) {
                 ESP_LOGE(kTag, "servo UART init failed");
+                end_head_motion_ignore();
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
@@ -5134,6 +6148,7 @@ void hardware_servo_task(void*)
             ESP_LOGW(kTag, "servo bus not answering");
             set_servo_vm_power(false);
             servo_powered = false;
+            end_head_motion_ignore();
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -5145,6 +6160,7 @@ void hardware_servo_task(void*)
             servo_powered = false;
             g_temperature_servo_yaw_c = -1;
             g_temperature_servo_pitch_c = -1;
+            end_head_motion_ignore();
             continue;
         }
         update_servo_temperatures(yaw, pitch);
@@ -5153,6 +6169,7 @@ void hardware_servo_task(void*)
         g_servo_bus.EnableTorque(pitch.id, 1);
         if (has_motion) {
             execute_motion_command(yaw, pitch, yaw_pos, pitch_pos, motion);
+            end_head_motion_ignore();
             update_servo_temperatures(yaw, pitch);
             g_servo_bus.EnableTorque(yaw.id, 0);
             g_servo_bus.EnableTorque(pitch.id, 0);
@@ -5164,6 +6181,7 @@ void hardware_servo_task(void*)
         const int pitch_target = has_pitch_target ? target_pct_to_raw_position(pitch, pitch_target_pct) : pitch_pos + pitch_delta;
         ESP_LOGI(kTag, "servo target raw yaw=%d pitch=%d", yaw_target, pitch_target);
         move_axes_toward(yaw, pitch, yaw_pos, pitch_pos, yaw_target, pitch_target);
+        end_head_motion_ignore();
         update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
         update_servo_temperatures(yaw, pitch);
         g_servo_bus.EnableTorque(yaw.id, 0);
@@ -5348,11 +6366,12 @@ extern "C" void app_main()
     init_temperature_sensor();
     init_speaker();
     init_microphone();
+    g_audio_output_mutex = xSemaphoreCreateMutex();
     g_sound_queue = xQueueCreate(4, sizeof(SoundCommand));
     g_motion_queue = xQueueCreate(3, sizeof(MotionCommand));
     g_ui_queue = xQueueCreate(6, sizeof(UiCommand));
     if (g_sound_queue) {
-        xTaskCreate(sound_task, "sound", 4096, nullptr, 3, nullptr);
+        xTaskCreate(sound_task, "sound", 8192, nullptr, 3, nullptr);
     }
     if (g_ui_queue) {
         xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
@@ -5361,6 +6380,7 @@ extern "C" void app_main()
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
+    xTaskCreate(sensor_interaction_task, "interaction", 12288, nullptr, 2, nullptr);
     xTaskCreate(camera_init_task, "camera_init", 12288, nullptr, 2, nullptr);
 
     if (!init_wifi()) {

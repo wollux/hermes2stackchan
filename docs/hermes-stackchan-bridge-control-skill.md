@@ -226,11 +226,17 @@ When StackChan itself records audio:
 1. Wakeword or touch starts recording.
 2. StackChan posts WAV data to `POST /stackchan/audio`.
 3. Bridge transcribes using the configured STT provider.
-4. Bridge asks Hermes.
-5. Hermes returns JSON with top-level `reply` and optional `actions`.
-6. Bridge validates actions and publishes MQTT commands.
-7. Bridge creates TTS for `reply`.
-8. StackChan receives or fetches the TTS WAV and plays it.
+4. Bridge handles simple one-step local commands directly when possible.
+5. Bridge asks Hermes for conversation, combined tasks, and complex requests.
+6. Hermes returns JSON with top-level `reply` and optional `actions`.
+7. Bridge validates actions and publishes MQTT commands.
+8. Bridge creates TTS for `reply`.
+9. StackChan receives or fetches the TTS WAV and plays it.
+
+Local shortcuts include volume, brightness, display sleep/wake, battery,
+temperature, and basic sensor questions. They log `hermes=0ms` and still return
+display/TTS to StackChan. Combined tasks and anything requiring reasoning still
+goes to Hermes.
 
 For this flow Hermes should return JSON:
 
@@ -306,8 +312,16 @@ The bridge also has an idle-sleep watcher: after five quiet minutes without huma
 interaction or non-life actions, it sends `cmd/device {"display_sleep":true}` and
 the life animator must stay quiet because the retained status reports
 `display_sleeping:true`.
-Head touch, display touch, `cmd/move`, and `cmd/motion` wake StackChan through
-the CRT wake animation before continuing with recording or movement.
+Head touch, display touch, `cmd/move`, `cmd/motion`, BMI270 IMU movement, and
+LTR553 proximity wake StackChan through the CRT wake animation before continuing
+with recording or movement. The bridge treats the firmware `interaction` event as
+human activity for the five-minute idle-sleep timer.
+
+The bridge also runs a sensor watcher. It filters BMI270/LTR553 noise and reacts
+only to stable physical interaction: shake becomes a short surprise face, lying
+on the side becomes a surprised face, and proximity lowers the head a little
+until the object moves away. These reactions are bridge-owned helper behavior;
+Hermes should not duplicate them with extra LED or sound actions.
 
 Normal pitch/rest position is around `45`, not `0`. Yaw can move more freely than
 pitch; pitch must remain conservative.

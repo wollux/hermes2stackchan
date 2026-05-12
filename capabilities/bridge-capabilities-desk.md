@@ -13,6 +13,21 @@ This public slice supports direct MQTT hardware control. Hermes may request acti
 
 ## Actions
 
+### local spoken shortcuts
+
+Before Hermes is called, the bridge handles simple one-step spoken commands
+locally after STT. These do not consume a Hermes turn and log `hermes=0ms`.
+
+Local shortcuts include absolute and simple relative hardware/status requests:
+
+- `Helligkeit 80 Prozent`, `mach heller`, `mach dunkler`
+- `Lautstaerke 55 Prozent`, `mach lauter`, `mach leiser`
+- `Display aus`, `Bildschirm an`, `geh schlafen`, `wach auf`
+- `Akku`, `Temperatur`, `Sensoren`, `Naehe`, `Seite`, `Bewegung`
+
+Combined tasks, questions needing reasoning, and anything with multiple intents
+still goes to Hermes.
+
 ### response contract
 
 For normal answers, direct messages, reminders, notifications, and command
@@ -153,7 +168,7 @@ Image display payload:
 
 Publishes to `hermes-stackchan/desk/cmd/face`.
 
-Supported emotions: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `wink`, `blink`, `look_left`, `look_right`, `look_up`, `look_down`, `breathe`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
+Supported emotions include: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `blink`, `wink`, `wink_left`, `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `breathe`, `deep_breathe`, `micro_sleep`, `surprise_pop`, `happy_squint`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
 
 ```json
 {
@@ -386,7 +401,7 @@ AXP2101 PMIC to turn StackChan off after any voice reply has finished.
 
 ## Status
 
-StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, temperatures, `firmware`, and `firmware_version`.
+StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, interaction state, BMI270 IMU motion, LTR553 proximity/ambient light, temperatures, `firmware`, and `firmware_version`.
 
 Battery fields:
 
@@ -405,6 +420,13 @@ Battery fields:
 ```
 
 The bridge command `watch-power` watches `external_power`/`usb_power` in these retained status updates and reacts to plug/unplug transitions with a battery percentage/charge overlay plus immediate head motion. After about five seconds, plugging in triggers a happy face; unplugging triggers a neutral face. It must not change LEDs or sound for power changes. `battery_charging` only means active charging; a full battery can have `external_power: true` and `battery_charging: false`.
+
+The bridge command `watch-sensors` watches BMI270 and LTR553 fields in retained
+status plus `interaction` events. It is noise-filtered and only reacts to stable
+signals: shake triggers a short surprise face, lying on the side triggers a
+surprised face, and proximity lowers the head slightly until the object moves
+away. Confirmed sensor interaction wakes a sleeping display. It must not change
+LEDs or sound.
 
 Temperature fields:
 

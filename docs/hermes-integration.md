@@ -8,7 +8,7 @@ This is the reproducible V1.0 integration path for one Hermes and one StackChan.
 - The active pair is configured in `.env` and `config/pairs.example.json`.
 - The active MQTT namespace is `hermes-stackchan/<pair-id>`.
 - StackChan records audio locally and uploads WAV data to the bridge over HTTP.
-- The bridge transcribes speech, asks Hermes, validates Hermes actions, publishes MQTT commands, generates TTS, and returns the TTS URL to StackChan.
+- The bridge transcribes speech, handles simple one-step hardware/status commands locally, asks Hermes for everything complex, validates Hermes actions, publishes MQTT commands, generates TTS, and returns the TTS URL to StackChan.
 
 ## Runtime Flow
 
@@ -16,9 +16,10 @@ This is the reproducible V1.0 integration path for one Hermes and one StackChan.
 2. StackChan stops after silence or the configured maximum duration.
 3. StackChan posts WAV audio to `POST /stackchan/audio`.
 4. Bridge transcribes audio through the configured STT provider.
-5. Bridge reads retained MQTT status from `hermes-stackchan/desk/status`.
-6. Bridge sends transcript, status, personality, and `capabilities/bridge-capabilities-desk.md` to Hermes.
-7. Hermes returns JSON only:
+5. Bridge handles simple one-step commands locally when possible.
+6. For status-dependent local commands, Bridge reads retained MQTT status from `hermes-stackchan/desk/status`.
+7. For conversation, combined tasks, and complex requests, Bridge sends transcript, status, personality, and `capabilities/bridge-capabilities-desk.md` to Hermes.
+8. Hermes returns JSON only:
 
 ```json
 {
@@ -29,9 +30,26 @@ This is the reproducible V1.0 integration path for one Hermes and one StackChan.
 }
 ```
 
-8. Bridge publishes valid hardware/display actions to MQTT.
-9. Bridge creates TTS for `reply` and returns or sends a `tts_url`.
-10. StackChan plays the returned WAV.
+9. Bridge publishes valid hardware/display actions to MQTT.
+10. Bridge creates TTS for `reply` and returns or sends a `tts_url`.
+11. StackChan plays the returned WAV.
+
+Local shortcuts deliberately skip Hermes and log `hermes=0ms`. Examples:
+
+- `Helligkeit 80 Prozent`
+- `Lautstaerke 55 Prozent`
+- `Mach heller`
+- `Mach leiser`
+- `Display aus`
+- `Bildschirm an`
+- `Wie ist dein Akku?`
+- `Temperatur?`
+- `Liegst du auf der Seite?`
+- `Wirst du geschuettelt?`
+- `Ist mein Finger am Sensor?`
+
+Combined tasks still go to Hermes, for example `Helligkeit 80 und sag mir das
+Wetter`.
 
 For messages that do not start on StackChan, for example a Telegram command to
 Hermes, Hermes must call the push endpoint:
