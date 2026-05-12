@@ -2148,8 +2148,10 @@ void draw_simple_mouth(int cx, int y, int width, int height, int mode, uint16_t 
 	} else if (mode == 4) {
 		draw_line(cx - width / 2, y, cx + width / 2, y, color, 4);
 	} else if (mode == 5) {
-		draw_line(cx - width / 2, y + 3, cx - 4, y + 7, color, 4);
-		draw_mouth_curve(cx + 18, y - 4, width / 2, height, true, color);
+		const int half = std::max(12, width / 2);
+		draw_line(cx - half, y + 6, cx - half / 3, y + 3, color, 3);
+		draw_line(cx - half / 3, y + 3, cx + half / 4, y + 5, color, 3);
+		draw_line(cx + half / 4, y + 5, cx + half, y - 5, color, 3);
 	} else if (mode == 6) {
 		draw_ellipse(cx, y, width / 5, height / 2, color);
 		draw_ellipse(cx, y, clamp_int(width / 9, 4, 9), clamp_int(height / 4, 3, 7), kBlack);
