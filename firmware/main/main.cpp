@@ -2421,8 +2421,23 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
         mouth_mode = 6; mouth_width = 60; mouth_height = 26; sweat = true;
         lb[1] = 18; lb[3] = 52; rb[1] = 48; rb[3] = 22;
     } else if (str_eq(emotion, "listening")) {
-        left_ry = right_ry = 34; left_pupil_dx = right_pupil_dx = 0;
-        mouth_mode = 2; mouth_width = 44; mouth_height = 10; draw_brows = false;
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const float breathe = std::sin(static_cast<float>(now_ms) / 720.0f);
+        const int listen_phase = static_cast<int>((now_ms / 360) % 12);
+        const int look_pattern[] = {0, 1, 2, 1, 0, -1, -2, -1, 0, 0, 1, 0};
+        const int up_pattern[] = {0, 0, -1, -2, -1, 0, 1, 0, -1, 0, 0, 0};
+        const int listen_energy = clamp_int(intensity_pct - 60, 0, 40);
+        left_rx = right_rx = 20 + pulse / 2 + listen_energy / 18;
+        left_ry = right_ry = 34 + static_cast<int>(std::lround(breathe * 2.0f)) + listen_energy / 14;
+        left_pupil_dx = right_pupil_dx = look_pattern[listen_phase] * 2;
+        left_pupil_dy = right_pupil_dy = up_pattern[listen_phase] * 2 - listen_energy / 24;
+        pupil_scale = clamp_int(86 - listen_energy / 3, 72, 92);
+        mouth_mode = listen_energy > 22 ? 2 : 1;
+        mouth_width = listen_energy > 22 ? 36 + listen_energy / 4 : 52 + pulse;
+        mouth_height = listen_energy > 22 ? 8 : 15 + static_cast<int>(std::lround(breathe * 2.0f));
+        mouth_color = rgb565(145, 255, 230);
+        blush = listen_energy > 18;
+        lb[1] = 32; lb[3] = 25; rb[1] = 25; rb[3] = 32;
     } else if (str_eq(emotion, "speaking")) {
         left_ry = right_ry = 33 + pulse; mouth_mode = 6; mouth_width = 70 + pulse * 3; mouth_height = 28 + pulse;
         mouth_color = rgb565(145, 255, 230); draw_brows = false;
@@ -5026,7 +5041,9 @@ void set_recording_state(bool enabled, const char* source, const char* request_i
             publish_status();
             return;
         }
-        if (!is_transient_face_emotion(g_face_emotion) && std::strcmp(g_face_emotion, "speaking") != 0) {
+        if (!is_transient_face_emotion(g_face_emotion) &&
+            std::strcmp(g_face_emotion, "speaking") != 0 &&
+            std::strcmp(g_face_emotion, "listening") != 0) {
             copy_cstr(g_pre_recording_face_emotion,
                       sizeof(g_pre_recording_face_emotion),
                       g_face_emotion);
@@ -5036,13 +5053,13 @@ void set_recording_state(bool enabled, const char* source, const char* request_i
             g_pre_recording_face_intensity_pct = 60;
         }
         reset_voice_meter();
-        g_face_extra_mode = FaceExtraMode::VoiceWaveform;
+        g_face_extra_mode = FaceExtraMode::None;
         g_recording = true;
         g_recording_started_ms = esp_timer_get_time() / 1000;
         copy_cstr(g_recording_source, sizeof(g_recording_source), source && *source ? source : "manual");
         copy_cstr(g_ui_mode, sizeof(g_ui_mode), "recording");
         set_lcd_sleep(false);
-        draw_face("speaking", 70);
+        draw_face("listening", 72);
         publish_event("recording_started", g_recording_source, request_id, reason);
     } else {
         if (!g_recording) {
@@ -6095,7 +6112,7 @@ void audio_state_task(void*)
         }
 
         if (now_ms - last_draw_ms >= 80) {
-            draw_face("speaking", clamp_int(62 + level_pct / 3, 62, 95));
+            draw_face("listening", clamp_int(64 + level_pct / 3, 64, 96));
             last_draw_ms = now_ms;
         }
         if (now_ms - last_status_ms >= 500) {
