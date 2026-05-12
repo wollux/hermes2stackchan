@@ -5364,6 +5364,18 @@ bool post_wav_to_bridge(const uint8_t* wav, size_t wav_size, const char* request
     return true;
 }
 
+bool source_should_upload_without_voice(const char* source)
+{
+    if (!source || !*source) {
+        return false;
+    }
+    return std::strcmp(source, "wakeword") == 0 ||
+           std::strcmp(source, "display_touch") == 0 ||
+           std::strcmp(source, "touch") == 0 ||
+           std::strcmp(source, "followup") == 0 ||
+           std::strcmp(source, "manual") == 0;
+}
+
 void build_bridge_photo_url(char* out, size_t out_len)
 {
     if (!out || out_len == 0) {
@@ -6149,7 +6161,28 @@ void audio_state_task(void*)
                      avg,
                      peak,
                      level_pct);
+            const size_t actual_pcm_bytes = captured_samples * sizeof(int16_t);
+            if (wav && actual_pcm_bytes > 0) {
+                make_wav_header(wav, static_cast<uint32_t>(actual_pcm_bytes));
+            }
             set_recording_state(false, g_recording_source, "", "no voice");
+            if (source_should_upload_without_voice(upload_source) &&
+                wav &&
+                actual_pcm_bytes > kAudioSampleRate / 2 &&
+                elapsed_ms >= static_cast<int64_t>(g_recording_min_ms)) {
+                ESP_LOGI(kTag,
+                         "voice monitor upload fallback: source=%s elapsed=%lldms bytes=%u",
+                         upload_source,
+                         static_cast<long long>(elapsed_ms),
+                         static_cast<unsigned>(kWavHeaderBytes + actual_pcm_bytes));
+                g_face_extra_mode = FaceExtraMode::ThoughtBubbles;
+                draw_face(g_face_emotion, g_face_intensity_pct);
+                post_wav_to_bridge(wav, kWavHeaderBytes + actual_pcm_bytes, upload_request_id, upload_source);
+                g_face_extra_mode = FaceExtraMode::None;
+                draw_face(g_face_emotion, g_face_intensity_pct);
+                publish_status();
+                start_followup_recording_if_pending();
+            }
         } else if (elapsed_ms >= static_cast<int64_t>(g_recording_max_ms)) {
             ESP_LOGI(kTag,
                      "voice monitor stop: max duration elapsed=%lldms avg=%d peak=%d level=%d%%",
