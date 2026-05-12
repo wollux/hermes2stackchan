@@ -166,6 +166,7 @@ volatile int g_led_mode = 0;
 volatile int g_led_r = 0;
 volatile int g_led_g = 0;
 volatile int g_led_b = 0;
+volatile int g_touch_side_light = 0;
 bool g_neon_ready = false;
 volatile int g_servo_yaw_pct = 0;
 volatile int g_servo_pitch_pct = 0;
@@ -833,6 +834,26 @@ bool show_neon_pixels()
     bool ok = g_py32->try_read_reg(0x24, led_cfg) == ESP_OK;
     ok = (g_py32->try_write_reg(0x24, led_cfg | (1 << 6)) == ESP_OK) && ok;
     return ok;
+}
+
+void set_touch_side_light_now(int side)
+{
+    g_touch_side_light = side;
+    if (!g_neon_ready) {
+        return;
+    }
+    if (side < 0) {
+        set_neon_range(0, 6, 0, 185, 110);
+        set_neon_range(6, 6, 0, 0, 0);
+        show_neon_pixels();
+    } else if (side > 0) {
+        set_neon_range(0, 6, 0, 0, 0);
+        set_neon_range(6, 6, 0, 185, 110);
+        show_neon_pixels();
+    } else {
+        set_neon_range(0, 12, 0, 0, 0);
+        show_neon_pixels();
+    }
 }
 
 void color_wheel(int pos, uint8_t* r, uint8_t* g, uint8_t* b)
@@ -5827,6 +5848,14 @@ void touch_event_task(void*)
                                 pressed,
                                 display_pressed ? x : -1,
                                 display_pressed ? y : -1);
+            if (pressed && head_pressed && head_zone == HeadTouchZone::Left) {
+                set_touch_side_light_now(-1);
+            } else if (pressed && head_pressed && head_zone == HeadTouchZone::Right) {
+                set_touch_side_light_now(1);
+            } else if (!pressed && (std::strcmp(active_source, "head_touch_left") == 0
+                                    || std::strcmp(active_source, "head_touch_right") == 0)) {
+                set_touch_side_light_now(0);
+            }
             if (pressed && touch_starts_recording) {
                 if (g_audio_input_ready && g_audio_input) {
                     set_recording_state(true,
@@ -5856,6 +5885,19 @@ void led_effect_task(void*)
     bool voice_led_active = false;
     while (true) {
         const int mode = static_cast<int>(g_led_mode);
+        const int touch_side_light = static_cast<int>(g_touch_side_light);
+        if (g_neon_ready && touch_side_light != 0 && !g_recording) {
+            if (touch_side_light < 0) {
+                set_neon_range(0, 6, 0, 185, 110);
+                set_neon_range(6, 6, 0, 0, 0);
+            } else {
+                set_neon_range(0, 6, 0, 0, 0);
+                set_neon_range(6, 6, 0, 185, 110);
+            }
+            show_neon_pixels();
+            vTaskDelay(pdMS_TO_TICKS(35));
+            continue;
+        }
         if (g_neon_ready && g_recording) {
             const int level = clamp_int(static_cast<int>(g_voice_level_pct), 0, 100);
             const int base = g_voice_active ? 12 : 3;
