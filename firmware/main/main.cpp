@@ -2286,7 +2286,6 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
     bool sweat = false;
     bool anger = false;
     bool hearts = false;
-    bool dead = false;
     bool glitch = false;
     bool draw_brows = true;
     int lb[4] = {70, 38, 130, 38};
@@ -2309,7 +2308,6 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
         mouth_mode = 1; mouth_width = str_eq(emotion, "thankful") ? 78 : 88; mouth_height = 28 + pulse; blush = str_eq(emotion, "thankful");
         lb[1] = 34; lb[3] = 28; rb[1] = 28; rb[3] = 34;
     } else if (str_eq(emotion, "love")) {
-        left_rx = right_rx = 25; left_ry = right_ry = 30;
         mouth_mode = 1; mouth_width = 92; mouth_height = 34; blush = true; hearts = true;
         lb[1] = lb[3] = rb[1] = rb[3] = 28;
     } else if (str_eq(emotion, "mischievous") || str_eq(emotion, "smug") || str_eq(emotion, "evil_grin")) {
@@ -2378,7 +2376,7 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
         left_ry = right_ry = 32; mouth_mode = 1; mouth_width = 70; mouth_height = 24; mouth_color = rgb565(112, 255, 150);
         lb[1] = 32; lb[3] = 28; rb[1] = 28; rb[3] = 32;
     } else if (str_eq(emotion, "error") || str_eq(emotion, "dead")) {
-        dead = true; mouth_mode = str_eq(emotion, "dead") ? 3 : 8; mouth_width = 76; mouth_height = 24; mouth_color = rgb565(255, 76, 88);
+        mouth_mode = str_eq(emotion, "dead") ? 3 : 8; mouth_width = 76; mouth_height = 24; mouth_color = rgb565(255, 76, 88);
         draw_brows = false;
     } else if (str_eq(emotion, "glitch")) {
         left_rx = 28; left_ry = 37; right_rx = 16; right_ry = 25; left_pupil_dx = 10; right_pupil_dx = -8;
@@ -2391,12 +2389,26 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
         return str_eq(emotion, "neutral");
     }
 
-    if (left_line) {
+    const bool heart_eyes = str_eq(emotion, "love");
+    const bool x_eyes = str_eq(emotion, "error") || str_eq(emotion, "dead");
+
+    if (heart_eyes) {
+        draw_tiny_heart(left_x, eye_y, 42, rgb565(255, 92, 138));
+        draw_tiny_heart(right_x, eye_y, 42, rgb565(255, 92, 138));
+    } else if (x_eyes) {
+        const uint16_t x_color = str_eq(emotion, "error") ? rgb565(255, 76, 88) : eye_color;
+        draw_line(left_x - 24, eye_y - 24, left_x + 24, eye_y + 24, x_color, 6);
+        draw_line(left_x + 24, eye_y - 24, left_x - 24, eye_y + 24, x_color, 6);
+        draw_line(right_x - 24, eye_y - 24, right_x + 24, eye_y + 24, x_color, 6);
+        draw_line(right_x + 24, eye_y - 24, right_x - 24, eye_y + 24, x_color, 6);
+    } else if (left_line) {
         draw_single_eye_line(left_x, eye_y, left_tilt, eye_color, 58 + pulse);
     } else {
         draw_single_eye_scaled_pupil(left_x, eye_y, left_rx, left_ry, left_pupil_dx, left_pupil_dy, pupil_scale, eye_color);
     }
-    if (right_line) {
+    if (heart_eyes || x_eyes) {
+        // Both eyes were drawn as exclusive symbolic eyes above.
+    } else if (right_line) {
         draw_single_eye_line(right_x, eye_y, right_tilt, eye_color, 58 + pulse);
     } else {
         draw_single_eye_scaled_pupil(right_x, eye_y, right_rx, right_ry, right_pupil_dx, right_pupil_dy, pupil_scale, eye_color);
@@ -2405,16 +2417,12 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
         draw_mood_brow(lb[0], lb[1], lb[2], lb[3], brow_color);
         draw_mood_brow(rb[0], rb[1], rb[2], rb[3], brow_color);
     }
-    if (str_eq(emotion, "love")) {
-        draw_tiny_heart(left_x, eye_y, 30, rgb565(255, 92, 138));
-        draw_tiny_heart(right_x, eye_y, 30, rgb565(255, 92, 138));
-    }
     if (mouth_mode == 8) {
         draw_mouth_curve(160 + mouth_dx, mouth_y + mouth_dy + 18, mouth_width, mouth_height, false, mouth_color);
     } else {
         draw_simple_mouth(160 + mouth_dx, mouth_y + mouth_dy, mouth_width, mouth_height, mouth_mode, mouth_color);
     }
-    draw_face_fx(blush, sweat, anger, hearts, dead, glitch, brow_color);
+    draw_face_fx(blush, sweat, anger, hearts && !heart_eyes, false, glitch, brow_color);
     return true;
 }
 
