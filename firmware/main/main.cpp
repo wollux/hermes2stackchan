@@ -96,6 +96,7 @@ constexpr int kMaxTextPayloadBytes = 1600;
 constexpr int kMaxDisplayedWords = 80;
 constexpr uint32_t kMqttTaskStackBytes = 8192;
 constexpr uint32_t kUiTaskStackBytes = 12288;
+constexpr bool kHeadTouchInputEnabled = false;
 constexpr gpio_num_t kAudioMclk = GPIO_NUM_0;
 constexpr gpio_num_t kAudioBclk = GPIO_NUM_34;
 constexpr gpio_num_t kAudioWs = GPIO_NUM_33;
@@ -586,6 +587,12 @@ bool init_imu()
 
 bool init_head_touch()
 {
+    if (!kHeadTouchInputEnabled) {
+        ESP_LOGI(kTag, "SI12T head touch disabled; display touch and wakeword start recording");
+        g_head_touch_ready = false;
+        g_head_touch.reset();
+        return false;
+    }
     if (!g_i2c_bus) {
         return false;
     }
@@ -720,6 +727,18 @@ bool head_touch_zone_starts_recording(HeadTouchZone zone)
 
 bool read_head_touch_pressed(uint8_t* raw_out = nullptr, HeadTouchZone* zone_out = nullptr, HeadTouchSample* sample_out = nullptr)
 {
+    if (!kHeadTouchInputEnabled) {
+        if (raw_out) {
+            *raw_out = 0;
+        }
+        if (zone_out) {
+            *zone_out = HeadTouchZone::None;
+        }
+        if (sample_out) {
+            *sample_out = {};
+        }
+        return false;
+    }
     if (!g_head_touch_ready || !g_head_touch) {
         if (zone_out) {
             *zone_out = HeadTouchZone::None;
@@ -6296,7 +6315,7 @@ void touch_event_task(void*)
         int y = -1;
         HeadTouchZone head_zone = HeadTouchZone::None;
         HeadTouchSample head_sample = {};
-        const bool head_pressed = read_head_touch_pressed(&head_raw, &head_zone, &head_sample);
+        const bool head_pressed = kHeadTouchInputEnabled && read_head_touch_pressed(&head_raw, &head_zone, &head_sample);
         const bool display_pressed = read_display_touch_pressed(&x, &y, &display_points);
         const bool pressed = head_pressed || display_pressed;
         const uint8_t raw = head_pressed ? head_raw : display_points;
