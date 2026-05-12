@@ -184,6 +184,9 @@ char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
+int g_face_blush_alpha_pct = 0;
+int g_face_hearts_alpha_pct = 0;
+bool g_face_fx_alpha_initialized = false;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -328,6 +331,14 @@ bool play_wav_url(const char* url);
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+uint16_t rgb565_scaled(uint8_t r, uint8_t g, uint8_t b, int alpha_pct)
+{
+    const int alpha = std::max(0, std::min(100, alpha_pct));
+    return rgb565(static_cast<uint8_t>((static_cast<int>(r) * alpha) / 100),
+                  static_cast<uint8_t>((static_cast<int>(g) * alpha) / 100),
+                  static_cast<uint8_t>((static_cast<int>(b) * alpha) / 100));
 }
 
 int clamp_int(int value, int min_value, int max_value)
@@ -2219,11 +2230,16 @@ void draw_tiny_heart(int cx, int cy, int size, uint16_t color)
     draw_line(cx + size / 2, cy, cx, cy + size / 2, color, std::max(2, size / 4));
 }
 
-void draw_face_fx(bool blush, bool sweat, bool anger, bool hearts, bool dead, bool glitch, uint16_t accent)
+void draw_face_fx(int blush_alpha_pct, bool sweat, bool anger, int hearts_alpha_pct, bool dead, bool glitch, uint16_t accent)
 {
-    if (blush) {
-        draw_ellipse(58, 142, 18, 6, rgb565(255, 98, 150));
-        draw_ellipse(262, 142, 18, 6, rgb565(255, 98, 150));
+    const int blush_alpha = clamp_int(blush_alpha_pct, 0, 100);
+    if (blush_alpha > 0) {
+        const int rx = clamp_int((18 * blush_alpha) / 100, 2, 18);
+        const int ry = clamp_int((6 * blush_alpha) / 100, 1, 6);
+        const int lift = (100 - blush_alpha) / 18;
+        const uint16_t blush_color = rgb565_scaled(255, 98, 150, blush_alpha);
+        draw_ellipse(58, 142 + lift, rx, ry, blush_color);
+        draw_ellipse(262, 142 + lift, rx, ry, blush_color);
     }
     if (sweat) {
         draw_ellipse(260, 48, 7, 11, rgb565(102, 247, 255));
@@ -2235,9 +2251,13 @@ void draw_face_fx(bool blush, bool sweat, bool anger, bool hearts, bool dead, bo
         draw_line(260, 14, 260, 38, red, 5);
         draw_line(244, 24, 276, 34, red, 5);
     }
-    if (hearts) {
-        draw_tiny_heart(72, 58, 18, rgb565(255, 92, 138));
-        draw_tiny_heart(248, 58, 18, rgb565(255, 92, 138));
+    const int hearts_alpha = clamp_int(hearts_alpha_pct, 0, 100);
+    if (hearts_alpha > 0) {
+        const int size = clamp_int((18 * hearts_alpha) / 100, 6, 18);
+        const int lift = (100 - hearts_alpha) / 14;
+        const uint16_t heart_color = rgb565_scaled(255, 92, 138, hearts_alpha);
+        draw_tiny_heart(72, 58 + lift, size, heart_color);
+        draw_tiny_heart(248, 58 + lift, size, heart_color);
     }
     if (dead) {
         const uint16_t black = kBlack;
@@ -2422,7 +2442,79 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
     } else {
         draw_simple_mouth(160 + mouth_dx, mouth_y + mouth_dy, mouth_width, mouth_height, mouth_mode, mouth_color);
     }
-    draw_face_fx(blush, sweat, anger, hearts && !heart_eyes, false, glitch, brow_color);
+    draw_face_fx(blush ? g_face_blush_alpha_pct : 0,
+                 sweat,
+                 anger,
+                 (hearts && !heart_eyes) ? g_face_hearts_alpha_pct : 0,
+                 false,
+                 glitch,
+                 brow_color);
+    return true;
+}
+
+int target_blush_alpha_for_face(const char* emotion, int intensity_pct)
+{
+    const int alpha = clamp_int(55 + intensity_pct / 2, 0, 100);
+    if (str_eq(emotion, "friendly") ||
+        str_eq(emotion, "super_happy") ||
+        str_eq(emotion, "love") ||
+        str_eq(emotion, "shy") ||
+        str_eq(emotion, "thankful")) {
+        return alpha;
+    }
+    return 0;
+}
+
+int target_hearts_alpha_for_face(const char* emotion, int intensity_pct)
+{
+    if (str_eq(emotion, "super_happy")) {
+        return clamp_int(45 + intensity_pct / 2, 0, 100);
+    }
+    return 0;
+}
+
+bool animate_face_fx_transition(const char* emotion, int intensity_pct)
+{
+    const int target_blush = target_blush_alpha_for_face(emotion, intensity_pct);
+    const int target_hearts = target_hearts_alpha_for_face(emotion, intensity_pct);
+
+    if (!g_face_fx_alpha_initialized) {
+        g_face_blush_alpha_pct = target_blush;
+        g_face_hearts_alpha_pct = target_hearts;
+        g_face_fx_alpha_initialized = true;
+        return false;
+    }
+
+    const int start_blush = g_face_blush_alpha_pct;
+    const int start_hearts = g_face_hearts_alpha_pct;
+    if (std::abs(start_blush - target_blush) < 18 &&
+        std::abs(start_hearts - target_hearts) < 18) {
+        g_face_blush_alpha_pct = target_blush;
+        g_face_hearts_alpha_pct = target_hearts;
+        return false;
+    }
+
+    constexpr int kFrames = 6;
+    for (int i = 1; i <= kFrames; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(kFrames);
+        const float eased = t * t * (3.0f - 2.0f * t);
+        g_face_blush_alpha_pct = start_blush + static_cast<int>(std::lround((target_blush - start_blush) * eased));
+        g_face_hearts_alpha_pct = start_hearts + static_cast<int>(std::lround((target_hearts - start_hearts) * eased));
+
+        {
+            FaceFrameGuard frame;
+            clear(kBlack);
+            if (!draw_mood_preset(emotion, intensity_pct)) {
+                g_face_blush_alpha_pct = target_blush;
+                g_face_hearts_alpha_pct = target_hearts;
+                return false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(34));
+    }
+
+    g_face_blush_alpha_pct = target_blush;
+    g_face_hearts_alpha_pct = target_hearts;
     return true;
 }
 
@@ -2782,6 +2874,9 @@ void draw_face(const char* emotion, int intensity_pct)
     wake_display_if_needed();
     copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
     copy_face_emotion(emotion, intensity_pct);
+    if (animate_face_fx_transition(g_face_emotion, intensity_pct)) {
+        return;
+    }
     FaceFrameGuard frame;
 
 	    const uint16_t white = rgb565(245, 250, 255);
