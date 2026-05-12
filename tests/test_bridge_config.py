@@ -833,7 +833,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(side_reasons, ["sideways"])
         self.assertEqual([action["action"] for action in side_actions], ["led", "face", "display", "local_tts"])
         self.assertEqual(side_actions[0], {"action": "led", "mode": "blink", "r": 255, "g": 0, "b": 0})
-        self.assertEqual(side_actions[1]["emotion"], "surprise_pop")
+        self.assertEqual(side_actions[1]["emotion"], "help")
         self.assertEqual(side_actions[2]["text"], "HILFE!")
         self.assertIn("umgekippt", side_actions[3]["text"])
 
@@ -848,7 +848,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(upright_reasons, ["upright"])
         self.assertEqual([action["action"] for action in upright_actions], ["led", "face", "motion", "local_tts"])
         self.assertEqual(upright_actions[0], {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
-        self.assertEqual(upright_actions[1], {"action": "face", "emotion": "happy", "intensity_pct": 82})
+        self.assertEqual(upright_actions[1], {"action": "face", "emotion": "thankful", "intensity_pct": 82})
         self.assertEqual(upright_actions[2]["speed_pct"], 72)
         self.assertIn("Danke", upright_actions[3]["text"])
 
@@ -873,6 +873,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(first_reasons, ["face_down"])
         self.assertEqual([action["action"] for action in first_actions], ["led", "face", "display", "motion", "local_tts"])
         self.assertEqual(first_actions[0]["mode"], "party")
+        self.assertEqual(first_actions[1]["emotion"], "face_down")
         self.assertEqual(first_actions[2]["text"], "NICHT AUFS GESICHT!")
         self.assertIn("Nicht aufs Gesicht", first_actions[4]["text"])
         self.assertEqual(quiet_actions, [])

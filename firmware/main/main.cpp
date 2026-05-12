@@ -1843,9 +1843,66 @@ void draw_word_sequence(const char* title, const char* text, int duration_ms, ui
     }
 }
 
+bool str_eq(const char* value, const char* expected)
+{
+    return value && expected && std::strcmp(value, expected) == 0;
+}
+
+const char* normalize_face_emotion(const char* emotion)
+{
+    if (!emotion || !*emotion) {
+        return "neutral";
+    }
+
+    if (str_eq(emotion, "question") || str_eq(emotion, "curious")) {
+        return "confused";
+    }
+    if (str_eq(emotion, "surprise")) {
+        return "surprised";
+    }
+    if (str_eq(emotion, "sleep")) {
+        return "sleepy";
+    }
+    if (str_eq(emotion, "grumble") || str_eq(emotion, "grumble_mouth")) {
+        return "annoyed";
+    }
+    if (str_eq(emotion, "mouth_smile") || str_eq(emotion, "tiny_laugh")) {
+        return "friendly";
+    }
+    if (str_eq(emotion, "mouth_tiny")) {
+        return "shy";
+    }
+    if (str_eq(emotion, "look_up_think")) {
+        return "thinking";
+    }
+    if (str_eq(emotion, "look_down_table") || str_eq(emotion, "bored_sigh")) {
+        return "bored";
+    }
+
+    static const char* known[] = {
+        "neutral", "happy", "sad", "angry", "surprised", "tired", "annoyed", "confused",
+        "scared", "love", "dead", "glitch", "super_happy", "friendly", "mischievous",
+        "smug", "proud", "shy", "skeptical", "offended", "panic", "dramatic",
+        "evil_grin", "sleepy", "bored", "thinking", "listening", "speaking",
+        "charging", "battery", "battery_low", "error", "face_down", "help", "thankful",
+        "blink", "wink", "wink_left", "wink_right", "glance_left", "glance_right",
+        "glance_up", "glance_down", "look_left", "look_right", "look_up", "look_down",
+        "breathe", "deep_breathe", "micro_sleep", "surprise_pop", "happy_squint",
+        "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint",
+        "confused_dots", "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
+        "mouth_wiggle", "yawn",
+    };
+    for (const char* known_emotion : known) {
+        if (str_eq(emotion, known_emotion)) {
+            return known_emotion;
+        }
+    }
+    return "neutral";
+}
+
 void copy_face_emotion(const char* emotion, int intensity_pct)
 {
-    const char* value = emotion && *emotion ? emotion : "neutral";
+    const char* value = normalize_face_emotion(emotion);
     std::strncpy(g_face_emotion, value, sizeof(g_face_emotion) - 1);
     g_face_emotion[sizeof(g_face_emotion) - 1] = '\0';
     g_face_intensity_pct = clamp_int(intensity_pct, 0, 100);
@@ -1922,6 +1979,27 @@ void draw_single_eye(int x, int y, int rx, int ry, int pupil_dx, int pupil_dy, u
 	             kBlack);
 }
 
+void draw_single_eye_scaled_pupil(int x, int y, int rx, int ry, int pupil_dx, int pupil_dy,
+                                  int pupil_scale_pct, uint16_t eye_color)
+{
+    rx = clamp_int(rx, 4, 38);
+    ry = clamp_int(ry, 3, 44);
+    draw_ellipse(x, y, rx, ry, eye_color);
+    if (ry <= 5 || pupil_scale_pct <= 0) {
+        return;
+    }
+    pupil_scale_pct = clamp_int(pupil_scale_pct, 35, 130);
+    const int pupil_rx = clamp_int((rx / 2) * pupil_scale_pct / 100, 3, 12);
+    const int pupil_ry = clamp_int((ry / 3) * pupil_scale_pct / 100, 3, 14);
+    const int max_dx = clamp_int(rx - pupil_rx - 2, 0, 20);
+    const int max_dy = clamp_int(ry - pupil_ry - 2, 0, 16);
+    draw_ellipse(x + clamp_int(pupil_dx, -max_dx, max_dx),
+                 y + clamp_int(pupil_dy, -max_dy, max_dy),
+                 pupil_rx,
+                 pupil_ry,
+                 kBlack);
+}
+
 void draw_single_eye_line(int x, int y, int tilt, uint16_t eye_color, int width = 46)
 {
 	draw_line(x - width / 2, y - tilt, x + width / 2, y + tilt, eye_color, 5);
@@ -1956,6 +2034,10 @@ uint16_t emotion_eye_color(const char* emotion)
 		return rgb565(245, 250, 255);
 	}
 	if (std::strcmp(emotion, "happy") == 0 ||
+	    std::strcmp(emotion, "super_happy") == 0 ||
+	    std::strcmp(emotion, "friendly") == 0 ||
+	    std::strcmp(emotion, "proud") == 0 ||
+	    std::strcmp(emotion, "thankful") == 0 ||
 	    std::strcmp(emotion, "love") == 0 ||
 	    std::strcmp(emotion, "happy_squint") == 0 ||
 	    std::strcmp(emotion, "silent_giggle") == 0 ||
@@ -1967,12 +2049,18 @@ uint16_t emotion_eye_color(const char* emotion)
 	}
 	if (std::strcmp(emotion, "angry") == 0 ||
 	    std::strcmp(emotion, "error") == 0 ||
+	    std::strcmp(emotion, "panic") == 0 ||
+	    std::strcmp(emotion, "help") == 0 ||
+	    std::strcmp(emotion, "face_down") == 0 ||
 	    std::strcmp(emotion, "battery_low") == 0 ||
 	    std::strcmp(emotion, "grumble") == 0) {
 		return rgb565(255, 76, 88);
 	}
 	if (std::strcmp(emotion, "sad") == 0 ||
-	    std::strcmp(emotion, "sleep") == 0 ||
+	    std::strcmp(emotion, "tired") == 0 ||
+	    std::strcmp(emotion, "sleepy") == 0 ||
+	    std::strcmp(emotion, "bored") == 0 ||
+	    std::strcmp(emotion, "offended") == 0 ||
 	    std::strcmp(emotion, "micro_sleep") == 0 ||
 	    std::strcmp(emotion, "sleepy_snapback") == 0 ||
 	    std::strcmp(emotion, "bored_sigh") == 0) {
@@ -1980,6 +2068,7 @@ uint16_t emotion_eye_color(const char* emotion)
 	}
 	if (std::strcmp(emotion, "question") == 0 ||
 	    std::strcmp(emotion, "confused") == 0 ||
+	    std::strcmp(emotion, "thinking") == 0 ||
 	    std::strcmp(emotion, "confused_dots") == 0 ||
 	    std::strcmp(emotion, "look_up_think") == 0) {
 		return rgb565(120, 236, 255);
@@ -1990,7 +2079,6 @@ uint16_t emotion_eye_color(const char* emotion)
 		return rgb565(255, 246, 150);
 	}
 	if (std::strcmp(emotion, "speaking") == 0 ||
-	    std::strcmp(emotion, "thinking") == 0 ||
 	    std::strcmp(emotion, "listening") == 0) {
 		return rgb565(145, 255, 230);
 	}
@@ -1999,6 +2087,11 @@ uint16_t emotion_eye_color(const char* emotion)
 		return rgb565(112, 255, 150);
 	}
 	if (std::strcmp(emotion, "suspicious_squint") == 0 ||
+	    std::strcmp(emotion, "mischievous") == 0 ||
+	    std::strcmp(emotion, "evil_grin") == 0 ||
+	    std::strcmp(emotion, "smug") == 0 ||
+	    std::strcmp(emotion, "skeptical") == 0 ||
+	    std::strcmp(emotion, "dramatic") == 0 ||
 	    std::strcmp(emotion, "smirk_slide") == 0 ||
 	    std::strcmp(emotion, "derp") == 0 ||
 	    std::strcmp(emotion, "cross_eyes") == 0 ||
@@ -2111,6 +2204,218 @@ void draw_custom_life_face_frame(int left_rx, int left_ry, int left_pupil_dx, in
 			draw_single_eye(right_x, eye_y, right_rx + pulse + 3, right_ry + pulse + 2, right_pupil_dx, right_pupil_dy, eye_color);
 	}
 	draw_simple_mouth(160 + mouth_dx, mouth_y + mouth_dy, 64 + pulse * 3, 18 + pulse, mouth_mode, mouth_mode == 1 ? warm : white);
+}
+
+void draw_mood_brow(int x1, int y1, int x2, int y2, uint16_t color, int width = 5)
+{
+    draw_line(x1, y1, x2, y2, color, width);
+}
+
+void draw_tiny_heart(int cx, int cy, int size, uint16_t color)
+{
+    draw_ellipse(cx - size / 3, cy - size / 5, size / 3, size / 3, color);
+    draw_ellipse(cx + size / 3, cy - size / 5, size / 3, size / 3, color);
+    draw_line(cx - size / 2, cy, cx, cy + size / 2, color, std::max(2, size / 4));
+    draw_line(cx + size / 2, cy, cx, cy + size / 2, color, std::max(2, size / 4));
+}
+
+void draw_face_fx(bool blush, bool sweat, bool anger, bool hearts, bool dead, bool glitch, uint16_t accent)
+{
+    if (blush) {
+        draw_ellipse(58, 142, 18, 6, rgb565(255, 98, 150));
+        draw_ellipse(262, 142, 18, 6, rgb565(255, 98, 150));
+    }
+    if (sweat) {
+        draw_ellipse(260, 48, 7, 11, rgb565(102, 247, 255));
+        draw_line(257, 38, 264, 28, rgb565(102, 247, 255), 4);
+    }
+    if (anger) {
+        const uint16_t red = rgb565(255, 75, 110);
+        draw_line(248, 26, 270, 16, red, 5);
+        draw_line(260, 14, 260, 38, red, 5);
+        draw_line(244, 24, 276, 34, red, 5);
+    }
+    if (hearts) {
+        draw_tiny_heart(72, 58, 18, rgb565(255, 92, 138));
+        draw_tiny_heart(248, 58, 18, rgb565(255, 92, 138));
+    }
+    if (dead) {
+        const uint16_t black = kBlack;
+        draw_line(75, 62, 125, 112, black, 7);
+        draw_line(125, 62, 75, 112, black, 7);
+        draw_line(195, 62, 245, 112, black, 7);
+        draw_line(245, 62, 195, 112, black, 7);
+    }
+    if (glitch) {
+        draw_rect(22, 42, 46, 4, accent);
+        draw_rect(226, 118, 58, 4, rgb565(255, 209, 102));
+        draw_rect(112, 188, 78, 3, rgb565(255, 75, 110));
+    }
+}
+
+bool draw_mood_preset(const char* emotion, int intensity_pct)
+{
+    const int pulse = clamp_int(intensity_pct / 18, 0, 7);
+    const int left_x = 100;
+    const int right_x = 220;
+    const int eye_y = 84;
+    const int mouth_y = 168;
+    const uint16_t white = rgb565(245, 250, 255);
+    const uint16_t eye_color = emotion_eye_color(emotion);
+    uint16_t mouth_color = white;
+    uint16_t brow_color = eye_color;
+    int left_rx = 18 + pulse;
+    int left_ry = 32 + pulse;
+    int right_rx = 18 + pulse;
+    int right_ry = 32 + pulse;
+    int left_pupil_dx = 0;
+    int left_pupil_dy = 0;
+    int right_pupil_dx = 0;
+    int right_pupil_dy = 0;
+    int pupil_scale = 100;
+    int left_tilt = 0;
+    int right_tilt = 0;
+    bool left_line = false;
+    bool right_line = false;
+    int mouth_mode = 0;
+    int mouth_dx = 0;
+    int mouth_dy = 0;
+    int mouth_width = 68 + pulse * 2;
+    int mouth_height = 18 + pulse;
+    bool blush = false;
+    bool sweat = false;
+    bool anger = false;
+    bool hearts = false;
+    bool dead = false;
+    bool glitch = false;
+    bool draw_brows = true;
+    int lb[4] = {70, 38, 130, 38};
+    int rb[4] = {190, 38, 250, 38};
+
+    if (str_eq(emotion, "neutral")) {
+        draw_brows = false;
+    } else if (str_eq(emotion, "friendly")) {
+        left_ry = right_ry = 34 + pulse;
+        lb[1] = 34; lb[3] = 28; rb[1] = 28; rb[3] = 34;
+        mouth_mode = 1; mouth_width = 84; mouth_height = 28 + pulse; blush = true;
+    } else if (str_eq(emotion, "super_happy")) {
+        left_line = right_line = true;
+        left_tilt = 5; right_tilt = -5;
+        mouth_mode = 1; mouth_width = 98; mouth_height = 34 + pulse; blush = true; hearts = true;
+        lb[1] = 26; lb[3] = 20; rb[1] = 20; rb[3] = 26;
+    } else if (str_eq(emotion, "happy") || str_eq(emotion, "thankful")) {
+        left_line = right_line = true;
+        left_tilt = 4; right_tilt = -4;
+        mouth_mode = 1; mouth_width = str_eq(emotion, "thankful") ? 78 : 88; mouth_height = 28 + pulse; blush = str_eq(emotion, "thankful");
+        lb[1] = 34; lb[3] = 28; rb[1] = 28; rb[3] = 34;
+    } else if (str_eq(emotion, "love")) {
+        left_rx = right_rx = 25; left_ry = right_ry = 30;
+        mouth_mode = 1; mouth_width = 92; mouth_height = 34; blush = true; hearts = true;
+        lb[1] = lb[3] = rb[1] = rb[3] = 28;
+    } else if (str_eq(emotion, "mischievous") || str_eq(emotion, "smug") || str_eq(emotion, "evil_grin")) {
+        const bool evil = str_eq(emotion, "evil_grin");
+        left_ry = 22 + pulse / 2; right_ry = 30 + pulse / 2;
+        left_pupil_dx = right_pupil_dx = evil ? -8 : 8;
+        mouth_mode = 5; mouth_dx = evil ? -4 : 8; mouth_width = 82; mouth_height = 24;
+        lb[1] = evil ? 24 : 44; lb[3] = evil ? 52 : 36;
+        rb[1] = evil ? 52 : 36; rb[3] = evil ? 24 : 44;
+        if (evil) { mouth_color = rgb565(255, 224, 116); anger = true; }
+    } else if (str_eq(emotion, "proud")) {
+        left_ry = right_ry = 28; left_pupil_dy = right_pupil_dy = -4;
+        mouth_mode = 1; mouth_width = 78; mouth_height = 22;
+        lb[1] = 24; lb[3] = 22; rb[1] = 22; rb[3] = 24;
+    } else if (str_eq(emotion, "shy")) {
+        left_pupil_dx = right_pupil_dx = -5; left_pupil_dy = right_pupil_dy = 6;
+        left_ry = right_ry = 26; mouth_mode = 2; mouth_width = 44; mouth_height = 10; blush = true;
+        lb[1] = 36; lb[3] = 42; rb[1] = 42; rb[3] = 36;
+    } else if (str_eq(emotion, "skeptical") || str_eq(emotion, "annoyed")) {
+        left_ry = right_ry = 14 + pulse / 3;
+        left_pupil_dx = right_pupil_dx = str_eq(emotion, "annoyed") ? 8 : -8;
+        mouth_mode = 4; mouth_width = 76; mouth_height = 10;
+        lb[1] = 40; lb[3] = 36; rb[1] = 34; rb[3] = 38;
+    } else if (str_eq(emotion, "offended")) {
+        left_ry = right_ry = 16; left_pupil_dx = right_pupil_dx = -7;
+        mouth_mode = 4; mouth_width = 54; mouth_dy = 10;
+        lb[1] = 42; lb[3] = 48; rb[1] = 40; rb[3] = 36;
+    } else if (str_eq(emotion, "sad")) {
+        left_ry = right_ry = 24 + pulse; left_pupil_dy = right_pupil_dy = 7;
+        mouth_mode = 8; mouth_width = 74; mouth_height = 24;
+        lb[1] = 28; lb[3] = 52; rb[1] = 52; rb[3] = 28;
+    } else if (str_eq(emotion, "tired") || str_eq(emotion, "sleepy") || str_eq(emotion, "bored")) {
+        left_ry = right_ry = str_eq(emotion, "sleepy") ? 8 : 13;
+        left_pupil_dx = right_pupil_dx = -3; left_pupil_dy = right_pupil_dy = 4;
+        mouth_mode = str_eq(emotion, "bored") ? 4 : 3; mouth_width = 58; mouth_height = 12; mouth_dy = 4;
+        lb[1] = lb[3] = rb[1] = rb[3] = 46;
+    } else if (str_eq(emotion, "confused") || str_eq(emotion, "thinking")) {
+        left_pupil_dx = -5; right_pupil_dx = 5; left_pupil_dy = right_pupil_dy = str_eq(emotion, "thinking") ? -6 : 0;
+        mouth_mode = 7; mouth_width = 64; mouth_height = 18;
+        lb[1] = 24; lb[3] = 44; rb[1] = 50; rb[3] = 28;
+    } else if (str_eq(emotion, "surprised") || str_eq(emotion, "panic") || str_eq(emotion, "scared") || str_eq(emotion, "help") || str_eq(emotion, "face_down")) {
+        const bool alarm = str_eq(emotion, "panic") || str_eq(emotion, "help") || str_eq(emotion, "face_down");
+        left_rx = right_rx = alarm ? 31 : 28;
+        left_ry = right_ry = alarm ? 40 : 36;
+        pupil_scale = alarm ? 45 : 65;
+        mouth_mode = 6; mouth_width = alarm ? 74 : 62; mouth_height = alarm ? 40 : 30;
+        lb[1] = 24; lb[3] = 30; rb[1] = 30; rb[3] = 24;
+        sweat = alarm || str_eq(emotion, "scared");
+        anger = alarm;
+        if (alarm) { mouth_color = rgb565(255, 76, 88); }
+    } else if (str_eq(emotion, "angry")) {
+        left_line = right_line = true; left_tilt = 18; right_tilt = -18;
+        mouth_mode = 4; mouth_width = 82; mouth_dy = 8; anger = true;
+        lb[1] = 22; lb[3] = 54; rb[1] = 54; rb[3] = 22;
+    } else if (str_eq(emotion, "dramatic")) {
+        left_ry = 38; right_ry = 18; left_pupil_dx = -7; right_pupil_dx = 7;
+        mouth_mode = 6; mouth_width = 60; mouth_height = 26; sweat = true;
+        lb[1] = 18; lb[3] = 52; rb[1] = 48; rb[3] = 22;
+    } else if (str_eq(emotion, "listening")) {
+        left_ry = right_ry = 34; left_pupil_dx = right_pupil_dx = 0;
+        mouth_mode = 2; mouth_width = 44; mouth_height = 10; draw_brows = false;
+    } else if (str_eq(emotion, "speaking")) {
+        left_ry = right_ry = 33 + pulse; mouth_mode = 6; mouth_width = 70 + pulse * 3; mouth_height = 28 + pulse;
+        mouth_color = rgb565(145, 255, 230); draw_brows = false;
+    } else if (str_eq(emotion, "charging")) {
+        left_ry = right_ry = 32; mouth_mode = 1; mouth_width = 70; mouth_height = 24; mouth_color = rgb565(112, 255, 150);
+        lb[1] = 32; lb[3] = 28; rb[1] = 28; rb[3] = 32;
+    } else if (str_eq(emotion, "error") || str_eq(emotion, "dead")) {
+        dead = true; mouth_mode = str_eq(emotion, "dead") ? 3 : 8; mouth_width = 76; mouth_height = 24; mouth_color = rgb565(255, 76, 88);
+        draw_brows = false;
+    } else if (str_eq(emotion, "glitch")) {
+        left_rx = 28; left_ry = 37; right_rx = 16; right_ry = 25; left_pupil_dx = 10; right_pupil_dx = -8;
+        mouth_mode = 7; mouth_width = 76; mouth_height = 22; glitch = true;
+        lb[1] = 20; lb[3] = 58; rb[1] = 54; rb[3] = 18;
+        brow_color = rgb565(255, 209, 102); mouth_color = brow_color;
+    } else if (str_eq(emotion, "battery") || str_eq(emotion, "battery_low")) {
+        return false;
+    } else {
+        return str_eq(emotion, "neutral");
+    }
+
+    if (left_line) {
+        draw_single_eye_line(left_x, eye_y, left_tilt, eye_color, 58 + pulse);
+    } else {
+        draw_single_eye_scaled_pupil(left_x, eye_y, left_rx, left_ry, left_pupil_dx, left_pupil_dy, pupil_scale, eye_color);
+    }
+    if (right_line) {
+        draw_single_eye_line(right_x, eye_y, right_tilt, eye_color, 58 + pulse);
+    } else {
+        draw_single_eye_scaled_pupil(right_x, eye_y, right_rx, right_ry, right_pupil_dx, right_pupil_dy, pupil_scale, eye_color);
+    }
+    if (draw_brows) {
+        draw_mood_brow(lb[0], lb[1], lb[2], lb[3], brow_color);
+        draw_mood_brow(rb[0], rb[1], rb[2], rb[3], brow_color);
+    }
+    if (str_eq(emotion, "love")) {
+        draw_tiny_heart(left_x, eye_y, 30, rgb565(255, 92, 138));
+        draw_tiny_heart(right_x, eye_y, 30, rgb565(255, 92, 138));
+    }
+    if (mouth_mode == 8) {
+        draw_mouth_curve(160 + mouth_dx, mouth_y + mouth_dy + 18, mouth_width, mouth_height, false, mouth_color);
+    } else {
+        draw_simple_mouth(160 + mouth_dx, mouth_y + mouth_dy, mouth_width, mouth_height, mouth_mode, mouth_color);
+    }
+    draw_face_fx(blush, sweat, anger, hearts, dead, glitch, brow_color);
+    return true;
 }
 
 void animate_transient_face(const char* emotion, int intensity_pct)
@@ -2485,6 +2790,10 @@ void draw_face(const char* emotion, int intensity_pct)
 	    const int mouth_y = 168;
 
     clear(kBlack);
+
+    if (draw_mood_preset(g_face_emotion, intensity_pct)) {
+        return;
+    }
 
 		if (std::strcmp(g_face_emotion, "blink") == 0) {
 			draw_flat_eye(left_x, eye_y, 58, 0, face_color);

@@ -286,8 +286,10 @@ Use these through Hermes JSON actions or through bridge helper commands:
 
 - `display`: show short text or UI state
 - `display_image`: show an image via bridge-hosted JPEG URL
-- `face`: set emotion/face, for example `neutral`, `happy`, `sad`, `question`,
-  `speaking`, `sleep`, `battery`, `charging`, `blink`, `wink_left`,
+- `face`: set emotion/face, for example `neutral`, `friendly`, `happy`,
+  `super_happy`, `thinking`, `listening`, `speaking`, `mischievous`, `smug`,
+  `evil_grin`, `help`, `panic`, `face_down`, `thankful`, `error`, `battery`,
+  `charging`, `battery_low`, plus transients like `blink`, `wink_left`,
   `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`,
   `breathe`, `deep_breathe`, `mouth_smile`, `mouth_tiny`, `mouth_wiggle`
 - `move`: safe directional or target movement
@@ -319,7 +321,7 @@ human activity for the five-minute idle-sleep timer.
 
 The bridge also runs a sensor watcher. It filters BMI270/LTR553 noise and reacts
 only to stable physical interaction: shake becomes a short surprise face, lying
-on the side becomes a surprised face, and proximity lowers the head a little
+on the side becomes a help/panic face, face-down becomes a tantrum face, and proximity lowers the head a little
 until the object moves away. These reactions are bridge-owned helper behavior;
 Hermes should not duplicate them with extra LED or sound actions.
 

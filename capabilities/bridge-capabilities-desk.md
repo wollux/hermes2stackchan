@@ -168,7 +168,9 @@ Image display payload:
 
 Publishes to `hermes-stackchan/desk/cmd/face`.
 
-Supported emotions include: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `blink`, `wink`, `wink_left`, `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `breathe`, `deep_breathe`, `micro_sleep`, `surprise_pop`, `happy_squint`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
+Supported emotions include: `neutral`, `happy`, `sad`, `angry`, `surprised`, `tired`, `annoyed`, `confused`, `scared`, `love`, `dead`, `glitch`, `super_happy`, `friendly`, `mischievous`, `smug`, `proud`, `shy`, `skeptical`, `offended`, `panic`, `dramatic`, `evil_grin`, `sleepy`, `bored`, `thinking`, `listening`, `speaking`, `charging`, `battery`, `battery_low`, `error`, `face_down`, `help`, `thankful`, plus transients such as `blink`, `wink`, `wink_left`, `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `breathe`, `deep_breathe`, `micro_sleep`, `surprise_pop`, and `happy_squint`.
+
+Recommended usage: use `friendly`, `happy`, `thinking`, `listening`, or `speaking` for normal conversation; use `mischievous`, `smug`, or `evil_grin` for humor; reserve `help`, `panic`, `face_down`, and `error` for real alarm/error situations.
 
 ```json
 {
@@ -424,7 +426,7 @@ The bridge command `watch-power` watches `external_power`/`usb_power` in these r
 The bridge command `watch-sensors` watches BMI270 and LTR553 fields in retained
 status plus `interaction` events. It is noise-filtered and only reacts to stable
 signals: shake triggers a short surprise face, lying on the side triggers a
-surprised face, and proximity lowers the head slightly until the object moves
+help/panic face, face-down triggers a tantrum face, and proximity lowers the head slightly until the object moves
 away. Confirmed sensor interaction wakes a sleeping display. It must not change
 LEDs or sound.
 

@@ -2271,7 +2271,7 @@ def sensor_status_is_face_down(status: dict[str, Any]) -> bool:
 def sensor_face_down_tantrum_actions() -> list[dict[str, Any]]:
     return [
         {"action": "led", "mode": "party", "r": 255, "g": 40, "b": 180},
-        {"action": "face", "emotion": "angry", "intensity_pct": 88},
+        {"action": "face", "emotion": "face_down", "intensity_pct": 92},
         {"action": "display", "mode": "text", "text": "NICHT AUFS GESICHT!", "duration_ms": 2200},
         {
             "action": "motion",
@@ -2470,7 +2470,7 @@ def build_sensor_reaction_actions(
             maybe_wake("sideways")
             actions.extend([
                 {"action": "led", "mode": "blink", "r": 255, "g": 0, "b": 0},
-                {"action": "face", "emotion": "surprise_pop", "intensity_pct": 94},
+                {"action": "face", "emotion": "help", "intensity_pct": 94},
                 {"action": "display", "mode": "text", "text": "HILFE!", "duration_ms": 4500},
                 {"action": "local_tts", "text": SENSOR_SIDE_HELP_TEXT},
             ])
@@ -2487,7 +2487,7 @@ def build_sensor_reaction_actions(
             actions.append({"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
             if state.side_active or state.face_down_active:
                 actions.extend([
-                    {"action": "face", "emotion": "happy", "intensity_pct": 82},
+                    {"action": "face", "emotion": "thankful", "intensity_pct": 82},
                     {
                         "action": "motion",
                         "curve": "spline",
@@ -2803,7 +2803,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
         return [(0, life_face("surprise_pop", high, name)), (720, life_face("blink", base_intensity, name))]
     if name == "cheeky_grin":
         side = rng.choice(["glance_left", "glance_right"])
-        return [(0, life_face(side, base_intensity, name)), (520, life_face("wink_right" if side == "glance_left" else "wink_left", high, name))]
+        return [(0, life_face("mischievous", high, name)), (520, life_face("wink_right" if side == "glance_left" else "wink_left", high, name))]
     if name == "question_glance":
         return [
             (0, life_face("glance_up", base_intensity, name)),
@@ -2813,7 +2813,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
     if name == "nervous_flick":
         return [(0, life_face("glance_left", base_intensity, name)), (180, life_face("glance_right", base_intensity, name)), (180, life_face("blink", low, name))]
     if name == "happy_squint":
-        return [(0, life_face("happy_squint", high, name))]
+        return [(0, life_face("super_happy", high, name))]
     if name == "grumble_mouth":
         return [(0, life_face("grumble", low, name))]
     if name == "scanner_eyes":
@@ -2883,9 +2883,9 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
         return [(0, life_face("glance_down", low, name)), (520, life_face("deep_breathe", low, name))]
     if name == "sneaky_side_eye":
         side = rng.choice(["glance_left", "glance_right"])
-        return [(0, life_face(side, low, name)), (900, life_face("mouth_tiny", high, name)), (500, life_face(side, low, name))]
+        return [(0, life_face(side, low, name)), (900, life_face("smug", high, name)), (500, life_face(side, low, name))]
     if name == "tiny_laugh":
-        return [(0, life_face("happy_squint", high, name)), (360, life_face("mouth_smile", high, name)), (360, life_face("blink", base_intensity, name))]
+        return [(0, life_face("friendly", high, name)), (360, life_face("mouth_smile", high, name)), (360, life_face("blink", base_intensity, name))]
     if name == "confused_scan":
         return [
             (0, life_face("glance_up", base_intensity, name)),
@@ -2922,7 +2922,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
     if name == "mouth_pop":
         return [(0, life_face("mouth_pop", high, name))]
     if name == "smirk_slide":
-        return [(0, life_face("glance_right", base_intensity, name)), (280, life_face("smirk_slide", high, name)), (760, life_face(mood, base_intensity, name))]
+        return [(0, life_face("glance_right", base_intensity, name)), (280, life_face("mischievous", high, name)), (760, life_face(mood, base_intensity, name))]
     if name == "silent_giggle":
         return [(0, life_face("silent_giggle", high, name)), (680, life_face("happy_squint", high, name))]
     if name == "sleepy_snapback":
@@ -5755,7 +5755,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     face = subcommands.add_parser("send-face", help="Set the StackChan face.")
     add_common_send_options(face)
-    face.add_argument("--emotion", default="neutral", help="neutral, happy, sad, angry, surprised, question, wink, sleep, speaking, error.")
+    face.add_argument(
+        "--emotion",
+        default="neutral",
+        help="neutral, friendly, happy, super_happy, thinking, mischievous, panic, help, speaking, error, etc.",
+    )
     face.add_argument("--intensity-pct", type=int, default=60, help="Expression intensity 0..100.")
     face.set_defaults(func=send_face)
 

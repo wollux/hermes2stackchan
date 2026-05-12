@@ -19,7 +19,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Retained status on `hermes-stackchan/desk/status`.
 - Structured ACK, error, and event topics.
 - Display text commands.
-- Face rendering with eyes, pupils, mouth, blink, breathing, gaze directions, sleep hints, battery states, and simple emotions.
+- Firmware-rendered Robot Face moods with eyes, pupils, brows, mouth curves, colors, blink, breathing, gaze, sleep hints, battery states, friendly/extreme emotions, and small FX.
 - Idle life animation from the bridge while StackChan is idle.
 - Automatic idle sleep: after five quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
 - Wake on interaction: head touch, display touch, commanded movement, IMU movement, and LTR553 proximity wake the display through the CRT wake animation.
@@ -30,7 +30,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Display brightness, display sleep, display wake, shutdown, reboot, ping, and status commands.
 - Battery and power status in retained MQTT state.
 - Interaction sensor status for BMI270 IMU motion and LTR553 proximity/ambient light.
-- Filtered bridge reactions for real sensor interaction: shake face, sideways surprise, proximity head dip, and sensor wake from sleep.
+- Filtered bridge reactions for real sensor interaction: shake face, sideways help/panic face, face-down tantrum, proximity head dip, and sensor wake from sleep.
 - Power watcher reactions for plug/unplug without taking over LEDs.
 - Temperature fields for SoC and servos where available.
 - ES7210 microphone recording.
@@ -436,7 +436,7 @@ scripts/h2s_bridge.sh watch-sensors --pair desk --verbose
 The unified bridge service runs this by default. It watches retained status plus
 `events`, filters sensor noise with hysteresis, and only reacts to stable
 signals: a real shake makes a short surprise face, lying on the side makes a
-surprised face, and a hand/finger approaching the LTR553 proximity sensor lowers
+help/panic face, face-down triggers a tantrum face, and a hand/finger approaching the LTR553 proximity sensor lowers
 the head slightly until the object moves away. If the display is sleeping, a
 confirmed sensor interaction wakes StackChan first. It does not use LEDs or
 sound.
