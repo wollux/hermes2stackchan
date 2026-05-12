@@ -28,6 +28,7 @@ from bridge.hermes2stackchan_bridge import (
     build_power_followup_actions,
     build_reminder,
     build_sensor_reaction_actions,
+    build_touch_emotion_actions,
     build_touch_lamp_payload,
     command_requests_display_sleep,
     direct_system_command_from_transcript,
@@ -60,9 +61,12 @@ from bridge.hermes2stackchan_bridge import (
     image_result_aspect_score,
     image_search_queries,
     command_counts_as_idle_activity,
+    current_face_action,
     request_id_counts_as_idle_activity,
     rgb565_to_jpeg,
     SensorReactionState,
+    TouchEmotionState,
+    sensor_status_is_face_down,
     sensor_status_is_sideways,
     status_allows_life_animation,
 )
@@ -628,6 +632,17 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(restore, {"action": "face", "emotion": "neutral", "intensity_pct": 75})
 
+    def test_current_life_base_does_not_keep_funny_transient_faces(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "cross_eyes", "intensity_pct": 71},
+        }
+
+        self.assertEqual(current_face_action(status), {"action": "face", "emotion": "neutral", "intensity_pct": 71})
+
     def test_status_health_required_paths(self) -> None:
         status = {
             "schema_version": "1.0",
@@ -812,9 +827,7 @@ class BridgeConfigTests(unittest.TestCase):
         side = self.sensor_status(accel_x=820, accel_y=100, accel_z=120)
 
         self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.0)[0], [])
-        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.1, source_hint="orientation")[0], [])
-        self.assertEqual(build_sensor_reaction_actions(side, state, now_s=40.2, source_hint="orientation")[0], [])
-        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.3, source_hint="orientation")
+        side_actions, side_reasons = build_sensor_reaction_actions(side, state, now_s=40.1, source_hint="orientation")
 
         self.assertEqual(side_reasons, ["sideways"])
         self.assertEqual([action["action"] for action in side_actions], ["led", "face", "display", "local_tts"])
@@ -825,16 +838,52 @@ class BridgeConfigTests(unittest.TestCase):
 
         pitched_head = self.sensor_status(accel_x=90, accel_y=430, accel_z=870)
         self.assertFalse(sensor_status_is_sideways(pitched_head))
+        self.assertFalse(sensor_status_is_face_down(pitched_head))
 
         upright = self.sensor_status(accel_x=0)
-        self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.3)[0], [])
-        upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=41.4, source_hint="orientation")
+        self.assertEqual(build_sensor_reaction_actions(upright, state, now_s=41.0)[0], [])
+        upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=41.2, source_hint="orientation")
 
         self.assertEqual(upright_reasons, ["upright"])
-        self.assertEqual(upright_actions, [
-            {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
-            {"action": "face", "emotion": "neutral", "intensity_pct": 60},
-        ])
+        self.assertEqual([action["action"] for action in upright_actions], ["led", "face", "motion", "local_tts"])
+        self.assertEqual(upright_actions[0], {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
+        self.assertEqual(upright_actions[1], {"action": "face", "emotion": "happy", "intensity_pct": 82})
+        self.assertEqual(upright_actions[2]["speed_pct"], 72)
+        self.assertIn("Danke", upright_actions[3]["text"])
+
+    def test_sensor_reaction_upright_always_turns_leds_off(self) -> None:
+        state = SensorReactionState()
+        upright = self.sensor_status(accel_x=0)
+
+        actions, reasons = build_sensor_reaction_actions(upright, state, now_s=45.0, source_hint="orientation")
+
+        self.assertEqual(reasons, ["upright"])
+        self.assertEqual(actions, [{"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0}])
+
+    def test_sensor_reaction_face_down_repeats_until_upright(self) -> None:
+        state = SensorReactionState()
+        face_down = self.sensor_status(accel_x=40, accel_y=60, accel_z=980)
+
+        first_actions, first_reasons = build_sensor_reaction_actions(face_down, state, now_s=55.0, source_hint="orientation")
+        quiet_actions, _ = build_sensor_reaction_actions(face_down, state, now_s=56.0, source_hint="orientation")
+        repeat_actions, repeat_reasons = build_sensor_reaction_actions(face_down, state, now_s=57.1, source_hint="orientation")
+
+        self.assertTrue(sensor_status_is_face_down(face_down))
+        self.assertEqual(first_reasons, ["face_down"])
+        self.assertEqual([action["action"] for action in first_actions], ["led", "face", "display", "motion", "local_tts"])
+        self.assertEqual(first_actions[0]["mode"], "party")
+        self.assertEqual(first_actions[2]["text"], "NICHT AUFS GESICHT!")
+        self.assertIn("Nicht aufs Gesicht", first_actions[4]["text"])
+        self.assertEqual(quiet_actions, [])
+        self.assertEqual(repeat_reasons, ["face_down"])
+        self.assertEqual([action["action"] for action in repeat_actions], ["led", "face", "display", "motion"])
+
+        upright = self.sensor_status(accel_x=0)
+        upright_actions, upright_reasons = build_sensor_reaction_actions(upright, state, now_s=58.3, source_hint="orientation")
+
+        self.assertEqual(upright_reasons, ["upright"])
+        self.assertEqual([action["action"] for action in upright_actions], ["led", "face", "motion", "local_tts"])
+        self.assertEqual(upright_actions[0]["mode"], "off")
 
     def test_sensor_reaction_ignores_busy_recording_status(self) -> None:
         state = SensorReactionState()
@@ -959,11 +1008,42 @@ class BridgeConfigTests(unittest.TestCase):
         started = build_touch_lamp_payload({"event": "recording_started"}, "touch-2")
         stopped = build_touch_lamp_payload({"event": "recording_stopped"}, "touch-3")
         ignored = build_touch_lamp_payload({"event": "touch_up"}, "touch-4")
+        side_touch = build_touch_lamp_payload({"event": "touch_down", "source": "head_touch_left"}, "touch-5")
 
         self.assertEqual(down, {"mode": "solid", "r": 0, "g": 255, "b": 0, "schema_version": "1.0", "request_id": "touch-1"})
         self.assertEqual(started, {"mode": "solid", "r": 0, "g": 255, "b": 0, "schema_version": "1.0", "request_id": "touch-2"})
         self.assertEqual(stopped, {"mode": "off", "r": 0, "g": 0, "b": 0, "schema_version": "1.0", "request_id": "touch-3"})
         self.assertIsNone(ignored)
+        self.assertIsNone(side_touch)
+
+    def test_side_touch_emotions_do_not_trigger_audio_or_led(self) -> None:
+        state = TouchEmotionState()
+
+        left_actions, left_reasons = build_touch_emotion_actions(
+            {"event": "touch_down", "source": "head_touch_left"},
+            state,
+            now_s=10.0,
+        )
+        center_actions, center_reasons = build_touch_emotion_actions(
+            {"event": "touch_down", "source": "head_touch"},
+            state,
+            now_s=10.2,
+        )
+        giggle_actions, giggle_reasons = build_touch_emotion_actions(
+            {"event": "touch_down", "source": "head_touch_right"},
+            state,
+            now_s=10.6,
+        )
+
+        self.assertEqual(left_reasons, ["side_touch_left"])
+        self.assertEqual(center_actions, [])
+        self.assertEqual(center_reasons, [])
+        self.assertEqual(giggle_reasons, ["side_touch_giggle"])
+        forbidden = {"audio", "local_tts", "tts", "speak", "sound", "led"}
+        for action in left_actions + giggle_actions:
+            self.assertNotIn(action["action"], forbidden)
+        self.assertTrue(any(action["action"] == "face" for action in left_actions))
+        self.assertTrue(any(action.get("emotion") == "silent_giggle" for action in giggle_actions))
 
     def test_life_animation_only_runs_on_idle_face(self) -> None:
         status = {
@@ -995,8 +1075,8 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertNotIn("sound", action_names)
 
     def test_life_variant_pool_has_100_named_variants(self) -> None:
-        self.assertEqual(len(LIFE_VARIANT_NAMES), 100)
-        self.assertEqual(len(set(LIFE_VARIANT_NAMES)), 100)
+        self.assertGreaterEqual(len(LIFE_VARIANT_NAMES), 100)
+        self.assertEqual(len(set(LIFE_VARIANT_NAMES)), len(LIFE_VARIANT_NAMES))
         for name in [
             "double_blink",
             "wink_left",
@@ -1006,6 +1086,16 @@ class BridgeConfigTests(unittest.TestCase):
             "look_behind",
             "desk_spin",
             "reset_grin",
+            "cross_eyes",
+            "eye_swap",
+            "derp",
+            "boing_eyes",
+            "suspicious_squint",
+            "confused_dots",
+            "mouth_pop",
+            "smirk_slide",
+            "silent_giggle",
+            "sleepy_snapback",
         ]:
             self.assertIn(name, LIFE_VARIANT_NAMES)
 
@@ -1100,6 +1190,36 @@ class BridgeConfigTests(unittest.TestCase):
         ]
 
         self.assertIn("micro_sleep", emotions)
+
+    def test_life_sequence_uses_funny_gags_but_not_constantly(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+        funny = {
+            "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint",
+            "confused_dots", "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
+        }
+
+        sequences = [build_life_sequence(status, random.Random(seed), include_motion=False) for seed in range(300)]
+        funny_sequences = [
+            sequence
+            for sequence in sequences
+            if any(action["action"] == "face" and action["emotion"] in funny for _delay, action in sequence)
+        ]
+        seen = {
+            action["emotion"]
+            for sequence in sequences
+            for _delay, action in sequence
+            if action["action"] == "face" and action["emotion"] in funny
+        }
+
+        self.assertGreaterEqual(len(seen), 8)
+        self.assertGreaterEqual(len(funny_sequences), 18)
+        self.assertLessEqual(len(funny_sequences), 45)
 
     def test_life_motion_is_mostly_small_and_slow(self) -> None:
         status = {
@@ -1246,7 +1366,7 @@ class BridgeConfigTests(unittest.TestCase):
             sequence = build_life_sequence(status, random.Random(seed), include_motion=False)
             self.assertNotIn("motion", {action["action"] for _delay, action in sequence})
 
-    def test_life_question_face_is_never_final_state(self) -> None:
+    def test_life_question_or_error_face_is_never_final_state(self) -> None:
         status = {
             "display_sleeping": False,
             "recording": False,
@@ -1259,7 +1379,7 @@ class BridgeConfigTests(unittest.TestCase):
             sequence = build_life_sequence(status, random.Random(seed))
             face_actions = [action for _delay, action in sequence if action["action"] == "face"]
             self.assertTrue(face_actions)
-            self.assertNotEqual(face_actions[-1]["emotion"], "question")
+            self.assertNotIn(face_actions[-1]["emotion"], {"question", "error"})
 
 
 if __name__ == "__main__":

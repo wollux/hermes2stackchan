@@ -58,15 +58,23 @@ SENSOR_PROXIMITY_HEAD_DROP_PCT = 18
 SENSOR_SIDE_AXIS_MG = 760
 SENSOR_SIDE_UPRIGHT_MAX_MG = 560
 SENSOR_UPRIGHT_AXIS_MG = 620
+SENSOR_FACE_DOWN_AXIS_MG = 900
+SENSOR_FACE_DOWN_OTHER_MAX_MG = 650
 SENSOR_SIDE_STABLE_SAMPLES = 3
+SENSOR_FACE_DOWN_STABLE_SAMPLES = 2
+SENSOR_FACE_DOWN_REPEAT_S = 2.0
 SENSOR_SHAKE_SCORE_THRESHOLD = 20
 SENSOR_SHAKE_COOLDOWN_S = 4.0
 SENSOR_REACTION_COOLDOWN_S = 1.0
 SENSOR_WAKE_COOLDOWN_S = 2.0
 SENSOR_SIDE_HELP_TEXT = "Hilfe! Ich bin umgekippt!"
+SENSOR_SIDE_THANKS_TEXT = "Danke, ich stehe wieder. Rettung erfolgreich!"
+SENSOR_FACE_DOWN_TEXT = "Hey! Nicht aufs Gesicht. Das mag ich gar nicht!"
 REMINDER_STORE_LOCK = RLock()
 LIFE_PAUSE_LOCK = RLock()
 LIFE_PAUSED_UNTIL: dict[str, float] = {}
+SIDE_TOUCH_SOURCES = {"head_touch_left", "head_touch_right"}
+SIDE_TOUCH_GIGGLE_WINDOW_S = 1.0
 
 
 class ConfigError(ValueError):
@@ -208,8 +216,11 @@ class SensorReactionState:
     side_active: bool = False
     side_seen_count: int = 0
     upright_seen_count: int = 0
+    face_down_active: bool = False
+    face_down_seen_count: int = 0
     last_shake_at: float = -9999.0
     last_side_at: float = -9999.0
+    last_face_down_at: float = -9999.0
     last_proximity_at: float = -9999.0
     last_wake_at: float = -9999.0
 
@@ -599,12 +610,83 @@ def send_payload(
 
 def build_touch_lamp_payload(event_payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any] | None:
     event = optional_string(event_payload.get("event"))
+    source = optional_string(event_payload.get("source"))
+    if source in SIDE_TOUCH_SOURCES:
+        return None
     recording = event_payload.get("recording")
     if event in {"touch_down", "recording_started"} or recording is True:
         return with_request_id({"mode": "solid", "r": 0, "g": 255, "b": 0}, request_id)
     if event == "recording_stopped" or recording is False:
         return with_request_id({"mode": "off", "r": 0, "g": 0, "b": 0}, request_id)
     return None
+
+
+@dataclass
+class TouchEmotionState:
+    last_side: str = ""
+    last_side_at: float = -9999.0
+
+
+def build_touch_emotion_actions(
+    event_payload: dict[str, Any],
+    state: TouchEmotionState,
+    now_s: float | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    event = optional_string(event_payload.get("event"))
+    source = optional_string(event_payload.get("source"))
+    if event != "touch_down" or source not in SIDE_TOUCH_SOURCES:
+        return [], []
+
+    now_s = time.monotonic() if now_s is None else now_s
+    side = "left" if source == "head_touch_left" else "right"
+    previous_side = state.last_side
+    previous_at = state.last_side_at
+    state.last_side = side
+    state.last_side_at = now_s
+
+    if previous_side and previous_side != side and now_s - previous_at <= SIDE_TOUCH_GIGGLE_WINDOW_S:
+        return [
+            {"action": "face", "emotion": "silent_giggle", "intensity_pct": 86},
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 52,
+                "points": [
+                    {"yaw_pct": -9, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 130, "speed_pct": 52},
+                    {"yaw_pct": 9, "pitch_pct": DEFAULT_IDLE_PITCH_PCT - 1, "duration_ms": 130, "speed_pct": 52},
+                    {"yaw_pct": -5, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 120, "speed_pct": 45},
+                    {"yaw_pct": DEFAULT_IDLE_YAW_PCT, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 220, "speed_pct": 35},
+                ],
+            },
+        ], ["side_touch_giggle"]
+
+    if side == "left":
+        return [
+            {"action": "face", "emotion": "happy_squint", "intensity_pct": 76},
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 24,
+                "points": [
+                    {"yaw_pct": -8, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 3, "duration_ms": 260, "speed_pct": 24},
+                    {"yaw_pct": DEFAULT_IDLE_YAW_PCT, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 420, "speed_pct": 18},
+                ],
+            },
+        ], ["side_touch_left"]
+
+    return [
+        {"action": "face", "emotion": "smirk_slide", "intensity_pct": 78},
+        {
+            "action": "motion",
+            "curve": "spline",
+            "speed_pct": 32,
+            "points": [
+                {"yaw_pct": 9, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 180, "speed_pct": 32},
+                {"yaw_pct": 3, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 2, "duration_ms": 170, "speed_pct": 26},
+                {"yaw_pct": DEFAULT_IDLE_YAW_PCT, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 320, "speed_pct": 22},
+            ],
+        },
+    ], ["side_touch_right"]
 
 
 def read_latest_status(config: BridgeConfig, pair: PairConfig, timeout_s: float = 2.0) -> dict[str, Any] | None:
@@ -2135,6 +2217,37 @@ def sensor_status_is_sideways(status: dict[str, Any]) -> bool:
     return abs(ax) >= SENSOR_SIDE_AXIS_MG and abs(ay) <= SENSOR_SIDE_UPRIGHT_MAX_MG
 
 
+def sensor_status_is_face_down(status: dict[str, Any]) -> bool:
+    ax = status_int_at(status, "sensors.imu.accel_mg.x")
+    ay = status_int_at(status, "sensors.imu.accel_mg.y")
+    az = status_int_at(status, "sensors.imu.accel_mg.z")
+    return (
+        abs(az) >= SENSOR_FACE_DOWN_AXIS_MG
+        and abs(ax) <= SENSOR_FACE_DOWN_OTHER_MAX_MG
+        and abs(ay) <= SENSOR_FACE_DOWN_OTHER_MAX_MG
+    )
+
+
+def sensor_face_down_tantrum_actions() -> list[dict[str, Any]]:
+    return [
+        {"action": "led", "mode": "party", "r": 255, "g": 40, "b": 180},
+        {"action": "face", "emotion": "angry", "intensity_pct": 88},
+        {"action": "display", "mode": "text", "text": "NICHT AUFS GESICHT!", "duration_ms": 2200},
+        {
+            "action": "motion",
+            "curve": "spline",
+            "speed_pct": 80,
+            "points": [
+                {"yaw_pct": -34, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 7, "duration_ms": 110},
+                {"yaw_pct": 34, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 3, "duration_ms": 115},
+                {"yaw_pct": -26, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 9, "duration_ms": 105},
+                {"yaw_pct": 22, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 115},
+                {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 5, "duration_ms": 130},
+            ],
+        },
+    ]
+
+
 def sensor_shake_motion_action() -> dict[str, Any]:
     return {
         "action": "motion",
@@ -2253,11 +2366,14 @@ def build_sensor_reaction_actions(
     imu_ready = status_bool(nested_status_value(status, "sensors.imu.ready")) is True
     motion_score = status_int_at(status, "sensors.imu.motion_score_pct", 0)
     imu_motion = status_bool(nested_status_value(status, "sensors.imu.motion_active")) is True
-    sideways = imu_ready and sensor_status_is_sideways(status)
+    face_down = imu_ready and sensor_status_is_face_down(status)
+    sideways = imu_ready and not face_down and sensor_status_is_sideways(status)
     imu_event = source_hint in {"imu", "orientation"}
-    if source_hint == "imu" and sideways:
+    if source_hint in {"imu", "orientation"} and face_down:
+        state.face_down_seen_count = max(state.face_down_seen_count, SENSOR_FACE_DOWN_STABLE_SAMPLES - 1)
+    if source_hint in {"imu", "orientation"} and sideways:
         state.side_seen_count = max(state.side_seen_count, SENSOR_SIDE_STABLE_SAMPLES - 1)
-    if source_hint == "orientation" and not sideways:
+    if source_hint == "orientation" and not sideways and not face_down:
         state.upright_seen_count = max(state.upright_seen_count, SENSOR_SIDE_STABLE_SAMPLES - 1)
     if (
         imu_event
@@ -2273,12 +2389,34 @@ def build_sensor_reaction_actions(
         state.last_shake_at = now_s
 
     if imu_event:
-        if sideways:
+        if face_down:
+            state.face_down_seen_count += 1
+            state.side_seen_count = 0
+            state.upright_seen_count = 0
+        elif sideways:
             state.side_seen_count += 1
             state.upright_seen_count = 0
+            state.face_down_seen_count = 0
         else:
             state.upright_seen_count += 1
             state.side_seen_count = 0
+            state.face_down_seen_count = 0
+
+        if (
+            face_down
+            and state.face_down_seen_count >= SENSOR_FACE_DOWN_STABLE_SAMPLES
+            and (
+                not state.face_down_active
+                or now_s - state.last_face_down_at >= SENSOR_FACE_DOWN_REPEAT_S
+            )
+        ):
+            maybe_wake("face_down")
+            actions.extend(sensor_face_down_tantrum_actions())
+            if not state.face_down_active:
+                actions.append({"action": "local_tts", "text": SENSOR_FACE_DOWN_TEXT})
+            reasons.append("face_down")
+            state.face_down_active = True
+            state.last_face_down_at = now_s
 
         if (
             sideways
@@ -2298,17 +2436,32 @@ def build_sensor_reaction_actions(
             state.last_side_at = now_s
 
         if (
-            state.side_active
+            source_hint == "orientation"
             and not sideways
             and state.upright_seen_count >= SENSOR_SIDE_STABLE_SAMPLES
             and now_s - state.last_side_at >= SENSOR_REACTION_COOLDOWN_S
         ):
-            actions.extend([
-                {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
-                {"action": "face", "emotion": "neutral", "intensity_pct": 60},
-            ])
+            actions.append({"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
+            if state.side_active or state.face_down_active:
+                actions.extend([
+                    {"action": "face", "emotion": "happy", "intensity_pct": 82},
+                    {
+                        "action": "motion",
+                        "curve": "spline",
+                        "speed_pct": 72,
+                        "points": [
+                            {"yaw_pct": -24, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 5, "duration_ms": 130},
+                            {"yaw_pct": 24, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1, "duration_ms": 150},
+                            {"yaw_pct": -14, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 7, "duration_ms": 130},
+                            {"yaw_pct": 14, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 3, "duration_ms": 130},
+                            {"yaw_pct": 0, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 170},
+                        ],
+                    },
+                    {"action": "local_tts", "text": SENSOR_SIDE_THANKS_TEXT},
+                ])
             reasons.append("upright")
             state.side_active = False
+            state.face_down_active = False
             state.last_side_at = now_s
 
     return actions, reasons
@@ -2338,34 +2491,47 @@ def life_animation_paused(pair_id: str) -> bool:
         return True
 
 
+TRANSIENT_FACE_EMOTIONS = {
+    "blink",
+    "glance_left",
+    "glance_right",
+    "glance_up",
+    "glance_down",
+    "mouth_smile",
+    "mouth_tiny",
+    "mouth_wiggle",
+    "look_left",
+    "look_right",
+    "look_up",
+    "look_down",
+    "breathe",
+    "deep_breathe",
+    "micro_sleep",
+    "question",
+    "wink_left",
+    "wink_right",
+    "surprise_pop",
+    "grumble",
+    "yawn",
+    "happy_squint",
+    "cross_eyes",
+    "eye_swap",
+    "derp",
+    "boing_eyes",
+    "suspicious_squint",
+    "confused_dots",
+    "mouth_pop",
+    "smirk_slide",
+    "silent_giggle",
+    "sleepy_snapback",
+}
+
+
 def current_face_action(status: dict[str, Any] | None, default_intensity: int = 60) -> dict[str, Any]:
     if not isinstance(status, dict):
         return {"action": "face", "emotion": "neutral", "intensity_pct": default_intensity}
     emotion = optional_string(nested_status_value(status, "face.emotion")) or "neutral"
-    if emotion in {
-        "blink",
-        "glance_left",
-        "glance_right",
-        "glance_up",
-        "glance_down",
-        "mouth_smile",
-        "mouth_tiny",
-        "mouth_wiggle",
-        "look_left",
-        "look_right",
-        "look_up",
-        "look_down",
-        "breathe",
-        "deep_breathe",
-        "micro_sleep",
-        "question",
-        "wink_left",
-        "wink_right",
-        "surprise_pop",
-        "grumble",
-        "yawn",
-        "happy_squint",
-    }:
+    if emotion in TRANSIENT_FACE_EMOTIONS:
         emotion = "neutral"
     intensity = nested_status_value(status, "face.intensity_pct")
     if not isinstance(intensity, int):
@@ -2689,6 +2855,35 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
         return [(0, life_face("micro_sleep", low, name)), (900, life_face("surprise_pop", high, name)), (620, life_face("blink", base_intensity, name))]
     if name == "reset_grin":
         return [(0, life_face(rng.choice(["glance_left", "glance_right"]), base_intensity, name)), (520, life_face("mouth_smile", high, name)), (620, life_face(mood, base_intensity, name))]
+    if name == "cross_eyes":
+        return [(0, life_face("cross_eyes", high, name)), (760, life_face("blink", base_intensity, name))]
+    if name == "eye_swap":
+        return [(0, life_face("eye_swap", high, name)), (720, life_face(mood, base_intensity, name))]
+    if name == "derp":
+        return [
+            (0, life_face("derp", high, name)),
+            (180, life_motion([idle_motion_point(rng.choice([-4, 4]), rng.choice([-2, 2]), 900, 10), idle_motion_point(0, 0, 1200, 10)], 10, variant=name)),
+            (860, life_face("blink", base_intensity, name)),
+        ]
+    if name == "boing_eyes":
+        return [(0, life_face("boing_eyes", high, name)), (680, life_face("mouth_tiny", base_intensity, name))]
+    if name == "suspicious_squint":
+        side = rng.choice([-1, 1])
+        return [
+            (0, life_face("suspicious_squint", low, name)),
+            (240, life_motion([idle_motion_point(7 * side, -1, 1100, 11, 260), idle_motion_point(0, 0, 1300, 10)], 11, variant=name)),
+            (1200, life_face(mood, base_intensity, name)),
+        ]
+    if name == "confused_dots":
+        return [(0, life_face("confused_dots", base_intensity, name)), (620, life_face("mouth_pop", base_intensity, name))]
+    if name == "mouth_pop":
+        return [(0, life_face("mouth_pop", high, name))]
+    if name == "smirk_slide":
+        return [(0, life_face("glance_right", base_intensity, name)), (280, life_face("smirk_slide", high, name)), (760, life_face(mood, base_intensity, name))]
+    if name == "silent_giggle":
+        return [(0, life_face("silent_giggle", high, name)), (680, life_face("happy_squint", high, name))]
+    if name == "sleepy_snapback":
+        return [(0, life_face("sleepy_snapback", low, name)), (780, life_face("blink", base_intensity, name))]
 
     return [(0, life_face("blink", base_intensity, name))]
 
@@ -2765,18 +2960,24 @@ CURATED_LIFE_VARIANT_NAMES = [
     "nervous_flick", "happy_squint", "grumble_mouth", "scanner_eyes", "yawn_hint",
     "look_behind", "desk_spin", "drama_blink", "shy_lookaway", "proud_lift", "bored_sigh",
     "sneaky_side_eye", "tiny_laugh", "confused_scan", "sleepy_recover", "reset_grin",
+    "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint", "confused_dots",
+    "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
 ]
 
 
 def build_life_variants() -> list[LifeVariant]:
     variants: list[LifeVariant] = []
-    rare_names = {"micro_sleep", "surprise_pop", "look_behind", "desk_spin", "drama_blink", "yawn_hint", "sleepy_recover"}
+    funny_names = {
+        "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint", "confused_dots",
+        "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
+    }
+    rare_names = {"micro_sleep", "surprise_pop", "look_behind", "desk_spin", "drama_blink", "yawn_hint", "sleepy_recover"} | funny_names
     for name in CURATED_LIFE_VARIANT_NAMES:
         variants.append(LifeVariant(
             name=name,
-            weight=0.8 if name in rare_names else 2.4,
+            weight=1.1 if name in funny_names else 0.8 if name in rare_names else 2.4,
             rare=name in rare_names,
-            min_gap_s=45.0 if name in rare_names else 8.0,
+            min_gap_s=28.0 if name in funny_names else 45.0 if name in rare_names else 8.0,
             builder=lambda rng, intensity, mood, variant_name=name: build_named_life_sequence(variant_name, rng, intensity, mood),
         ))
 
@@ -2814,8 +3015,8 @@ def build_life_variants() -> list[LifeVariant]:
         name = f"gen_head_{direction}_{index}"
         variants.append(LifeVariant(name, 1.6 if direction != "scan" else 0.8, direction == "scan", 12.0 if direction != "scan" else 40.0, lambda rng, intensity, mood, variant_name=name: build_generated_life_sequence(variant_name, rng, intensity, mood)))
 
-    if len(variants) != 100:
-        raise RuntimeError(f"expected 100 life variants, got {len(variants)}")
+    if len(variants) < 100:
+        raise RuntimeError(f"expected at least 100 life variants, got {len(variants)}")
     return variants
 
 
@@ -2859,17 +3060,25 @@ LIFE_VARIANT_CATEGORIES: dict[str, list[LifeVariant]] = {
     "rare_gag": life_variants_matching(
         lambda name: name in {"wink_left", "wink_right", "micro_sleep", "surprise_pop", "yawn_hint", "drama_blink", "sleepy_recover"}
     ),
+    "funny_gag": life_variants_matching(
+        lambda name: name in {
+            "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint",
+            "confused_dots", "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
+        }
+    ),
 }
 
 
 def choose_life_variant(rng: random.Random) -> LifeVariant:
     roll = rng.random()
-    if roll < 0.54:
+    if roll < 0.50:
         category = LIFE_VARIANT_CATEGORIES["blink_breathe"]
-    elif roll < 0.72:
+    elif roll < 0.67:
         category = LIFE_VARIANT_CATEGORIES["gaze"]
-    elif roll < 0.82:
+    elif roll < 0.77:
         category = LIFE_VARIANT_CATEGORIES["mouth"]
+    elif roll < 0.87:
+        category = LIFE_VARIANT_CATEGORIES["funny_gag"]
     elif roll < 0.94:
         category = LIFE_VARIANT_CATEGORIES["small_head"]
     elif roll < 0.985:
@@ -3769,6 +3978,12 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
             event = optional_string(data.get("event"))
             if event not in {"touch_down", "touch_up", "recording_started", "recording_stopped"}:
                 return
+        if event in {"touch_down", "touch_up"} and (
+            b'"source":"head_touch_left"' in raw_payload or b'"source":"head_touch_right"' in raw_payload
+        ):
+            if args.verbose:
+                print(f"[bridge] fast-touch {event} ignored for side head touch", flush=True)
+            return
         if event == last_event:
             return
         last_event = event
@@ -3802,6 +4017,50 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
     try:
         while True:
             time.sleep(0.25)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
+def watch_touch_emotions(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    state = TouchEmotionState()
+    done = Event()
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        try:
+            payload = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            if args.verbose:
+                print("[bridge] touch-emotion ignored invalid json", flush=True)
+            return
+        if not isinstance(payload, dict):
+            return
+        actions, reasons = build_touch_emotion_actions(payload, state)
+        if not actions:
+            return
+        pause_life_animation(pair.pair_id, args.life_pause_s, f"side touch {','.join(reasons)}")
+        messages, errors = actions_to_topic_payloads(pair, actions, f"touch-{uuid.uuid4().hex[:10]}")
+        if errors:
+            print(f"[bridge] touch-emotion ignored invalid actions: {errors}", file=sys.stderr, flush=True)
+        publish_action_messages(client, messages, pair, wait=False)
+        if args.verbose:
+            print(f"[{time.strftime('%H:%M:%S')}] [bridge] touch emotion {reasons}: {len(messages)} action(s)", flush=True)
+        if args.once:
+            done.set()
+
+    client.on_message = on_message
+    connect_and_start(client, config.mqtt)
+    client.subscribe([(pair.events_topic, 0)])
+    print(f"[{time.strftime('%H:%M:%S')}] [bridge] touch emotions active on {pair.events_topic}", flush=True)
+    try:
+        while not done.wait(0.25):
+            pass
+        return 0
     except KeyboardInterrupt:
         return 0
     finally:
@@ -3887,16 +4146,22 @@ def watch_sensors(args: argparse.Namespace) -> int:
 
             def react_to_event() -> None:
                 nonlocal latest_status
-                fresh_status = read_latest_status(config, pair, timeout_s=0.6)
-                if isinstance(fresh_status, dict):
-                    latest_status = fresh_status
-                event_status = merge_sensor_event_status(latest_status, payload)
+                if source == "orientation":
+                    event_status = merge_sensor_event_status(latest_status, payload)
+                else:
+                    fresh_status = read_latest_status(config, pair, timeout_s=0.6)
+                    if isinstance(fresh_status, dict):
+                        latest_status = fresh_status
+                    event_status = merge_sensor_event_status(latest_status, payload)
                 actions, reasons = build_sensor_reaction_actions(event_status, state, source_hint=source)
                 publish_reactions(actions, reasons)
 
-            timer = Timer(0.12, react_to_event)
-            timer.daemon = True
-            timer.start()
+            if source == "orientation":
+                react_to_event()
+            else:
+                timer = Timer(0.12, react_to_event)
+                timer.daemon = True
+                timer.start()
             return
 
         if message.topic != pair.status_topic:
@@ -5278,6 +5543,19 @@ def run_bridge(args: argparse.Namespace) -> int:
                 off_delay_ms=args.touch_off_delay_ms,
             ),
         ))
+    if not args.no_touch_emotions:
+        workers.append((
+            "touch-emotions",
+            watch_touch_emotions,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                verbose=args.touch_emotion_verbose,
+                life_pause_s=args.touch_emotion_life_pause_s,
+                once=False,
+            ),
+        ))
     if not args.no_power:
         workers.append((
             "power-watcher",
@@ -5561,6 +5839,13 @@ def build_parser() -> argparse.ArgumentParser:
     touch_lamp.add_argument("--off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
     touch_lamp.set_defaults(func=watch_touch_lamp)
 
+    touch_emotions = subcommands.add_parser("watch-touch-emotions", help="React to left/right head touch with face and small head emotions.")
+    touch_emotions.add_argument("--pair", default="desk", help="Pair id to watch.")
+    touch_emotions.add_argument("--verbose", action="store_true", help="Log generated side-touch emotion actions.")
+    touch_emotions.add_argument("--life-pause-s", type=float, default=3.0, help="Pause idle life animation after side-touch reactions.")
+    touch_emotions.add_argument("--once", action="store_true", help="Exit after the first side-touch reaction.")
+    touch_emotions.set_defaults(func=watch_touch_emotions)
+
     sensors = subcommands.add_parser("watch-sensors", help="React to IMU movement and LTR553 proximity with filtered wake/face/head actions.")
     sensors.add_argument("--pair", default="desk", help="Pair id to watch.")
     sensors.add_argument("--verbose", action="store_true", help="Log sensor events and generated actions.")
@@ -5634,6 +5919,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--restart-delay-s", type=float, default=3.0, help="Delay before restarting a crashed worker thread.")
     run.add_argument("--no-audio", action="store_true", help="Disable the HTTP audio/STT/TTS worker.")
     run.add_argument("--no-touch-lamp", action="store_true", help="Disable the fast touch/recording LED worker.")
+    run.add_argument("--no-touch-emotions", action="store_true", help="Disable left/right head-touch emotion reactions.")
     run.add_argument("--no-power", action="store_true", help="Disable the power-state reaction worker.")
     run.add_argument("--no-sensors", action="store_true", help="Disable IMU/LTR553 sensor reactions.")
     run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
@@ -5642,6 +5928,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
     run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
     run.add_argument("--touch-off-delay-ms", type=int, default=500, help="Delay before LEDs turn off after recording stops.")
+    run.add_argument("--touch-emotion-verbose", action="store_true", help="Log generated side-touch emotion actions.")
+    run.add_argument("--touch-emotion-life-pause-s", type=float, default=3.0, help="Pause idle life animation after side-touch reactions.")
     run.add_argument("--power-debounce-s", type=float, default=1.0, help="Minimum seconds between power reactions.")
     run.add_argument("--power-announce-initial", action="store_true", help="Also show the current power state immediately.")
     run.add_argument("--power-no-restore-face", action="store_true", help="Do not run delayed face/motion reaction after battery overlay.")
