@@ -634,7 +634,7 @@ def build_touch_emotion_actions(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     event = optional_string(event_payload.get("event"))
     source = optional_string(event_payload.get("source"))
-    if event != "touch_down" or source not in SIDE_TOUCH_SOURCES:
+    if event not in {"touch_down", "touch_swipe_forward", "touch_swipe_backward"} or source not in SIDE_TOUCH_SOURCES:
         return [], []
 
     now_s = time.monotonic() if now_s is None else now_s
@@ -643,6 +643,36 @@ def build_touch_emotion_actions(
     previous_at = state.last_side_at
     state.last_side = side
     state.last_side_at = now_s
+
+    if event in {"touch_swipe_forward", "touch_swipe_backward"}:
+        return [
+            {"action": "face", "emotion": "happy_squint", "intensity_pct": 84},
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 46,
+                "points": [
+                    {
+                        "yaw_pct": -11 if side == "left" else 11,
+                        "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 2,
+                        "duration_ms": 180,
+                        "speed_pct": 42,
+                    },
+                    {
+                        "yaw_pct": 6 if side == "left" else -6,
+                        "pitch_pct": DEFAULT_IDLE_PITCH_PCT,
+                        "duration_ms": 160,
+                        "speed_pct": 38,
+                    },
+                    {
+                        "yaw_pct": DEFAULT_IDLE_YAW_PCT,
+                        "pitch_pct": DEFAULT_IDLE_PITCH_PCT,
+                        "duration_ms": 260,
+                        "speed_pct": 28,
+                    },
+                ],
+            },
+        ], [f"head_pet_swipe_{side}"]
 
     if previous_side and previous_side != side and now_s - previous_at <= SIDE_TOUCH_GIGGLE_WINDOW_S:
         return [

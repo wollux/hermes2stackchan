@@ -1061,6 +1061,22 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertTrue(any(action["action"] == "face" for action in left_actions))
         self.assertTrue(any(action.get("emotion") == "silent_giggle" for action in giggle_actions))
 
+    def test_head_pet_swipe_uses_side_emotion_without_led_or_audio(self) -> None:
+        state = TouchEmotionState()
+
+        actions, reasons = build_touch_emotion_actions(
+            {"event": "touch_swipe_forward", "source": "head_touch_right"},
+            state,
+            now_s=20.0,
+        )
+
+        self.assertEqual(reasons, ["head_pet_swipe_right"])
+        forbidden = {"audio", "local_tts", "tts", "speak", "sound", "led"}
+        for action in actions:
+            self.assertNotIn(action["action"], forbidden)
+        self.assertTrue(any(action["action"] == "face" for action in actions))
+        self.assertTrue(any(action["action"] == "motion" for action in actions))
+
     def test_life_animation_only_runs_on_idle_face(self) -> None:
         status = {
             "display_sleeping": False,

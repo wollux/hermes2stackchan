@@ -618,36 +618,57 @@ enum class HeadTouchZone {
     Ambiguous,
 };
 
-HeadTouchZone head_touch_zone_from_raw(uint8_t raw)
-{
-    int active_zone = -1;
-    int active_count = 0;
-    for (int zone = 0; zone < 3; ++zone) {
-        if (((raw >> (zone * 2)) & 0x03) != 0) {
-            active_zone = zone;
-            active_count++;
-        }
-    }
-    if (active_count == 0) {
-        return HeadTouchZone::None;
-    }
-    if (active_count > 1) {
-        return HeadTouchZone::Ambiguous;
-    }
+struct HeadTouchSample {
+    uint8_t raw = 0;
+    uint8_t intensity[3] = {0, 0, 0};
+    int position_pct = 0;
+    HeadTouchZone zone = HeadTouchZone::None;
+};
 
-    switch (active_zone) {
-    case 0:
-        return HeadTouchZone::Left;
-    case 1:
-        return HeadTouchZone::Center;
-    case 2:
-        return HeadTouchZone::Right;
-    default:
-        return HeadTouchZone::Ambiguous;
+int head_touch_position_from_intensity(const uint8_t intensity[3])
+{
+    const int total = static_cast<int>(intensity[0]) + static_cast<int>(intensity[1]) + static_cast<int>(intensity[2]);
+    if (total <= 0) {
+        return 0;
     }
+    const int weighted = static_cast<int>(intensity[0]) * -100 + static_cast<int>(intensity[2]) * 100;
+    return weighted / total;
 }
 
-const char* head_touch_source_from_zone(HeadTouchZone zone)
+HeadTouchZone head_touch_zone_from_position(int position_pct, const uint8_t intensity[3])
+{
+    int max_intensity = static_cast<int>(intensity[0]);
+    if (static_cast<int>(intensity[1]) > max_intensity) {
+        max_intensity = static_cast<int>(intensity[1]);
+    }
+    if (static_cast<int>(intensity[2]) > max_intensity) {
+        max_intensity = static_cast<int>(intensity[2]);
+    }
+    if (max_intensity <= 0) {
+        return HeadTouchZone::None;
+    }
+    if (position_pct <= -40) {
+        return HeadTouchZone::Left;
+    }
+    if (position_pct >= 40) {
+        return HeadTouchZone::Right;
+    }
+    return HeadTouchZone::Center;
+}
+
+HeadTouchSample parse_head_touch_sample(uint8_t raw)
+{
+    HeadTouchSample sample = {};
+    sample.raw = raw;
+    for (int zone = 0; zone < 3; ++zone) {
+        sample.intensity[zone] = (raw >> (zone * 2)) & 0x03;
+    }
+    sample.position_pct = head_touch_position_from_intensity(sample.intensity);
+    sample.zone = head_touch_zone_from_position(sample.position_pct, sample.intensity);
+    return sample;
+}
+
+const char* head_touch_source_from_position(HeadTouchZone zone, int position_pct)
 {
     switch (zone) {
     case HeadTouchZone::Left:
@@ -686,11 +707,14 @@ bool head_touch_zone_starts_recording(HeadTouchZone zone)
     return zone == HeadTouchZone::Center || zone == HeadTouchZone::Ambiguous;
 }
 
-bool read_head_touch_pressed(uint8_t* raw_out = nullptr, HeadTouchZone* zone_out = nullptr)
+bool read_head_touch_pressed(uint8_t* raw_out = nullptr, HeadTouchZone* zone_out = nullptr, HeadTouchSample* sample_out = nullptr)
 {
     if (!g_head_touch_ready || !g_head_touch) {
         if (zone_out) {
             *zone_out = HeadTouchZone::None;
+        }
+        if (sample_out) {
+            *sample_out = {};
         }
         return false;
     }
@@ -699,16 +723,22 @@ bool read_head_touch_pressed(uint8_t* raw_out = nullptr, HeadTouchZone* zone_out
         if (zone_out) {
             *zone_out = HeadTouchZone::None;
         }
+        if (sample_out) {
+            *sample_out = {};
+        }
         return false;
     }
     if (raw_out) {
         *raw_out = raw;
     }
-    const HeadTouchZone zone = head_touch_zone_from_raw(raw);
+    const HeadTouchSample sample = parse_head_touch_sample(raw);
     if (zone_out) {
-        *zone_out = zone;
+        *zone_out = sample.zone;
     }
-    return zone != HeadTouchZone::None;
+    if (sample_out) {
+        *sample_out = sample;
+    }
+    return sample.zone != HeadTouchZone::None;
 }
 
 bool init_display_touch()
@@ -3510,15 +3540,20 @@ void publish_interaction_event(const char* source, const char* message)
     publish_json(g_topic_events, payload);
 }
 
-void publish_touch_event(const char* event, const char* source, const char* zone, uint8_t raw, bool pressed, int x, int y)
+void publish_touch_event(const char* event, const char* source, const char* zone, uint8_t raw, int position_pct, bool pressed, int x, int y)
 {
     char payload[640] = {};
+    const int ch1 = raw & 0x03;
+    const int ch2 = (raw >> 2) & 0x03;
+    const int ch3 = (raw >> 4) & 0x03;
+    const int ch4 = (raw >> 6) & 0x03;
     std::snprintf(payload,
                   sizeof(payload),
                   "{\"schema_version\":\"1.0\",\"pair_id\":\"%s\",\"stackchan_id\":\"%s\","
                   "\"event\":\"%s\",\"source\":\"%s\",\"uptime_ms\":%lld,"
                   "\"touch\":{\"ready\":%s,\"head_ready\":%s,\"display_ready\":%s,"
-                  "\"pressed\":%s,\"zone\":\"%s\",\"raw\":%u,\"x\":%d,\"y\":%d},"
+                  "\"pressed\":%s,\"zone\":\"%s\",\"raw\":%u,\"raw_hex\":\"0x%02X\","
+                  "\"ch1\":%d,\"ch2\":%d,\"ch3\":%d,\"ch4\":%d,\"position_pct\":%d,\"x\":%d,\"y\":%d},"
                   "\"message\":\"%s\"}",
                   CONFIG_STACKCHAN_PAIR_ID,
                   CONFIG_STACKCHAN_STACKCHAN_ID,
@@ -3531,14 +3566,25 @@ void publish_touch_event(const char* event, const char* source, const char* zone
                   pressed ? "true" : "false",
                   zone && *zone ? zone : "none",
                   static_cast<unsigned>(raw),
+                  static_cast<unsigned>(raw),
+                  ch1,
+                  ch2,
+                  ch3,
+                  ch4,
+                  position_pct,
                   x,
                   y,
                   pressed ? "head touch pressed" : "head touch released");
-    ESP_LOGI(kTag, "touch event=%s source=%s zone=%s raw=0x%02x pressed=%s x=%d y=%d",
+    ESP_LOGI(kTag, "touch event=%s source=%s zone=%s raw=0x%02x ch=%d,%d,%d,%d pos=%d pressed=%s x=%d y=%d",
              event,
              source && *source ? source : "touch",
              zone && *zone ? zone : "none",
              raw,
+             ch1,
+             ch2,
+             ch3,
+             ch4,
+             position_pct,
              pressed ? "true" : "false",
              x,
              y);
@@ -5784,6 +5830,10 @@ void touch_event_task(void*)
     bool last_pressed = false;
     int stable_count = 0;
     bool stable_pressed = false;
+    bool active_head_touch = false;
+    bool swipe_reported = false;
+    bool active_touch_started_recording = false;
+    int active_start_position_pct = 0;
     uint8_t last_debug_raw = 0;
     int last_debug_x = -1;
     int last_debug_y = -1;
@@ -5796,11 +5846,13 @@ void touch_event_task(void*)
         int x = -1;
         int y = -1;
         HeadTouchZone head_zone = HeadTouchZone::None;
-        const bool head_pressed = read_head_touch_pressed(&head_raw, &head_zone);
+        HeadTouchSample head_sample = {};
+        const bool head_pressed = read_head_touch_pressed(&head_raw, &head_zone, &head_sample);
         const bool display_pressed = read_display_touch_pressed(&x, &y, &display_points);
         const bool pressed = head_pressed || display_pressed;
         const uint8_t raw = head_pressed ? head_raw : display_points;
-        const char* source = head_pressed ? head_touch_source_from_zone(head_zone) : (display_pressed ? "display_touch" : active_source);
+        const int touch_position_pct = head_pressed ? head_sample.position_pct : 0;
+        const char* source = head_pressed ? head_touch_source_from_position(head_zone, touch_position_pct) : (display_pressed ? "display_touch" : active_source);
         const char* zone = head_pressed ? head_touch_zone_name(head_zone) : (display_pressed ? "display" : active_zone);
         const bool touch_starts_recording = head_pressed ? head_touch_zone_starts_recording(head_zone) : display_pressed;
         g_touch_raw = raw;
@@ -5808,10 +5860,14 @@ void touch_event_task(void*)
         g_touch_y = display_pressed ? y : -1;
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (raw != last_debug_raw || x != last_debug_x || y != last_debug_y || now_ms - last_debug_ms >= 1000) {
-            ESP_LOGI(kTag, "touch sample source=%s zone=%s head_raw=0x%02x display_points=%u x=%d y=%d pressed=%s stable=%s head_ready=%s display_ready=%s",
+            ESP_LOGI(kTag, "touch sample source=%s zone=%s head_raw=0x%02x ch=%d,%d,%d pos=%d display_points=%u x=%d y=%d pressed=%s stable=%s head_ready=%s display_ready=%s",
                      source,
                      zone,
                      head_raw,
+                     head_sample.intensity[0],
+                     head_sample.intensity[1],
+                     head_sample.intensity[2],
+                     touch_position_pct,
                      static_cast<unsigned>(display_points),
                      x,
                      y,
@@ -5840,11 +5896,16 @@ void touch_event_task(void*)
             g_touch_pressed = pressed;
             if (pressed) {
                 wake_display_if_needed();
+                active_head_touch = head_pressed;
+                swipe_reported = false;
+                active_touch_started_recording = touch_starts_recording;
+                active_start_position_pct = touch_position_pct;
             }
             publish_touch_event(pressed ? "touch_down" : "touch_up",
                                 pressed ? source : active_source,
                                 pressed ? zone : active_zone,
                                 raw,
+                                pressed ? touch_position_pct : active_start_position_pct,
                                 pressed,
                                 display_pressed ? x : -1,
                                 display_pressed ? y : -1);
@@ -5868,10 +5929,29 @@ void touch_event_task(void*)
                 }
             }
             if (!pressed) {
+                active_head_touch = false;
+                swipe_reported = false;
+                active_touch_started_recording = false;
                 copy_cstr(active_source, sizeof(active_source), "none");
                 copy_cstr(active_zone, sizeof(active_zone), "none");
             }
             publish_status();
+        }
+        if (stable_pressed && active_head_touch && head_pressed && !active_touch_started_recording && !swipe_reported) {
+            const int delta = touch_position_pct - active_start_position_pct;
+            if (delta >= 40 || delta <= -40) {
+                const char* swipe_event = delta >= 40 ? "touch_swipe_forward" : "touch_swipe_backward";
+                const char* swipe_source = delta >= 40 ? "head_touch_right" : "head_touch_left";
+                publish_touch_event(swipe_event,
+                                    swipe_source,
+                                    zone,
+                                    raw,
+                                    touch_position_pct,
+                                    true,
+                                    -1,
+                                    -1);
+                swipe_reported = true;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(25));
     }
