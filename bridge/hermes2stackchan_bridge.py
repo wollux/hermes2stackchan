@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Thread, Timer
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 
 SCHEMA_VERSION = "1.0"
@@ -48,6 +49,7 @@ EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
+LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 SENSOR_PROXIMITY_ON_DELTA = 55
 SENSOR_PROXIMITY_OFF_DELTA = 28
 SENSOR_PROXIMITY_ON_RAW = 120
@@ -1556,7 +1558,6 @@ def spoken_command_is_combined(command: str) -> bool:
             " danach ",
             " nachdem ",
             " ausserdem ",
-            " plus ",
             " wenn ",
             " sobald ",
         )
@@ -1565,7 +1566,28 @@ def spoken_command_is_combined(command: str) -> bool:
 
 SPOKEN_NUMBER_WORDS = {
     "null": 0,
+    "eins": 1,
+    "ein": 1,
+    "eine": 1,
+    "einen": 1,
+    "zwei": 2,
+    "drei": 3,
+    "vier": 4,
+    "fuenf": 5,
+    "sechs": 6,
+    "sieben": 7,
+    "acht": 8,
+    "neun": 9,
     "zehn": 10,
+    "elf": 11,
+    "zwoelf": 12,
+    "dreizehn": 13,
+    "vierzehn": 14,
+    "fuenfzehn": 15,
+    "sechzehn": 16,
+    "siebzehn": 17,
+    "achtzehn": 18,
+    "neunzehn": 19,
     "zwanzig": 20,
     "dreissig": 30,
     "vierzig": 40,
@@ -1576,6 +1598,259 @@ SPOKEN_NUMBER_WORDS = {
     "neunzig": 90,
     "hundert": 100,
 }
+
+GERMAN_WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+GERMAN_WEEKDAY_NORMALIZED = tuple(normalize_spoken_command_text(day) for day in GERMAN_WEEKDAYS)
+GERMAN_MONTHS = (
+    "Januar",
+    "Februar",
+    "Maerz",
+    "April",
+    "Mai",
+    "Juni",
+    "Juli",
+    "August",
+    "September",
+    "Oktober",
+    "November",
+    "Dezember",
+)
+
+
+def local_datetime(now: dt.datetime | None = None) -> dt.datetime:
+    if now is None:
+        return dt.datetime.now(LOCAL_TIMEZONE)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=LOCAL_TIMEZONE)
+    return now.astimezone(LOCAL_TIMEZONE)
+
+
+def spoken_int_token(token: str) -> int | None:
+    token = normalize_spoken_command_text(token).strip()
+    if re.fullmatch(r"-?\d+", token):
+        return int(token)
+    return SPOKEN_NUMBER_WORDS.get(token)
+
+
+def parse_spoken_number_value(text: str) -> int | None:
+    text = normalize_spoken_command_text(text)
+    match = re.search(r"-?\d+", text)
+    if match:
+        return int(match.group(0))
+    for word, value in SPOKEN_NUMBER_WORDS.items():
+        if re.search(rf"\b{re.escape(word)}\b", text):
+            return value
+    return None
+
+
+def format_minutes_duration(minutes: int) -> str:
+    minutes = max(0, minutes)
+    hours, rest = divmod(minutes, 60)
+    if hours and rest:
+        return f"{hours} Stunden und {rest} Minuten"
+    if hours:
+        return f"{hours} Stunden"
+    return f"{rest} Minuten"
+
+
+def local_time_reply_from_command(command: str, now: dt.datetime | None = None) -> tuple[str, list[dict[str, Any]], str] | None:
+    current = local_datetime(now)
+    padded = f" {command} "
+    weekday = GERMAN_WEEKDAYS[current.weekday()]
+    month = GERMAN_MONTHS[current.month - 1]
+
+    for index, normalized_day in enumerate(GERMAN_WEEKDAY_NORMALIZED):
+        if f"heute {normalized_day}" in command or f"heute ein {normalized_day}" in command or f"heute {normalized_day}?" in command:
+            if current.weekday() == index:
+                return f"Ja, heute ist {GERMAN_WEEKDAYS[index]}.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+            return f"Nein, heute ist {weekday}.", [{"action": "face", "emotion": "thinking", "intensity_pct": 60}], ""
+
+    if "wochenende" in command:
+        if current.weekday() >= 5:
+            return "Ja, es ist Wochenende.", [{"action": "face", "emotion": "happy", "intensity_pct": 66}], ""
+        days_until_saturday = 5 - current.weekday()
+        target = (current + dt.timedelta(days=days_until_saturday)).replace(hour=0, minute=0, second=0, microsecond=0)
+        minutes = int((target - current).total_seconds() // 60)
+        return f"Bis zum Wochenende sind es noch {format_minutes_duration(minutes)}.", [{"action": "face", "emotion": "thinking", "intensity_pct": 60}], ""
+
+    if "mitternacht" in command:
+        target = (current + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        minutes = int((target - current).total_seconds() // 60)
+        return f"Bis Mitternacht sind es noch {format_minutes_duration(minutes)}.", [{"action": "face", "emotion": "thinking", "intensity_pct": 60}], ""
+
+    if any(token in padded for token in (" uhrzeit ", " wie spaet ", " wieviel uhr ", " welche uhrzeit ")):
+        if current.minute:
+            text = f"Es ist {current.hour} Uhr {current.minute:02d}."
+        else:
+            text = f"Es ist {current.hour} Uhr."
+        return text, [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
+    if "kalenderwoche" in command or "kw" in padded:
+        return f"Kalenderwoche {current.isocalendar().week}.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
+    if "wochentag" in command or "welcher tag" in command:
+        return f"Heute ist {weekday}.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
+    if "datum" in command or "welches datum" in command:
+        return f"Heute ist {weekday}, der {current.day}. {month} {current.year}.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
+    if "monat" in command and command.startswith(("welcher", "was", "sag", "zeige")):
+        return f"Wir haben {month}.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
+    if "jahr" in command and command.startswith(("welches", "was", "sag", "zeige")):
+        return f"Wir haben {current.year}.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
+    if "tageszeit" in command or "guten morgen" in command or "guten abend" in command:
+        if 5 <= current.hour < 11:
+            greeting = "Guten Morgen."
+        elif 11 <= current.hour < 17:
+            greeting = "Guten Tag."
+        elif 17 <= current.hour < 22:
+            greeting = "Guten Abend."
+        else:
+            greeting = "Gute Nacht."
+        return greeting, [{"action": "face", "emotion": "friendly", "intensity_pct": 66}], ""
+
+    return None
+
+
+def parse_local_duration_s(command: str) -> int | None:
+    match = re.search(
+        r"\b(?:in|auf|fuer)?\s*(\d+|ein|eine|einen|eins|zwei|drei|vier|fuenf|sechs|sieben|acht|neun|zehn|elf|zwoelf|zwanzig|dreissig|vierzig|fuenfzig|sechzig)\s*"
+        r"(sekunden?|minuten?|stunden?)\b",
+        command,
+    )
+    if not match:
+        return None
+    amount = spoken_int_token(match.group(1))
+    if amount is None:
+        return None
+    unit = match.group(2)
+    if unit.startswith("sekunde"):
+        return max(1, amount)
+    if unit.startswith("minute"):
+        return max(1, amount * 60)
+    if unit.startswith("stunde"):
+        return max(1, amount * 3600)
+    return None
+
+
+def parse_local_due_at(command: str, now: dt.datetime | None = None) -> str | None:
+    match = re.search(r"\bum\s*(\d{1,2})(?::| uhr)?\s*(\d{1,2})?\b", command)
+    if not match:
+        return None
+    current = local_datetime(now)
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target += dt.timedelta(days=1)
+    return target.isoformat()
+
+
+def local_reminder_reply_from_command(command: str, now: dt.datetime | None = None) -> tuple[str, list[dict[str, Any]], str] | None:
+    padded = f" {command} "
+    is_timer = " timer " in padded or command.startswith("timer") or "kurzzeitwecker" in command
+    is_reminder = "erinnere" in command or "erinnerung" in command or "weck mich" in command or "wecker" in command
+    if not is_timer and not is_reminder:
+        return None
+
+    delay_s = parse_local_duration_s(command)
+    due_at = parse_local_due_at(command, now)
+    if delay_s is None and due_at is None:
+        return None
+
+    if is_timer:
+        text = "Timer abgelaufen."
+        seconds = delay_s or 0
+        if seconds >= 3600:
+            hours = seconds // 3600
+            reply = f"Timer auf {hours} {'Stunde' if hours == 1 else 'Stunden'} gestellt."
+        elif seconds >= 60:
+            minutes = seconds // 60
+            reply = f"Timer auf {minutes} {'Minute' if minutes == 1 else 'Minuten'} gestellt."
+        else:
+            reply = f"Timer auf {seconds} {'Sekunde' if seconds == 1 else 'Sekunden'} gestellt."
+    else:
+        reminder_text = ""
+        match = re.search(r"\ban\s+(.+)$", command)
+        if match:
+            reminder_text = match.group(1).strip(" .")
+        elif "weck mich" in command or "wecker" in command:
+            reminder_text = "Aufwachen"
+        if not reminder_text:
+            return None
+        text = reminder_text[:120]
+        reply = "Erinnerung gestellt."
+
+    action: dict[str, Any] = {"action": "reminder", "text": text}
+    if delay_s is not None:
+        action["delay_s"] = delay_s
+    elif due_at:
+        action["due_at"] = due_at
+    return reply, [{"action": "face", "emotion": "happy", "intensity_pct": 68}, action], ""
+
+
+def local_math_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    number = r"(-?\d+|null|eins|ein|eine|einen|zwei|drei|vier|fuenf|sechs|sieben|acht|neun|zehn|elf|zwoelf|zwanzig|dreissig|vierzig|fuenfzig|sechzig|hundert)"
+    percent = re.search(rf"\b{number}\s*prozent\s+von\s+{number}\b", command)
+    if percent:
+        left = spoken_int_token(percent.group(1))
+        right = spoken_int_token(percent.group(2))
+        if left is not None and right is not None:
+            result = right * left / 100
+            text = f"Das sind {result:g}."
+            return text, [{"action": "face", "emotion": "thinking", "intensity_pct": 62}], ""
+
+    match = re.search(rf"\b{number}\s+(plus|minus|mal|geteilt(?: durch)?)\s+{number}\b", command)
+    if not match:
+        return None
+    left = spoken_int_token(match.group(1))
+    right = spoken_int_token(match.group(3))
+    op = match.group(2)
+    if left is None or right is None:
+        return None
+    if op == "plus":
+        result: float = left + right
+    elif op == "minus":
+        result = left - right
+    elif op == "mal":
+        result = left * right
+    else:
+        if right == 0:
+            return "Durch null lieber nicht.", [{"action": "face", "emotion": "skeptical", "intensity_pct": 65}], ""
+        result = left / right
+    return f"Das sind {result:g}.", [{"action": "face", "emotion": "thinking", "intensity_pct": 62}], ""
+
+
+def local_random_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    padded = f" {command} "
+    if " wuerfel " in padded or command.startswith("wuerfel") or "wuerfeln" in command:
+        return f"Ich wuerfle {random.randint(1, 6)}.", [{"action": "face", "emotion": "mischievous", "intensity_pct": 62}], ""
+    if "kopf oder zahl" in command:
+        return f"Ich nehme {random.choice(('Kopf', 'Zahl'))}.", [{"action": "face", "emotion": "mischievous", "intensity_pct": 62}], ""
+    if command.startswith(("waehle ", "such dir ", "entscheide ")) and " oder " in command:
+        tail = re.sub(r"^(waehle|such dir|entscheide)\s+", "", command).strip()
+        options = [part.strip(" .") for part in tail.split(" oder ") if part.strip(" .")]
+        if len(options) >= 2:
+            return f"Ich nehme {random.choice(options)}.", [{"action": "face", "emotion": "mischievous", "intensity_pct": 62}], ""
+    return None
+
+
+def local_identity_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    if "wer bist du" in command:
+        return "Ich bin StackChan, lokal schnell und mit Hermes im Ruecken.", [{"action": "face", "emotion": "friendly", "intensity_pct": 68}], ""
+    if "bist du wach" in command or command == "hallo" or command == "computer":
+        return "Ja, ich bin wach.", [{"action": "face", "emotion": "friendly", "intensity_pct": 68}], ""
+    if "was kannst du lokal" in command or "was kannst du alleine" in command:
+        return (
+            "Lokal kann ich Zeit, Datum, Timer, Akku, Temperatur, Lautstaerke, Helligkeit, LEDs, Display und Kopfbewegungen.",
+            [{"action": "face", "emotion": "friendly", "intensity_pct": 68}],
+            "",
+        )
+    return None
 
 
 def parse_spoken_percent(command: str) -> int | None:
@@ -1620,6 +1895,13 @@ def local_command_may_need_status(text: str) -> bool:
             " schuetteln ",
             " bewegung ",
             " seite ",
+            " wlan ",
+            " wifi ",
+            " kamera ",
+            " display ",
+            " bildschirm ",
+            " schlaeft ",
+            " schlafen ",
         )
     )
 
@@ -1637,7 +1919,21 @@ def direct_status_reply_from_transcript(
     if not isinstance(status, dict):
         if any(
             token in f" {command} "
-            for token in ("akku", "akkustand", "batterie", "temperatur", "sensor", "sensoren", "helligkeit", "lautstaerke")
+            for token in (
+                "akku",
+                "akkustand",
+                "batterie",
+                "temperatur",
+                "sensor",
+                "sensoren",
+                "helligkeit",
+                "lautstaerke",
+                "wlan",
+                "wifi",
+                "kamera",
+                "display",
+                "bildschirm",
+            )
         ):
             return "Status ist gerade nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
         return None
@@ -1676,6 +1972,29 @@ def direct_status_reply_from_transcript(
         pct = status_percent(status, "speaker.volume_pct", status_int_at(status, "volume_pct", 0))
         return f"Lautstaerke {pct} Prozent.", [], ""
 
+    if any(token in f" {command} " for token in ("wlan", "wifi")):
+        rssi = status_int_at(status, "wifi.rssi", status_int_at(status, "wifi_rssi", 0))
+        connected = status_bool(nested_status_value(status, "wifi.connected"))
+        if connected is False:
+            return "WLAN ist gerade nicht verbunden.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
+        if rssi:
+            return f"WLAN ist verbunden, RSSI {rssi} dBm.", [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+        return "WLAN Status ist nicht genau bekannt.", [{"action": "face", "emotion": "thinking", "intensity_pct": 60}], ""
+
+    if "kamera" in command or "foto" in command:
+        camera_ready = status_bool(status.get("camera_available"))
+        if camera_ready is True:
+            return "Kamera ist verfuegbar.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+        if camera_ready is False:
+            return "Kamera ist nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
+
+    if "display" in command or "bildschirm" in command:
+        sleeping = status_bool(status.get("display_sleeping"))
+        if sleeping is True:
+            return "Display schlaeft.", [{"action": "face", "emotion": "sleepy", "intensity_pct": 60}], ""
+        if sleeping is False:
+            return "Display ist wach.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
+
     if any(token in f" {command} " for token in ("naehe", "naehesensor", "proximity", "finger")):
         near = status_bool(nested_status_value(status, "sensors.ltr553.near")) is True
         delta = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
@@ -1713,6 +2032,7 @@ def direct_status_reply_from_transcript(
 def direct_local_command_from_transcript(
     text: str,
     status: Any = STATUS_NOT_PROVIDED,
+    now: dt.datetime | None = None,
 ) -> tuple[str, list[dict[str, Any]], str] | None:
     normalized = normalize_spoken_command_text(text)
     if not normalized:
@@ -1722,6 +2042,16 @@ def direct_local_command_from_transcript(
         return None
     if spoken_command_is_combined(command):
         return None
+
+    for local_reply in (
+        local_time_reply_from_command(command, now),
+        local_reminder_reply_from_command(command, now),
+        local_math_reply_from_command(command),
+        local_random_reply_from_command(command),
+        local_identity_reply_from_command(command),
+    ):
+        if local_reply:
+            return local_reply
 
     def is_command_phrase(phrase: str) -> bool:
         return command == phrase or command.startswith(f"{phrase} ")
@@ -1819,6 +2149,24 @@ def direct_local_command_from_transcript(
         return "LEDs aus.", [{"action": "led", "mode": "off"}], ""
     if any(token in f" {command} " for token in ("led an", "leds an", "lampe an", "lampen an")):
         return "LEDs an.", [{"action": "led", "mode": "solid", "r": 40, "g": 120, "b": 255}], ""
+
+    if any(token in f" {command} " for token in ("ton test", "tontest", "piep", "beep", "sound test")):
+        return "Ton.", [{"action": "sound", "pattern": "good", "frequency_hz": 880, "duration_ms": 120}], ""
+
+    if any(token in f" {command} " for token in ("mach foto", "mach ein foto", "mache foto", "mache ein foto", "foto machen", "kamera ausloesen")):
+        return "Foto.", [{"action": "system", "system_action": "take_photo"}], ""
+
+    if any(token in f" {command} " for token in ("kopf", "schau", "guck", "blicke")):
+        if any(token in f" {command} " for token in (" links ", " nach links ")):
+            return "Links.", [{"action": "move", "direction": "left"}, {"action": "face", "emotion": "glance_left", "intensity_pct": 65}], ""
+        if any(token in f" {command} " for token in (" rechts ", " nach rechts ")):
+            return "Rechts.", [{"action": "move", "direction": "right"}, {"action": "face", "emotion": "glance_right", "intensity_pct": 65}], ""
+        if any(token in f" {command} " for token in (" oben ", " hoch ", " nach oben ")):
+            return "Hoch.", [{"action": "move", "pitch_target_pct": 65}, {"action": "face", "emotion": "glance_up", "intensity_pct": 65}], ""
+        if any(token in f" {command} " for token in (" unten ", " runter ", " nach unten ")):
+            return "Runter.", [{"action": "move", "pitch_target_pct": 25}, {"action": "face", "emotion": "glance_down", "intensity_pct": 65}], ""
+        if any(token in f" {command} " for token in (" mitte ", " gerade ", " grade ", " zentrum ")):
+            return "Mitte.", [{"action": "move", "yaw_target_pct": 0, "pitch_target_pct": DEFAULT_IDLE_PITCH_PCT}, {"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
 
     status_reply = direct_status_reply_from_transcript(command, status)
     if status_reply:
@@ -5340,10 +5688,14 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     display_text, actions, post_tts_system_action = direct_command
                     hermes_response = {"reply": display_text, "actions": actions}
                     hermes_ms = 0
-                    scheduled_reminders = []
-                    reminder_errors = []
+                    actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
+                        self.server.config,
+                        self.server.pair,
+                        actions,
+                        f"speech-reminder-{request_id}",
+                    )
                     print(
-                        f"[bridge-http] local command request_id={request_id}: "
+                        f"[bridge-http] local intent=direct request_id={request_id}: hermes=0ms "
                         f"post_tts={post_tts_system_action or '-'} actions={len(actions)}",
                         flush=True,
                     )

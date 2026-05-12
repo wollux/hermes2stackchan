@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
 import importlib.util
 import random
@@ -535,6 +536,43 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("Naehe erkannt", direct_local_command_from_transcript("Ist mein Finger am Sensor?", status)[0])
         self.assertEqual(direct_local_command_from_transcript("Liegst du auf der Seite?", status)[0], "Ich liege auf der Seite.")
         self.assertIn("Bewegung erkannt", direct_local_command_from_transcript("Wirst du geschuettelt?", status)[0])
+
+    def test_direct_local_time_calendar_answers_skip_hermes(self) -> None:
+        now = dt.datetime(2026, 5, 12, 14, 30)
+
+        self.assertEqual(direct_local_command_from_transcript("Wie spaet ist es?", now=now)[0], "Es ist 14 Uhr 30.")
+        self.assertEqual(direct_local_command_from_transcript("Welcher Wochentag ist heute?", now=now)[0], "Heute ist Dienstag.")
+        self.assertEqual(
+            direct_local_command_from_transcript("Welches Datum haben wir?", now=now)[0],
+            "Heute ist Dienstag, der 12. Mai 2026.",
+        )
+        self.assertEqual(direct_local_command_from_transcript("Ist heute Dienstag?", now=now)[0], "Ja, heute ist Dienstag.")
+        self.assertIn("Kalenderwoche 20", direct_local_command_from_transcript("Welche Kalenderwoche?", now=now)[0])
+        self.assertIn("9 Stunden und 30 Minuten", direct_local_command_from_transcript("Wie lange bis Mitternacht?", now=now)[0])
+
+    def test_direct_local_reminder_timer_math_and_random_skip_hermes(self) -> None:
+        now = dt.datetime(2026, 5, 12, 14, 30)
+
+        timer = direct_local_command_from_transcript("Stell einen Timer auf 5 Minuten.", now=now)
+        self.assertEqual(timer[0], "Timer auf 5 Minuten gestellt.")
+        self.assertEqual(timer[1][1]["action"], "reminder")
+        self.assertEqual(timer[1][1]["delay_s"], 300)
+
+        reminder = direct_local_command_from_transcript("Erinnere mich in 10 Minuten an Tee.", now=now)
+        self.assertEqual(reminder[0], "Erinnerung gestellt.")
+        self.assertEqual(reminder[1][1]["text"], "tee")
+        self.assertEqual(reminder[1][1]["delay_s"], 600)
+
+        self.assertIsNone(direct_local_command_from_transcript("Erinnere mich bitte.", now=now))
+        self.assertEqual(direct_local_command_from_transcript("Was ist 3 plus 4?")[0], "Das sind 7.")
+        self.assertEqual(direct_local_command_from_transcript("Was sind 20 Prozent von 50?")[0], "Das sind 10.")
+        self.assertTrue(direct_local_command_from_transcript("Wuerfel.")[0].startswith("Ich wuerfle "))
+
+    def test_direct_local_more_device_commands_skip_hermes(self) -> None:
+        self.assertEqual(direct_local_command_from_transcript("Kopf nach links.")[1][0]["direction"], "left")
+        self.assertEqual(direct_local_command_from_transcript("Schau nach oben.")[1][0]["pitch_target_pct"], 65)
+        self.assertEqual(direct_local_command_from_transcript("Mach ein Foto.")[1][0]["system_action"], "take_photo")
+        self.assertEqual(direct_local_command_from_transcript("Piep.")[1][0]["action"], "sound")
 
     def test_direct_local_combined_tasks_go_to_hermes(self) -> None:
         self.assertIsNone(direct_local_command_from_transcript("Helligkeit 80 und sag mir das Wetter."))
