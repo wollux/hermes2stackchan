@@ -60,7 +60,7 @@ SENSOR_SIDE_UPRIGHT_MAX_MG = 560
 SENSOR_UPRIGHT_AXIS_MG = 620
 SENSOR_FACE_DOWN_AXIS_MG = 900
 SENSOR_FACE_DOWN_OTHER_MAX_MG = 650
-SENSOR_SIDE_STABLE_SAMPLES = 3
+SENSOR_SIDE_STABLE_SAMPLES = 2
 SENSOR_FACE_DOWN_STABLE_SAMPLES = 2
 SENSOR_FACE_DOWN_REPEAT_S = 2.0
 SENSOR_SHAKE_SCORE_THRESHOLD = 20
@@ -835,6 +835,7 @@ REQUIRED_STATUS_PATHS = (
     "head.pan_pct",
     "head.tilt_pct",
     "head.ready",
+    "head.motion_active",
     "face.emotion",
     "face.intensity_pct",
     "ui.mode",
@@ -2179,6 +2180,8 @@ def status_allows_life_animation(status: dict[str, Any] | None) -> bool:
         return False
     if status_bool(status.get("recording")) or status_bool(status.get("speaking")):
         return False
+    if status_bool(nested_status_value(status, "head.motion_active")):
+        return False
     ui_mode = nested_status_value(status, "ui.mode")
     if isinstance(ui_mode, str) and ui_mode != "face":
         return False
@@ -2241,7 +2244,11 @@ def status_is_recording(status: dict[str, Any]) -> bool:
 
 
 def status_is_busy(status: dict[str, Any]) -> bool:
-    return status_is_recording(status) or status_bool(status.get("speaking")) is True
+    return (
+        status_is_recording(status)
+        or status_bool(status.get("speaking")) is True
+        or status_bool(nested_status_value(status, "head.motion_active")) is True
+    )
 
 
 def sensor_status_is_sideways(status: dict[str, Any]) -> bool:
@@ -2326,6 +2333,7 @@ def build_sensor_reaction_actions(
     reasons: list[str] = []
     display_sleeping = status_bool(status.get("display_sleeping")) is True
     recording = status_is_recording(status)
+    head_motion_active = status_bool(nested_status_value(status, "head.motion_active")) is True
     source_hint = source_hint.strip().lower()
 
     def maybe_wake(reason: str) -> None:
@@ -2335,6 +2343,8 @@ def build_sensor_reaction_actions(
             state.last_wake_at = now_s
 
     if recording:
+        return actions, reasons
+    if head_motion_active:
         return actions, reasons
 
     proximity_ready = status_bool(nested_status_value(status, "sensors.ltr553.ready")) is True
@@ -3006,9 +3016,12 @@ def build_life_variants() -> list[LifeVariant]:
     }
     rare_names = {"micro_sleep", "surprise_pop", "look_behind", "desk_spin", "drama_blink", "yawn_hint", "sleepy_recover"} | funny_names
     for name in CURATED_LIFE_VARIANT_NAMES:
+        weight = 1.1 if name in funny_names else 0.8 if name in rare_names else 2.4
+        if name == "desk_spin":
+            weight = 2.4
         variants.append(LifeVariant(
             name=name,
-            weight=1.1 if name in funny_names else 0.8 if name in rare_names else 2.4,
+            weight=weight,
             rare=name in rare_names,
             min_gap_s=28.0 if name in funny_names else 45.0 if name in rare_names else 8.0,
             builder=lambda rng, intensity, mood, variant_name=name: build_named_life_sequence(variant_name, rng, intensity, mood),
@@ -3104,17 +3117,17 @@ LIFE_VARIANT_CATEGORIES: dict[str, list[LifeVariant]] = {
 
 def choose_life_variant(rng: random.Random) -> LifeVariant:
     roll = rng.random()
-    if roll < 0.50:
+    if roll < 0.62:
         category = LIFE_VARIANT_CATEGORIES["blink_breathe"]
-    elif roll < 0.67:
+    elif roll < 0.78:
         category = LIFE_VARIANT_CATEGORIES["gaze"]
-    elif roll < 0.77:
+    elif roll < 0.86:
         category = LIFE_VARIANT_CATEGORIES["mouth"]
-    elif roll < 0.87:
-        category = LIFE_VARIANT_CATEGORIES["funny_gag"]
-    elif roll < 0.94:
+    elif roll < 0.925:
         category = LIFE_VARIANT_CATEGORIES["small_head"]
     elif roll < 0.985:
+        category = LIFE_VARIANT_CATEGORIES["funny_gag"]
+    elif roll < 0.997:
         category = LIFE_VARIANT_CATEGORIES["big_head"]
     else:
         category = LIFE_VARIANT_CATEGORIES["rare_gag"]

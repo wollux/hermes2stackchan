@@ -86,9 +86,9 @@ constexpr int kImuSideAxisMg = 760;
 constexpr int kImuSideUprightMaxMg = 560;
 constexpr int kImuFaceDownAxisMg = 900;
 constexpr int kImuFaceDownOtherMaxMg = 650;
-constexpr int kServoMoveStepRaw = 12;
-constexpr int kMotionMaxSpeedPct = 24;
-constexpr int kMotionMinSegmentMs = 180;
+constexpr int kServoMoveStepRaw = 8;
+constexpr int kMotionMaxSpeedPct = 100;
+constexpr int kMotionMinSegmentMs = 160;
 constexpr int kMaxDisplayJpegBytes = 240 * 1024;
 constexpr int kMaxMqttTopic = 128;
 constexpr int kMaxMqttPayload = 4096;
@@ -3270,6 +3270,12 @@ float catmull_rom_value(float p0, float p1, float p2, float p3, float t)
                    (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
 }
 
+float smoothstep_value(float t)
+{
+    t = std::max(0.0f, std::min(1.0f, t));
+    return t * t * (3.0f - 2.0f * t);
+}
+
 int motion_segment_duration_ms(const ServoAxis& yaw, const ServoAxis& pitch,
                                int yaw_start_raw, int pitch_start_raw,
                                const MotionPoint& target)
@@ -3283,7 +3289,8 @@ int motion_segment_duration_ms(const ServoAxis& yaw, const ServoAxis& pitch,
     const int pct_distance = std::max(std::abs(target.yaw_pct - yaw_start_pct),
                                       std::abs(target.pitch_pct - pitch_start_pct));
     const int speed_pct = clamp_int(target.speed_pct, 1, kMotionMaxSpeedPct);
-    const float ms_per_pct = 5.0f + (100 - speed_pct) * 0.30f;
+    const float normalized = static_cast<float>(speed_pct) / 100.0f;
+    const float ms_per_pct = 3.0f + (1.0f - normalized) * (1.0f - normalized) * 18.0f;
     return clamp_int(
         static_cast<int>(std::lround(std::max(1, pct_distance) * ms_per_pct)),
         kMotionMinSegmentMs,
@@ -3322,7 +3329,7 @@ void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
 {
     const int steps = safe_motion_steps(yaw1, pitch1, yaw2, pitch2, duration_ms);
     for (int step = 1; step <= steps; ++step) {
-        const float t = static_cast<float>(step) / static_cast<float>(steps);
+        const float t = smoothstep_value(static_cast<float>(step) / static_cast<float>(steps));
         int yaw_next = 0;
         int pitch_next = 0;
         if (spline) {
@@ -3335,6 +3342,30 @@ void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
         write_motion_sample(yaw, pitch, yaw_pos, pitch_pos, yaw_next, pitch_next);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+}
+
+void move_axes_smooth_target(const ServoAxis& yaw, const ServoAxis& pitch,
+                             int& yaw_current, int& pitch_current,
+                             int yaw_target, int pitch_target,
+                             int speed_pct)
+{
+    yaw_target = clamp_int(yaw_target, effective_raw_min(yaw), effective_raw_max(yaw));
+    pitch_target = clamp_int(pitch_target, effective_raw_min(pitch), effective_raw_max(pitch));
+    MotionPoint target = {};
+    target.yaw_pct = raw_position_to_target_pct(yaw, yaw_target);
+    target.pitch_pct = raw_position_to_target_pct(pitch, pitch_target);
+    target.duration_ms = 0;
+    target.speed_pct = clamp_int(speed_pct, 1, kMotionMaxSpeedPct);
+    target.hold_ms = 0;
+    const int duration_ms = motion_segment_duration_ms(yaw, pitch, yaw_current, pitch_current, target);
+    move_axes_path_segment(yaw, pitch,
+                           yaw_current, pitch_current,
+                           yaw_current, pitch_current,
+                           yaw_current, pitch_current,
+                           yaw_target, pitch_target,
+                           yaw_target, pitch_target,
+                           duration_ms,
+                           false);
 }
 
 void execute_motion_command(const ServoAxis& yaw, const ServoAxis& pitch,
@@ -3502,7 +3533,7 @@ void publish_interaction_event(const char* source, const char* message)
                   "\"event\":\"interaction\",\"source\":\"%s\",\"request_id\":\"\","
                   "\"uptime_ms\":%lld,\"recording\":%s,\"speaking\":%s,\"display_sleeping\":%s,"
                   "\"message\":\"%s\","
-                  "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
+                  "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s,\"motion_active\":%s},"
                   "\"sensors\":{\"imu\":{\"ready\":%s,"
                   "\"accel_mg\":{\"x\":%d,\"y\":%d,\"z\":%d},"
                   "\"gyro_dps\":{\"x\":%d,\"y\":%d,\"z\":%d},"
@@ -3521,6 +3552,7 @@ void publish_interaction_event(const char* source, const char* message)
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
+                  g_head_motion_active ? "true" : "false",
                   g_imu_ready ? "true" : "false",
                   static_cast<int>(g_imu_accel_x_mg),
                   static_cast<int>(g_imu_accel_y_mg),
@@ -3629,7 +3661,7 @@ void publish_status()
                   "\"ltr553\":{\"ready\":%s,\"proximity_raw\":%d,\"ambient_raw\":%d,"
                   "\"proximity_baseline\":%d,\"proximity_delta\":%d,"
                   "\"near\":%s,\"light_changed\":%s}},"
-                  "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s},"
+                  "\"head\":{\"pan_pct\":%d,\"tilt_pct\":%d,\"ready\":%s,\"motion_active\":%s},"
                   "\"led\":{\"mode\":\"%s\",\"mode_id\":%d,\"r\":%d,\"g\":%d,\"b\":%d,\"ready\":%s},"
                   "\"face\":{\"emotion\":\"%s\",\"intensity_pct\":%d},"
                   "\"ui\":{\"mode\":\"%s\"},"
@@ -3704,6 +3736,7 @@ void publish_status()
                   static_cast<int>(g_servo_yaw_pct),
                   static_cast<int>(g_servo_pitch_pct),
                   g_servo_ready ? "true" : "false",
+                  g_head_motion_active ? "true" : "false",
                   led_mode_name(static_cast<int>(g_led_mode)),
                   static_cast<int>(g_led_mode),
                   static_cast<int>(g_led_r),
@@ -3826,16 +3859,20 @@ bool enqueue_motion_command(const MotionCommand& command)
     return g_motion_queue && xQueueSend(g_motion_queue, &command, pdMS_TO_TICKS(50)) == pdTRUE;
 }
 
+void publish_status();
+
 void begin_head_motion_ignore()
 {
     g_head_motion_active = true;
     g_last_head_motion_ms = esp_timer_get_time() / 1000;
+    publish_status();
 }
 
 void end_head_motion_ignore()
 {
     g_head_motion_active = false;
     g_last_head_motion_ms = esp_timer_get_time() / 1000;
+    publish_status();
 }
 
 bool sensors_paused_for_head_motion()
@@ -6180,7 +6217,7 @@ void hardware_servo_task(void*)
         const int yaw_target = has_yaw_target ? target_pct_to_raw_position(yaw, yaw_target_pct) : yaw_pos + yaw_delta;
         const int pitch_target = has_pitch_target ? target_pct_to_raw_position(pitch, pitch_target_pct) : pitch_pos + pitch_delta;
         ESP_LOGI(kTag, "servo target raw yaw=%d pitch=%d", yaw_target, pitch_target);
-        move_axes_toward(yaw, pitch, yaw_pos, pitch_pos, yaw_target, pitch_target);
+        move_axes_smooth_target(yaw, pitch, yaw_pos, pitch_pos, yaw_target, pitch_target, 32);
         end_head_motion_ignore();
         update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
         update_servo_temperatures(yaw, pitch);

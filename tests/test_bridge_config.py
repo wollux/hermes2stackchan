@@ -663,7 +663,7 @@ class BridgeConfigTests(unittest.TestCase):
             "wakeword_enabled": True,
             "recording": False,
             "speaking": False,
-            "head": {"pan_pct": 0, "tilt_pct": 0, "ready": True},
+            "head": {"pan_pct": 0, "tilt_pct": 0, "ready": True, "motion_active": False},
             "face": {"emotion": "neutral", "intensity_pct": 60},
             "ui": {"mode": "face"},
             "led": {"mode": "off", "mode_id": 0, "r": 0, "g": 0, "b": 0, "ready": True},
@@ -744,6 +744,7 @@ class BridgeConfigTests(unittest.TestCase):
         proximity_near: bool = False,
         motion_score_pct: int = 0,
         motion_active: bool = False,
+        head_motion_active: bool = False,
         accel_x: int = 0,
         accel_y: int = 820,
         accel_z: int = 540,
@@ -753,7 +754,7 @@ class BridgeConfigTests(unittest.TestCase):
             "recording": recording,
             "speaking": speaking,
             "audio": {"recording": recording},
-            "head": {"tilt_pct": tilt_pct},
+            "head": {"tilt_pct": tilt_pct, "motion_active": head_motion_active},
             "sensors": {
                 "imu": {
                     "ready": True,
@@ -901,6 +902,23 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(actions, [])
         self.assertEqual(reasons, [])
+
+    def test_sensor_reaction_ignores_head_motion_status(self) -> None:
+        state = SensorReactionState()
+        moving = self.sensor_status(
+            head_motion_active=True,
+            proximity_delta=200,
+            proximity_raw=600,
+            proximity_near=True,
+            motion_score_pct=90,
+            motion_active=True,
+            accel_x=900,
+        )
+
+        for source_hint in ("", "imu", "orientation", "proximity"):
+            actions, reasons = build_sensor_reaction_actions(moving, state, now_s=50.0, source_hint=source_hint)
+            self.assertEqual(actions, [])
+            self.assertEqual(reasons, [])
 
     def test_audio_action_to_topic_payload_start_recording(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
@@ -1082,11 +1100,15 @@ class BridgeConfigTests(unittest.TestCase):
             "display_sleeping": False,
             "recording": False,
             "speaking": False,
+            "head": {"motion_active": False},
             "ui": {"mode": "face"},
             "face": {"emotion": "neutral", "intensity_pct": 60},
         }
 
         self.assertTrue(status_allows_life_animation(status))
+        status["head"]["motion_active"] = True
+        self.assertFalse(status_allows_life_animation(status))
+        status["head"]["motion_active"] = False
         status["ui"]["mode"] = "display"
         self.assertFalse(status_allows_life_animation(status))
 
@@ -1298,7 +1320,7 @@ class BridgeConfigTests(unittest.TestCase):
 
         motions = [
             (delay, action)
-            for seed in range(300)
+            for seed in range(1000)
             for delay, action in build_life_sequence(status, random.Random(seed))
             if action["action"] == "motion"
         ]
@@ -1319,7 +1341,7 @@ class BridgeConfigTests(unittest.TestCase):
         ]
         big_faces = [
             (delay, action)
-            for seed in range(300)
+            for seed in range(1000)
             for delay, action in build_life_sequence(status, random.Random(seed))
             if action["action"] == "face" and action["emotion"] in {"glance_left", "glance_right", "glance_up", "glance_down"}
         ]
