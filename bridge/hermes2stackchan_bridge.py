@@ -52,6 +52,8 @@ DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
 DEFAULT_LIFE_MIN_INTERVAL_S = 0.35
 DEFAULT_LIFE_MAX_INTERVAL_S = 1.35
 MAX_LIFE_FACE_GAP_MS = 1200
+DEFAULT_LIFE_SMALL_MOTION_GAP_S = 20.0
+DEFAULT_LIFE_BIG_MOTION_GAP_S = 120.0
 LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 STACKCHAN_PRESENCE_TIMEOUT_S = 15.0
 SENSOR_PROXIMITY_ON_DELTA = 55
@@ -3049,6 +3051,50 @@ def life_action_settle_delay_s(action: dict[str, Any]) -> float:
     return (duration_ms + 350) / 1000.0
 
 
+def life_motion_size(action: dict[str, Any]) -> str:
+    if action_name(action) != "motion":
+        return "none"
+    points = action.get("points")
+    if not isinstance(points, list):
+        return "small"
+    variant = optional_string(action.get("variant"))
+    max_yaw = 0
+    max_pitch_delta = 0
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        yaw = parse_int_value(point.get("yaw_pct"), DEFAULT_IDLE_YAW_PCT, "motion.yaw_pct")
+        pitch = parse_int_value(point.get("pitch_pct"), DEFAULT_IDLE_PITCH_PCT, "motion.pitch_pct")
+        max_yaw = max(max_yaw, abs(yaw - DEFAULT_IDLE_YAW_PCT))
+        max_pitch_delta = max(max_pitch_delta, abs(pitch - DEFAULT_IDLE_PITCH_PCT))
+    if variant in {"desk_spin", "look_behind"} or max_yaw >= 35 or max_pitch_delta >= 14:
+        return "big"
+    return "small"
+
+
+class LifeMotionLimiter:
+    def __init__(self, small_gap_s: float, big_gap_s: float) -> None:
+        self.small_gap_s = max(0.0, float(small_gap_s))
+        self.big_gap_s = max(0.0, float(big_gap_s))
+        self.last_small_s = 0.0
+        self.last_big_s = 0.0
+
+    def allow(self, action: dict[str, Any], now_s: float | None = None) -> bool:
+        size = life_motion_size(action)
+        if size == "none":
+            return True
+        now = time.monotonic() if now_s is None else now_s
+        if size == "big":
+            if self.last_big_s and now - self.last_big_s < self.big_gap_s:
+                return False
+            self.last_big_s = now
+            return True
+        if self.last_small_s and now - self.last_small_s < self.small_gap_s:
+            return False
+        self.last_small_s = now
+        return True
+
+
 def gaze_for_direction(direction: str) -> str:
     return {
         "left": "glance_left",
@@ -3917,6 +3963,7 @@ def animate_life(args: argparse.Namespace) -> int:
     rng = random.Random(args.seed)
     client = create_mqtt_client(config.mqtt)
     emitted = 0
+    motion_limiter = LifeMotionLimiter(args.small_motion_gap_s, args.big_motion_gap_s)
 
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
         if message.topic != pair.status_topic:
@@ -3959,6 +4006,12 @@ def animate_life(args: argparse.Namespace) -> int:
                         if not status_allows_life_animation(status):
                             print("[bridge] life motion skipped: StackChan is no longer idle on face", flush=True)
                             break
+                        if not motion_limiter.allow(action):
+                            print(
+                                f"[bridge] life motion skipped: {life_motion_size(action)} motion rate limit",
+                                flush=True,
+                            )
+                            continue
                     publish_action_messages(
                         client,
                         [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
@@ -6233,6 +6286,8 @@ def run_bridge(args: argparse.Namespace) -> int:
                 seed=args.life_seed,
                 once=False,
                 no_motion=args.life_no_motion,
+                small_motion_gap_s=args.life_small_motion_gap_s,
+                big_motion_gap_s=args.life_big_motion_gap_s,
             ),
         ))
 
@@ -6516,6 +6571,8 @@ def build_parser() -> argparse.ArgumentParser:
     life.add_argument("--seed", type=int, default=None, help="Optional random seed for repeatable tests.")
     life.add_argument("--once", action="store_true", help="Emit one life sequence and exit.")
     life.add_argument("--no-motion", action="store_true", help="Only animate the face, without servo head motion.")
+    life.add_argument("--small-motion-gap-s", type=float, default=DEFAULT_LIFE_SMALL_MOTION_GAP_S, help="Minimum seconds between small idle head motions.")
+    life.add_argument("--big-motion-gap-s", type=float, default=DEFAULT_LIFE_BIG_MOTION_GAP_S, help="Minimum seconds between large idle head motions.")
     life.set_defaults(func=animate_life)
 
     run = subcommands.add_parser("run", help="Run the full bridge as one multithreaded process.")
@@ -6553,6 +6610,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
     run.add_argument("--life-seed", type=int, default=None, help="Optional random seed for repeatable tests.")
     run.add_argument("--life-no-motion", action="store_true", help="Only animate the face, without servo head motion.")
+    run.add_argument("--life-small-motion-gap-s", type=float, default=DEFAULT_LIFE_SMALL_MOTION_GAP_S, help="Minimum seconds between small idle head motions.")
+    run.add_argument("--life-big-motion-gap-s", type=float, default=DEFAULT_LIFE_BIG_MOTION_GAP_S, help="Minimum seconds between large idle head motions.")
     run.set_defaults(func=run_bridge)
     return parser
 

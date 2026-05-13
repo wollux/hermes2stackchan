@@ -37,6 +37,7 @@ from bridge.hermes2stackchan_bridge import (
     due_reminders,
     DEFAULT_IDLE_PITCH_PCT,
     DEFAULT_IDLE_YAW_PCT,
+    LifeMotionLimiter,
     external_reply_actions,
     face_snapshot,
     add_reminder,
@@ -45,6 +46,7 @@ from bridge.hermes2stackchan_bridge import (
     local_command_may_need_status,
     missing_status_paths,
     motion_action_duration_ms,
+    life_motion_size,
     mqtt_settle_delay_after_publish_s,
     notify_actions_from_payload,
     notify_text_from_payload,
@@ -1455,6 +1457,34 @@ class BridgeConfigTests(unittest.TestCase):
             last = motion["points"][-1]
             self.assertEqual(last["yaw_pct"], DEFAULT_IDLE_YAW_PCT)
             self.assertEqual(last["pitch_pct"], DEFAULT_IDLE_PITCH_PCT)
+
+    def test_life_motion_limiter_rates_small_and_big_motion(self) -> None:
+        small = {
+            "action": "motion",
+            "variant": "gen_head_left_0",
+            "points": [
+                {"yaw_pct": -5, "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 2, "duration_ms": 1200},
+                {"yaw_pct": DEFAULT_IDLE_YAW_PCT, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 1200},
+            ],
+        }
+        big = {
+            "action": "motion",
+            "variant": "desk_spin",
+            "points": [
+                {"yaw_pct": 65, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 500},
+                {"yaw_pct": DEFAULT_IDLE_YAW_PCT, "pitch_pct": DEFAULT_IDLE_PITCH_PCT, "duration_ms": 500},
+            ],
+        }
+        limiter = LifeMotionLimiter(small_gap_s=20.0, big_gap_s=120.0)
+
+        self.assertEqual(life_motion_size(small), "small")
+        self.assertEqual(life_motion_size(big), "big")
+        self.assertTrue(limiter.allow(small, now_s=100.0))
+        self.assertFalse(limiter.allow(small, now_s=119.0))
+        self.assertTrue(limiter.allow(small, now_s=120.0))
+        self.assertTrue(limiter.allow(big, now_s=130.0))
+        self.assertFalse(limiter.allow(big, now_s=249.0))
+        self.assertTrue(limiter.allow(big, now_s=250.0))
 
     def test_life_sequence_pairs_vertical_faces_with_vertical_motion(self) -> None:
         status = {
