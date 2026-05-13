@@ -192,7 +192,6 @@ bool g_face_pose_initialized = false;
 volatile int g_motion_gaze_dx = 0;
 volatile int g_motion_gaze_dy = 0;
 volatile bool g_motion_gaze_active = false;
-volatile uint32_t g_motion_gaze_revision = 0;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -4170,9 +4169,16 @@ int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
     return std::max(min_safe_steps, requested_steps);
 }
 
-void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
+bool can_draw_motion_gaze()
 {
-    constexpr int kDeadbandPct = 1;
+    return !g_display_sleeping &&
+           std::strcmp(g_ui_mode, "display") != 0 &&
+           std::strcmp(g_ui_mode, "image") != 0;
+}
+
+void set_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct, bool draw_now)
+{
+    constexpr int kDeadbandPct = 4;
     int dx = 0;
     int dy = 0;
     if (std::abs(yaw_delta_pct) > kDeadbandPct) {
@@ -4194,7 +4200,21 @@ void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
     g_motion_gaze_dx = dx;
     g_motion_gaze_dy = dy;
     g_motion_gaze_active = true;
-    g_motion_gaze_revision = g_motion_gaze_revision + 1;
+
+    if (draw_now && can_draw_motion_gaze()) {
+        render_current_face_pose_no_transition();
+    }
+}
+
+void set_motion_gaze_from_raw_delta(const ServoAxis& yaw, const ServoAxis& pitch,
+                                    int yaw_start_raw, int pitch_start_raw,
+                                    int yaw_target_raw, int pitch_target_raw,
+                                    bool draw_now)
+{
+    set_motion_gaze_from_pct_delta(
+        raw_position_to_target_pct(yaw, yaw_target_raw) - raw_position_to_target_pct(yaw, yaw_start_raw),
+        raw_position_to_target_pct(pitch, pitch_target_raw) - raw_position_to_target_pct(pitch, pitch_start_raw),
+        draw_now);
 }
 
 void clear_motion_gaze()
@@ -4205,30 +4225,8 @@ void clear_motion_gaze()
     g_motion_gaze_dx = 0;
     g_motion_gaze_dy = 0;
     g_motion_gaze_active = false;
-    g_motion_gaze_revision = g_motion_gaze_revision + 1;
-}
-
-void motion_gaze_task(void*)
-{
-    bool drew_active_gaze = false;
-    uint32_t last_revision = g_motion_gaze_revision;
-    while (true) {
-        const bool can_draw = !g_display_sleeping &&
-                              std::strcmp(g_ui_mode, "display") != 0 &&
-                              std::strcmp(g_ui_mode, "image") != 0;
-        if (g_motion_gaze_active && can_draw) {
-            const uint32_t revision = g_motion_gaze_revision;
-            if (revision != last_revision || !drew_active_gaze) {
-                last_revision = revision;
-                render_current_face_pose_no_transition();
-                drew_active_gaze = true;
-            }
-        } else if (drew_active_gaze && can_draw) {
-            last_revision = g_motion_gaze_revision;
-            render_current_face_pose_no_transition();
-            drew_active_gaze = false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
+    if (can_draw_motion_gaze()) {
+        render_current_face_pose_no_transition();
     }
 }
 
@@ -4236,14 +4234,10 @@ void write_motion_sample(const ServoAxis& yaw, const ServoAxis& pitch,
                          int& yaw_pos, int& pitch_pos,
                          int yaw_raw, int pitch_raw)
 {
-    const int previous_yaw_pct = raw_position_to_target_pct(yaw, yaw_pos);
-    const int previous_pitch_pct = raw_position_to_target_pct(pitch, pitch_pos);
     yaw_pos = clamp_int(yaw_raw, effective_raw_min(yaw), effective_raw_max(yaw));
     pitch_pos = clamp_int(pitch_raw, effective_raw_min(pitch), effective_raw_max(pitch));
     write_safe_servo_positions(yaw, pitch, yaw_pos, pitch_pos);
     update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
-    update_motion_gaze_from_pct_delta(static_cast<int>(g_servo_yaw_pct) - previous_yaw_pct,
-                                      static_cast<int>(g_servo_pitch_pct) - previous_pitch_pct);
 }
 
 void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
@@ -4256,8 +4250,6 @@ void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
                             bool spline)
 {
     const int steps = safe_motion_steps(yaw1, pitch1, yaw2, pitch2, duration_ms);
-    update_motion_gaze_from_pct_delta(raw_position_to_target_pct(yaw, yaw2) - raw_position_to_target_pct(yaw, yaw1),
-                                      raw_position_to_target_pct(pitch, pitch2) - raw_position_to_target_pct(pitch, pitch1));
     for (int step = 1; step <= steps; ++step) {
         const float t = smoothstep_value(static_cast<float>(step) / static_cast<float>(steps));
         int yaw_next = 0;
@@ -4287,6 +4279,7 @@ void move_axes_smooth_target(const ServoAxis& yaw, const ServoAxis& pitch,
     target.duration_ms = 0;
     target.speed_pct = clamp_int(speed_pct, 1, kMotionMaxSpeedPct);
     target.hold_ms = 0;
+    set_motion_gaze_from_raw_delta(yaw, pitch, yaw_current, pitch_current, yaw_target, pitch_target, true);
     const int duration_ms = motion_segment_duration_ms(yaw, pitch, yaw_current, pitch_current, target);
     move_axes_path_segment(yaw, pitch,
                            yaw_current, pitch_current,
@@ -4311,6 +4304,15 @@ void execute_motion_command(const ServoAxis& yaw, const ServoAxis& pitch,
     for (int i = 0; i < command.point_count; ++i) {
         yaw_raw[i] = target_pct_to_raw_position(yaw, command.points[i].yaw_pct);
         pitch_raw[i] = target_pct_to_raw_position(pitch, command.points[i].pitch_pct);
+    }
+
+    for (int i = 0; i < command.point_count; ++i) {
+        const int yaw_delta_pct = command.points[i].yaw_pct - raw_position_to_target_pct(yaw, yaw_pos);
+        const int pitch_delta_pct = command.points[i].pitch_pct - raw_position_to_target_pct(pitch, pitch_pos);
+        if (std::abs(yaw_delta_pct) > 4 || std::abs(pitch_delta_pct) > 4) {
+            set_motion_gaze_from_raw_delta(yaw, pitch, yaw_pos, pitch_pos, yaw_raw[i], pitch_raw[i], true);
+            break;
+        }
     }
 
     const bool spline = command.curve == 1;
@@ -7381,7 +7383,6 @@ extern "C" void app_main()
         xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
-    xTaskCreate(motion_gaze_task, "motion_gaze", 4096, nullptr, 2, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
