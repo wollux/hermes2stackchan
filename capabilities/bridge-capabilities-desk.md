@@ -52,6 +52,13 @@ Local shortcuts include absolute and simple relative hardware/status requests:
 - `Lautstaerke 55 Prozent`, `mach lauter`, `mach leiser`
 - `Display aus`, `Bildschirm an`, `geh schlafen`, `wach auf`
 - `Akku`, `Temperatur`, `Sensoren`, `Naehe`, `Seite`, `Bewegung`
+- `Nicht stoeren`, `Privatmodus`, `Debugmodus`, `Demomodus`, `Normalmodus`
+- `sag nochmal`, `sei still`
+- `Tanze fuer mich`, `nicke langsam`, `Kopf schuetteln`,
+  `neugierig schauen`, `verwirrt schwenken`, `stolz schauen`,
+  `muede absinken`, `streck dich`, `Schlafpose`
+- `Erfolgston`, `Fehlerton`, `Frageton`, `Kameraton`, `Alarmton`,
+  `Nachrichtenton`, `Tontest`
 
 Combined tasks, questions needing reasoning, and anything with multiple intents
 still goes to Hermes.
@@ -331,6 +338,10 @@ Supported profiles: `slow_nod`, `fast_shake`, `curious_look`,
 `confused_sway`, `proud_look_up`, `tired_sink`, `rescue_dance`,
 `wake_stretch`, `sleep_pose`.
 
+Many one-step spoken motion requests are already local bridge shortcuts. Hermes
+does not need to handle simple commands like "dance", "nod", "shake your head",
+or "look proud" unless the request also needs reasoning or conversation.
+
 Do not send `move` and `motion`/`motion_profile` in the same answer. The bridge
 will prefer the richer motion path and drop the simple move.
 
@@ -369,6 +380,9 @@ Publishes to `hermes-stackchan/desk/cmd/sound`.
 Safe local speaker tone patterns: `success`, `error`, `question`, `camera`,
 `alarm`, `notify`. These are short and should not reset the device.
 
+Simple spoken tone requests are local bridge shortcuts. Hermes should only send
+sound actions when the tone is part of a richer answer or event choreography.
+
 ### audio
 
 Publishes to `hermes-stackchan/desk/cmd/audio`.
@@ -380,6 +394,10 @@ Supported actions: `set_wakeword`, `simulate_wakeword`, `start_recording`,
 
 Bridge-only audio actions: `replay_last` replays the most recent TTS answer;
 `stop` maps to firmware `stop_playback`.
+
+For "sei still", "stopp", or a display tap while speaking, use audio stop only.
+Do not add a new spoken confirmation, otherwise the device stops one playback and
+immediately starts another.
 
 Enable wakeword listening:
 

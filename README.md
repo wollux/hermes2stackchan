@@ -39,7 +39,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Local voice activity detection: stop after speech plus short silence.
 - HTTP WAV upload from StackChan to the bridge.
 - Groq Whisper STT through the bridge.
-- Local spoken shortcuts before Hermes for simple one-step hardware/status commands like volume, brightness, display on/off, battery, temperature, and sensor questions.
+- Local spoken shortcuts before Hermes for simple one-step hardware/status/mode commands like volume, brightness, display on/off, battery, temperature, sensor questions, privacy/focus/debug/demo modes, safe tones, replay/stop, and named motion profiles.
 - Hermes chat call with current StackChan status, capabilities, and personality.
 - V1.0 companion context package for Hermes: pair profile, wakeword, voice, persistent mood (`calm`, `curious`, `playful`, `tired`, `focused`, `concerned`, `annoyed`, `help`), privacy mode, proactivity, status summary, local capabilities, and recent interaction history.
 - Persistent per-pair companion state: mood, mood intensity, privacy mode, and proactivity survive bridge restarts.
@@ -455,6 +455,13 @@ scripts/h2s_bridge.sh send-device --pair desk --display-wake --wait-ack
 scripts/h2s_bridge.sh send-system --pair desk --action shutdown --wait-ack
 scripts/h2s_bridge.sh send-sound --pair desk --frequency-hz 880 --duration-ms 140 --wait-ack
 ```
+
+Useful local spoken commands that do not need Hermes:
+
+- `Nicht stoeren`, `Nicht stoeren aus`, `Privatmodus`, `Debugmodus`, `Demomodus`
+- `Tanze fuer mich`, `nicke langsam`, `Kopf schuetteln`, `neugierig schauen`
+- `Erfolgston`, `Fehlerton`, `Frageton`, `Kameraton`, `Alarmton`, `Nachrichtenton`
+- `sag nochmal`, `sei still`
 
 `display_sleep` only turns the display/backlight off and keeps StackChan alive.
 `display_wake` wakes the display. `shutdown` is a real power-off request through
