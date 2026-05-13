@@ -1615,6 +1615,18 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["volume_pct"], 65)
         self.assertEqual(payload["request_id"], "sound-001")
 
+    def test_local_safe_sound_commands_are_handled_without_hermes(self) -> None:
+        question = direct_local_command_from_transcript("Spiele den Frageton.")
+        self.assertIsNotNone(question)
+        assert question is not None
+        self.assertEqual(question[0], "Frageton.")
+        self.assertEqual(question[1], [{"action": "sound", "pattern": "question"}])
+
+        alarm = direct_local_command_from_transcript("Alarmton.")
+        self.assertIsNotNone(alarm)
+        assert alarm is not None
+        self.assertEqual(alarm[1], [{"action": "sound", "pattern": "alarm"}])
+
     def test_reminder_builds_from_delay_and_fires_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = load_config(

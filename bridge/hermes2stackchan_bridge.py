@@ -3913,8 +3913,18 @@ def direct_local_command_from_transcript(
     if any(token in f" {command} " for token in ("led an", "leds an", "lampe an", "lampen an")):
         return "LEDs an.", [{"action": "led", "mode": "solid", "r": 40, "g": 120, "b": 255}], ""
 
-    if any(token in f" {command} " for token in ("ton test", "tontest", "piep", "beep", "sound test")):
-        return "Ton.", [{"action": "sound", "pattern": "good", "frequency_hz": 880, "duration_ms": 120}], ""
+    sound_patterns: tuple[tuple[tuple[str, ...], str, str], ...] = (
+        ((" erfolgston ", " erfolg ton ", " guter ton ", " gut ton "), "Erfolgston.", "success"),
+        ((" fehlerton ", " fehler ton ", " fail ton "), "Fehlerton.", "error"),
+        ((" frageton ", " frage ton ", " rueckfrage ton ", " fragezeichen ton "), "Frageton.", "question"),
+        ((" kameraton ", " kamera ton ", " fototon ", " foto ton "), "Kameraton.", "camera"),
+        ((" alarmton ", " alarm ton ", " hilfeton ", " hilfe ton "), "Alarmton.", "alarm"),
+        ((" nachrichtenton ", " notify ton ", " benachrichtigungston "), "Nachrichtenton.", "notify"),
+        ((" ton test ", " tontest ", " piep ", " beep ", " sound test "), "Ton.", "success"),
+    )
+    for phrases, reply, pattern in sound_patterns:
+        if any(phrase in f" {command} " for phrase in phrases):
+            return reply, [{"action": "sound", "pattern": pattern}], ""
 
     if any(token in f" {command} " for token in ("mach foto", "mach ein foto", "mache foto", "mache ein foto", "foto machen", "kamera ausloesen")):
         return "Foto.", [{"action": "system", "system_action": "take_photo"}], ""
