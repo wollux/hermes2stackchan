@@ -615,6 +615,10 @@ Combined debug cockpit:
 
 ```bash
 scripts/debug_cockpit.sh /dev/cu.usbmodem21301
+H2S_BRIDGE_URL=http://192.168.99.58:8788 scripts/debug_cockpit.sh \
+  --remote-host 192.168.99.58 \
+  --remote-user wollux \
+  --serial-port /dev/cu.usbmodem21301
 ```
 
 Common symptoms:

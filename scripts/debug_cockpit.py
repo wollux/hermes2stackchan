@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import queue
 import signal
@@ -18,6 +19,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Iterable
 
@@ -125,13 +128,66 @@ def existing_logs(paths: Iterable[Path]) -> list[Path]:
     return result
 
 
+def summarize_health(payload: dict[str, object]) -> str:
+    stackchan = payload.get("stackchan") if isinstance(payload.get("stackchan"), dict) else {}
+    watchdog = payload.get("watchdog") if isinstance(payload.get("watchdog"), dict) else {}
+    health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+    replay = payload.get("replay_buffer") if isinstance(payload.get("replay_buffer"), dict) else {}
+    hermes = health.get("hermes") if isinstance(health.get("hermes"), dict) else {}
+    stt = health.get("stt") if isinstance(health.get("stt"), dict) else {}
+    tts = health.get("tts") if isinstance(health.get("tts"), dict) else {}
+
+    online = bool(stackchan.get("online"))
+    age = stackchan.get("last_seen_age_s")
+    age_text = "never" if age is None else f"{float(age):.1f}s"
+    stale = bool(watchdog.get("stale"))
+    last_skip = watchdog.get("last_skip_reason") or "-"
+    last_replay = replay.get("last_debug_request_id") or "-"
+    replay_error = replay.get("last_debug_error") or "-"
+    return (
+        f"stackchan={'online' if online else 'offline'} age={age_text} stale={stale} "
+        f"skip={last_skip} hermes={bool(hermes.get('ok'))} "
+        f"stt={bool(stt.get('configured'))} tts={bool(tts.get('configured'))} "
+        f"replay={last_replay} replay_error={replay_error}"
+    )
+
+
+def poll_health(
+    bridge_url: str,
+    interval_s: float,
+    source: str,
+    out: "queue.Queue[tuple[str, str]]",
+    stop: threading.Event,
+) -> None:
+    url = bridge_url.rstrip("/") + "/healthz?status=1"
+    emit(out, source, f"polling {url} every {interval_s:.1f}s")
+    while not stop.is_set():
+        try:
+            with urllib.request.urlopen(url, timeout=3.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                emit(out, source, summarize_health(payload))
+            else:
+                emit(out, source, "invalid health payload")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            emit(out, source, f"health failed: {exc}")
+        stop.wait(max(1.0, interval_s))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stream bridge logs, MQTT, and serial monitor together.")
     parser.add_argument("--pair", default=os.environ.get("H2S_PAIR_ID", "desk"), help="Pair id to watch.")
+    parser.add_argument("--bridge-url", default=os.environ.get("H2S_BRIDGE_URL", "http://127.0.0.1:8788"), help="Bridge HTTP base URL for health polling.")
     parser.add_argument("--serial-port", default=find_serial_port(), help="ESP serial port, e.g. /dev/cu.usbmodem21301.")
     parser.add_argument("--idf-export", default=str(DEFAULT_IDF_EXPORT), help="Path to ESP-IDF export.sh.")
+    parser.add_argument("--no-health", action="store_true", help="Do not poll /healthz.")
+    parser.add_argument("--health-interval-s", type=float, default=5.0, help="Seconds between /healthz summaries.")
     parser.add_argument("--no-serial", action="store_true", help="Do not start ESP-IDF serial monitor.")
     parser.add_argument("--no-mqtt", action="store_true", help="Do not start bridge MQTT watch.")
+    parser.add_argument("--remote-host", default=os.environ.get("H2S_REMOTE_HOST", ""), help="Optional bridge host for remote journalctl tail.")
+    parser.add_argument("--remote-user", default=os.environ.get("H2S_REMOTE_USER", "wollux"), help="SSH user for --remote-host.")
+    parser.add_argument("--remote-service", default=os.environ.get("H2S_REMOTE_SERVICE", "hermes2stackchan.service"), help="Systemd user service to tail remotely.")
+    parser.add_argument("--no-remote-log", action="store_true", help="Do not tail remote journal even if --remote-host is set.")
     parser.add_argument(
         "--log",
         action="append",
@@ -152,12 +208,32 @@ def main(argv: list[str] | None = None) -> int:
         source = f"log:{path.name}"
         threading.Thread(target=follow_file, args=(path, source, out, stop), daemon=True).start()
 
+    if not args.no_health:
+        threading.Thread(
+            target=poll_health,
+            args=(args.bridge_url, max(1.0, args.health_interval_s), "healthz", out, stop),
+            daemon=True,
+        ).start()
+
     python = os.environ.get("PYTHON", "/opt/homebrew/bin/python3.11" if Path("/opt/homebrew/bin/python3.11").exists() else sys.executable)
     if not args.no_mqtt:
         processes.append(
             stream_process(
                 [python, "-u", "-m", "bridge.hermes2stackchan_bridge", "--env", ".env", "watch", "--pair", args.pair],
                 "mqtt",
+                out,
+                stop,
+                ROOT,
+            )
+        )
+
+    if args.remote_host and not args.no_remote_log:
+        remote = f"{args.remote_user}@{args.remote_host}" if args.remote_user else args.remote_host
+        remote_cmd = f"journalctl --user -u {args.remote_service} -f -n 80 --no-pager"
+        processes.append(
+            stream_process(
+                ["ssh", remote, remote_cmd],
+                "bridge-remote",
                 out,
                 stop,
                 ROOT,
@@ -178,7 +254,11 @@ def main(argv: list[str] | None = None) -> int:
             processes.append(stream_process(command, "serial", out, stop, FIRMWARE_DIR))
 
     print("Hermes2StackChan debug cockpit running. Stop with Ctrl-C.", flush=True)
-    print(f"pair={args.pair} serial={args.serial_port or 'none'}", flush=True)
+    print(
+        f"pair={args.pair} bridge={args.bridge_url} serial={args.serial_port or 'none'} "
+        f"remote={args.remote_host or 'none'}",
+        flush=True,
+    )
     try:
         while True:
             try:
