@@ -1945,6 +1945,8 @@ def build_bridge_healthz(
     replay_last = replay_entries[-1] if replay_entries else None
     sensor_status = status.get("sensors") if isinstance(status, dict) else None
     audio_status = status.get("audio") if isinstance(status, dict) else None
+    busy_reasons = status_busy_reasons(status) if isinstance(status, dict) else []
+    display_sleeping = status_bool(status.get("display_sleeping")) is True if isinstance(status, dict) else None
     return {
         "ok": True,
         "service": "hermes2stackchan-bridge",
@@ -2009,6 +2011,17 @@ def build_bridge_healthz(
             "last_status_ts": presence["last_status_ts"],
             "last_skip_reason": presence["last_skip_reason"],
             "last_skip_ts": presence["last_skip_ts"],
+        },
+        "idle_sleep": {
+            "enabled": True,
+            "timeout_s": DEFAULT_IDLE_SLEEP_TIMEOUT_S,
+            "display_sleeping": display_sleeping,
+            "busy_reasons": busy_reasons,
+            "blocking_busy_reasons": sorted(idle_activity_reasons_from_busy_reasons(set(busy_reasons))),
+            "motion_blocks_sleep_timer": False,
+            "ignored_request_prefixes": list(IDLE_SLEEP_IGNORED_REQUEST_PREFIXES),
+            "ignored_event_sources": sorted(IDLE_SLEEP_IGNORED_EVENT_SOURCES),
+            "note": "runtime last-activity timer lives in the idle-sleep worker log",
         },
         "replay_buffer": {
             "available": replay is not None,

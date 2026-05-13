@@ -328,10 +328,13 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("queue", payload)
         self.assertIn("health", payload)
         self.assertIn("watchdog", payload)
+        self.assertIn("idle_sleep", payload)
         self.assertIn("replay_buffer", payload)
         self.assertIn("offline_policy", payload)
         self.assertIn("last_errors", payload)
         self.assertEqual(payload["stackchan"]["status_available"], False)
+        self.assertEqual(payload["idle_sleep"]["timeout_s"], 600.0)
+        self.assertIn("sensor-", payload["idle_sleep"]["ignored_request_prefixes"])
 
     def test_healthz_payload_exposes_watchdog_presence_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -383,6 +386,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertTrue(payload["stackchan"]["status_available"])
         self.assertTrue(payload["stackchan"]["online"])
         self.assertFalse(payload["watchdog"]["stale"])
+        self.assertEqual(payload["idle_sleep"]["busy_reasons"], [])
         STACKCHAN_PRESENCE.clear()
 
     def test_replay_memory_and_audio_action(self) -> None:
