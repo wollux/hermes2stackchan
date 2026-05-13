@@ -90,6 +90,7 @@ from bridge.hermes2stackchan_bridge import (
     sensor_status_is_sideways,
     status_allows_life_animation,
     action_queue_record,
+    actions_request_audio_stop,
     build_waiting_animation_actions,
     waiting_animation_delay_s,
     privacy_policy_for_mode,
@@ -1574,6 +1575,11 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(topic, "hermes-stackchan/desk/cmd/audio")
         self.assertEqual(payload["action"], "play_tts_url")
         self.assertEqual(payload["url"], "http://example.test/tts.wav")
+
+    def test_audio_stop_detection_suppresses_followup_tts(self) -> None:
+        self.assertTrue(actions_request_audio_stop([{"action": "audio", "audio_action": "stop"}]))
+        self.assertTrue(actions_request_audio_stop([{"action": "audio", "audio_action": "stop_playback"}]))
+        self.assertFalse(actions_request_audio_stop([{"action": "audio", "audio_action": "replay_last"}]))
 
     def test_sound_action_to_topic_payload_supports_safe_patterns(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]

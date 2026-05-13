@@ -3204,6 +3204,16 @@ def local_audio_control_reply_from_transcript(text: str, pair: PairConfig) -> tu
     return None
 
 
+def actions_request_audio_stop(actions: list[dict[str, Any]]) -> bool:
+    for action in actions:
+        if action_name(action) != "audio":
+            continue
+        audio_action = optional_string(action.get("audio_action") or action.get("command")).strip().lower().replace("-", "_")
+        if audio_action in {"stop", "stop_playback"}:
+            return True
+    return False
+
+
 def local_history_reply_from_transcript(
     text: str,
     config: BridgeConfig,
@@ -8175,6 +8185,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             transcript, backend = transcribe_audio_bytes(audio, self.server.config.speech)
             stt_ms = round((time.monotonic() - stt_started) * 1000)
             post_tts_system_action = ""
+            suppress_tts = False
             if not transcript:
                 display_text = "NICHTS VERSTANDEN"
                 hermes_response: dict[str, Any] = {"reply": display_text, "actions": [{"action": "say", "text": display_text, "emotion": "question"}]}
@@ -8203,6 +8214,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     direct_command = direct_local_command_from_transcript(transcript, status)
                 if direct_command:
                     display_text, actions, post_tts_system_action = direct_command
+                    suppress_tts = audio_direct and actions_request_audio_stop(actions)
                     hermes_response = {"reply": display_text, "actions": actions}
                     hermes_ms = 0
                     actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
@@ -8319,7 +8331,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
 
             tts_started = time.monotonic()
             try:
-                tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if display_text else ""
+                tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if display_text and not suppress_tts else ""
             except Exception as exc:
                 tts_path = ""
                 action_errors.append(f"TTS failed: {exc}")
@@ -8336,13 +8348,14 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             tts_ms = round((time.monotonic() - tts_started) * 1000) if display_text else 0
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             tts_url = f"http://{host}{tts_path}" if tts_path else ""
-            remember_last_replay(
-                self.server.pair,
-                reply=display_text,
-                tts_url=tts_url,
-                tts_path=tts_path,
-                request_id=request_id,
-            )
+            if tts_url:
+                remember_last_replay(
+                    self.server.pair,
+                    reply=display_text,
+                    tts_url=tts_url,
+                    tts_path=tts_path,
+                    request_id=request_id,
+                )
             total_ms = round((time.monotonic() - started) * 1000)
             processing_indicator.stop()
             shorten_life_animation_pause(
