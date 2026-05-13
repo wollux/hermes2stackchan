@@ -246,12 +246,43 @@ For this flow Hermes should return JSON:
 {
   "reply": "Mache ich.",
   "actions": [
-    {"action": "face", "emotion": "happy", "intensity_pct": 70}
+    {"action": "face", "emotion": "friendly", "intensity_pct": 70}
   ]
 }
 ```
 
 Do not put normal spoken answers into a `say` action. Use the top-level `reply`.
+
+## Face Contract
+
+StackChan's current face system is template-based and intentionally simple:
+black background, white eyes, white mouth, white brows, black pupil cutouts.
+Hermes should only send the supported semantic face names below.
+
+Base emotions:
+
+- `neutral`, `calm`, `friendly`, `happy`, `super_happy`, `thankful`, `love`
+- `curious`, `playful`, `focused`, `concerned`, `annoyed`, `help`
+- `sad`, `angry`, `surprised`, `tired`, `confused`, `scared`
+- `listening`, `thinking`, `speaking`, `charging`
+
+Short transients:
+
+- `soft_blink`, `blink`, `breathe`, `deep_breathe`
+- `glance_left`, `glance_right`, `glance_up`, `glance_down`
+- `look_left`, `look_right`, `look_up`, `look_down`
+- `brow_raise`, `brow_soft`, `brow_skeptic`, `brow_skeptic_left`,
+  `brow_skeptic_right`, `brow_wiggle`
+- `mouth_smile`, `mouth_tiny`, `mouth_wiggle`
+
+Use `friendly` for "glücklich gucken", "freundlich schauen", "lächeln", and
+normal warm confirmations. Use `super_happy` only when the user asks for extra
+happy or when a celebration really fits.
+
+Never send old removed face names: `happy_squint`, `derp`, `cross_eyes`,
+`surprise_pop`, `micro_sleep`, `silent_giggle`, `smirk_slide`, `mischievous`,
+`smug`, `evil_grin`, `glitch`, or `dead`. If an old session still uses them,
+restart/delete that stale Hermes session.
 
 ## Available MQTT Topics
 
@@ -289,12 +320,14 @@ Use these through Hermes JSON actions or through bridge helper commands:
 - `display`: accepted for compatibility; `mode:"info"` shows a sticky local
   info screen with time, weekday, date, and a small face
 - `display_image`: accepted for compatibility, but current firmware does not replace the face with images
-- `face`: set a template emotion such as `neutral`, `happy`, `sad`,
-  `angry`, `surprised`, `tired`, `annoyed`, `confused`, `scared`, `love`,
-  `dead`, `glitch`, or a calm transient such as `soft_blink`, `breathe`,
-  `glance_left`, `glance_right`, `glance_up`, `glance_down`, `mouth_smile`,
-  `mouth_tiny`, `mouth_wiggle`, `brow_raise`, `brow_soft`, `brow_skeptic`,
-  `brow_skeptic_left`, `brow_skeptic_right`, `brow_wiggle`
+- `face`: set a supported template emotion such as `neutral`, `friendly`,
+  `super_happy`, `happy`, `thankful`, `curious`, `playful`, `focused`,
+  `concerned`, `annoyed`, `help`, `sad`, `angry`, `surprised`, `tired`,
+  `confused`, `scared`, `listening`, `thinking`, `speaking`, or a calm
+  transient such as `soft_blink`, `breathe`, `glance_left`, `glance_right`,
+  `glance_up`, `glance_down`, `mouth_smile`, `mouth_tiny`, `mouth_wiggle`,
+  `brow_raise`, `brow_soft`, `brow_skeptic`, `brow_skeptic_left`,
+  `brow_skeptic_right`, `brow_wiggle`
 - `move`: safe directional or target movement
 - `motion`: computed motion path with waypoints
 - `led`: LED modes/colors
@@ -329,10 +362,25 @@ Useful diagnostics:
 ```bash
 cd /home/wollux/hermes2stackchan
 /home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env healthz --pair desk
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env watchdog-status --pair desk
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env replay-list --pair desk
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env replay-last --pair desk
 /home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env read-companion --pair desk --with-status
 /home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env set-companion --pair desk --privacy-mode focus
 /home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env list-history --pair desk
 ```
+
+Watchdog and replay notes:
+
+- `/healthz?status=1` includes StackChan presence age, stale/offline state, last
+  skip reason, watchdog config, and a short replay-buffer summary.
+- `watchdog-status --pair desk` is the quick human-readable check before sending
+  actions. If StackChan is stale, do not push notify/reminder/display/motion output.
+- `replay-list`, `replay-last`, and `replay-show --request-id ...` inspect the
+  last bridge speech/notify/photo rounds. Normal privacy keeps text/metadata only;
+  debug privacy may keep audio paths; private privacy keeps only minimal errors.
+- A real IMU shake during TTS is local: bridge sends `cmd/audio` with
+  `audio_action: stop_playback`, turns LEDs off, and does not ask Hermes.
 
 The bridge shows an animated thinking heartbeat while Hermes is processing:
 glances, brows, breathing, blinks, and a small mouth impulse. It intentionally
@@ -345,14 +393,14 @@ so do not rely on a weather/status answer leaving a decorative lamp active.
 StackChan has an idle-life animator in the bridge. It may blink, breathe, glance,
 move its mouth, and occasionally move the head. This should only run when idle and
 must not interrupt recording, speaking, battery overlays, sleep, or errors.
-The bridge also has an idle-sleep watcher: after five quiet minutes without human
+The bridge also has an idle-sleep watcher: after ten quiet minutes without human
 interaction or non-life actions, it sends `cmd/device {"display_sleep":true}` and
 the life animator must stay quiet because the retained status reports
 `display_sleeping:true`.
 Head touch, display touch, `cmd/move`, `cmd/motion`, BMI270 IMU movement, and
 LTR553 proximity wake StackChan through the CRT wake animation before continuing
 with recording or movement. The bridge treats the firmware `interaction` event as
-human activity for the five-minute idle-sleep timer.
+human activity for the ten-minute idle-sleep timer.
 
 The bridge also runs a sensor watcher. It filters BMI270/LTR553 noise and reacts
 only to stable physical interaction: shake becomes a short surprise face, lying

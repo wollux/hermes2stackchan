@@ -21,7 +21,7 @@ context package. Treat it as authoritative.
 It contains:
 
 - pair profile: pair ID, Hermes ID, StackChan ID, MQTT prefix, wakeword, voice
-- persistent mood: `calm`, `playful`, `curious`, `tired`, `focused`, `annoyed`, `help`
+- persistent mood: `calm`, `curious`, `playful`, `tired`, `focused`, `concerned`, `annoyed`, `help`
 - proactivity level: `quiet`, `balanced`, `playful`
 - privacy mode: `normal`, `focus`, `private`, `demo`, `debug`
 - status summary: battery, display, UI, face, head, sensors, recording/speaking
@@ -213,11 +213,28 @@ the bridge and stays active until another face/UI command replaces it.
 
 Publishes to `hermes-stackchan/desk/cmd/face`.
 
-Supported robot-face base emotions: `neutral`, `happy`, `sad`, `angry`, `surprised`, `tired`, `annoyed`, `confused`, `scared`, `love`, `dead`, `glitch`.
+Supported robot-face base emotions: `calm`, `curious`, `playful`, `focused`, `concerned`, `annoyed`, `help`, `neutral`, `friendly`, `super_happy`, `happy`, `thankful`, `love`, `sad`, `angry`, `surprised`, `tired`, `confused`, `scared`, `listening`, `thinking`, `speaking`, `charging`.
 
-Supported calm template transients: `soft_blink`, `blink`, `breathe`, `deep_breathe`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `look_left`, `look_right`, `look_up`, `look_down`, `mouth_smile`, `mouth_tiny`, `mouth_wiggle`.
+Supported calm template transients: `soft_blink`, `blink`, `breathe`, `deep_breathe`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `look_left`, `look_right`, `look_up`, `look_down`, `brow_raise`, `brow_soft`, `brow_skeptic`, `brow_skeptic_left`, `brow_skeptic_right`, `brow_wiggle`, `mouth_smile`, `mouth_tiny`, `mouth_wiggle`.
 
-Do not use old gag faces such as `happy_squint`, `derp`, `cross_eyes`, `surprise_pop`, or `micro_sleep`. Movement direction is shown by the firmware automatically through pupil gaze while motors move.
+Do not use old gag faces such as `happy_squint`, `derp`, `cross_eyes`,
+`surprise_pop`, `micro_sleep`, `silent_giggle`, `smirk_slide`, `mischievous`,
+`smug`, or `evil_grin`. The bridge maps some legacy names defensively, but
+Hermes should not emit them. Movement direction is shown by the firmware
+automatically through pupil gaze while motors move.
+
+The normal face renderer is monochrome by design: black background, white eyes, white mouth, white brows, with black pupil cutouts. You may suggest `mood_hint` at the top level or send a `{"action":"mood","mood":"..."}` action; the bridge validates and persists the mood and decides the final hardware behavior.
+
+For explicit user requests like “glücklich gucken”, “freundlich schauen”, or
+“lächeln”, use `friendly` or `super_happy`. Do not answer those with `playful`,
+`annoyed`, or any sarcastic/grumpy face unless the user explicitly asks for that
+mood.
+
+For playful dance or show-off requests, keep the mood friendly/playful. A dance
+may use motion, face, and temporary LEDs, but it must end in a friendly/playful
+face. Do not leave `party`, `scanner`, `blink`, or solid LEDs on indefinitely
+unless the user explicitly asked to control LEDs. If LEDs are used only as part
+of a dance/effect, include an `off` LED cleanup after the motion/effect.
 
 ```json
 {
@@ -299,9 +316,32 @@ Path command with explicit segment durations:
 }
 ```
 
+Hermes may also request a named motion profile and let the bridge calculate the
+safe spline waypoints:
+
+```json
+{
+  "action": "motion_profile",
+  "profile": "slow_nod",
+  "intensity_pct": 70
+}
+```
+
+Supported profiles: `slow_nod`, `fast_shake`, `curious_look`,
+`confused_sway`, `proud_look_up`, `tired_sink`, `rescue_dance`,
+`wake_stretch`, `sleep_pose`.
+
+Do not send `move` and `motion`/`motion_profile` in the same answer. The bridge
+will prefer the richer motion path and drop the simple move.
+
 ### led
 
 Publishes to `hermes-stackchan/desk/cmd/led`.
+
+LEDs are stateful. Use them intentionally. For temporary effects such as dance,
+celebration, acknowledgement, or emphasis, turn them off again after a short
+time or after the accompanying motion. Only leave LEDs on when the user
+explicitly asks for LED/light/lamp control.
 
 Modes: `off`, `solid`, `rainbow`, `scanner`, `blink`, `breathe`, `sparkle`, `party`.
 
@@ -326,7 +366,8 @@ Supported fields: `volume_pct`, `brightness_pct`, `display_sleep`, `display_wake
 
 Publishes to `hermes-stackchan/desk/cmd/sound`.
 
-Currently supports simple local tones through the speaker.
+Safe local speaker tone patterns: `success`, `error`, `question`, `camera`,
+`alarm`, `notify`. These are short and should not reset the device.
 
 ### audio
 
@@ -334,7 +375,11 @@ Publishes to `hermes-stackchan/desk/cmd/audio`.
 
 This is the V1.0 control contract for wakeword and push-to-talk state. StackChan can detect the built-in WakeNet wakeword `Computer` locally and can also start recording from touch/push-to-talk. Recorded WAV audio is uploaded to the bridge over HTTP, not MQTT.
 
-Supported actions: `set_wakeword`, `simulate_wakeword`, `start_recording`, `stop_recording`.
+Supported actions: `set_wakeword`, `simulate_wakeword`, `start_recording`,
+`stop_recording`, `play_tts_url`, `stop_playback`.
+
+Bridge-only audio actions: `replay_last` replays the most recent TTS answer;
+`stop` maps to firmware `stop_playback`.
 
 Enable wakeword listening:
 
@@ -410,6 +455,19 @@ the spoken answer:
 
 Use `follow_up_listen: true` only when the reply is a real question and Hermes expects the user to answer immediately. StackChan will play the TTS answer first and then start a short follow-up recording.
 
+Display touch behavior:
+
+- hold display touch: push-to-talk recording
+- short display tap: replay the last TTS answer
+- display tap while speaking: stop current playback
+
+Action validation:
+
+- no `display_sleep` together with `display_wake`
+- no `led off` together with an active LED mode in the same action batch
+- no `speaking`/`listening` face together with sleep/error/help face
+- no simple `move` together with a richer `motion` or `motion_profile`
+
 While Hermes is working, the bridge shows an animated thinking heartbeat: eyes
 think, glance, breathe, blink, and move the mouth slightly without using LEDs or
 spoken filler.
@@ -463,10 +521,16 @@ StackChan publishes retained status to `hermes-stackchan/desk/status`, including
 Bridge health:
 
 - `GET /health` is the small liveness check.
-- `GET /healthz` returns the V1.0 health payload with StackChan presence, status
-  completeness, MQTT/Hermes/STT/TTS configuration, companion state, privacy, and
-  action-priority policy.
-- CLI equivalents: `healthz`, `read-companion`, `set-companion`, and `list-history`.
+- `GET /healthz?status=1` returns the V1.0 health payload with StackChan
+  presence, watchdog stale/offline state, status completeness, MQTT/Hermes/STT/TTS
+  configuration, companion state, privacy, replay summary, and action-priority policy.
+- CLI equivalents: `healthz`, `watchdog-status`, `replay-list`, `replay-last`,
+  `read-companion`, `set-companion`, and `list-history`.
+- If StackChan is stale/offline, the bridge suppresses non-local output actions:
+  idle-life, sensor reactions, reminders, notifications, motion, display images,
+  and Hermes-push output.
+- If StackChan is shaken while TTS is playing, the bridge stops playback locally
+  with `audio_action: stop_playback`, turns LEDs off, and shows a concerned face.
 
 Action priority policy:
 

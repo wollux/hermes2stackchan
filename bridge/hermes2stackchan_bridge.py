@@ -51,7 +51,8 @@ DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 DEFAULT_COMPANION_STATE_STORE = "~/.hermes/hermes2stackchan/companion_state.json"
 DEFAULT_INTERACTION_HISTORY_STORE = "~/.hermes/hermes2stackchan/interaction_history.jsonl"
 DEFAULT_TELEMETRY_STORE = "~/.hermes/hermes2stackchan/telemetry.jsonl"
-DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
+DEFAULT_REPLAY_DEBUG_STORE = "~/.hermes/hermes2stackchan/replay_debug.jsonl"
+DEFAULT_IDLE_SLEEP_TIMEOUT_S = 600.0
 DEFAULT_LIFE_MIN_INTERVAL_S = 0.35
 DEFAULT_LIFE_MAX_INTERVAL_S = 1.35
 MAX_LIFE_FACE_GAP_MS = 1200
@@ -88,7 +89,20 @@ LIFE_PAUSE_LOCK = RLock()
 LIFE_PAUSED_UNTIL: dict[str, float] = {}
 SIDE_TOUCH_SOURCES = {"head_touch_left", "head_touch_right"}
 SIDE_TOUCH_GIGGLE_WINDOW_S = 1.0
-COMPANION_MOODS = {"calm", "playful", "curious", "tired", "focused", "annoyed", "help"}
+COMPANION_MOODS = {"calm", "curious", "playful", "tired", "focused", "concerned", "annoyed", "help"}
+MOOD_ALIASES = {
+    "worry": "concerned",
+    "worried": "concerned",
+    "concern": "concerned",
+    "careful": "concerned",
+    "question": "curious",
+    "thinking": "curious",
+    "sleepy": "tired",
+    "sleep": "tired",
+    "angry": "annoyed",
+    "panic": "help",
+    "scared": "help",
+}
 PRIVACY_MODES = {"normal", "focus", "private", "demo", "debug"}
 PROACTIVITY_LEVELS = {"quiet", "balanced", "playful"}
 
@@ -100,6 +114,108 @@ ACTION_PRIORITY_RANKS = {
     "proactive": 40,
     "idle": 50,
 }
+SAFE_SOUND_PATTERNS = {"success", "good", "ok", "error", "fail", "question", "ask", "followup", "camera", "photo", "shutter", "alarm", "notify", "message"}
+FACE_BASE_EMOTIONS = {
+    "neutral",
+    "calm",
+    "friendly",
+    "happy",
+    "super_happy",
+    "thankful",
+    "love",
+    "curious",
+    "playful",
+    "focused",
+    "concerned",
+    "annoyed",
+    "help",
+    "sad",
+    "angry",
+    "surprised",
+    "tired",
+    "confused",
+    "scared",
+    "listening",
+    "thinking",
+    "speaking",
+    "charging",
+}
+FACE_TRANSIENT_EMOTIONS = {
+    "blink",
+    "soft_blink",
+    "breathe",
+    "deep_breathe",
+    "glance_left",
+    "glance_right",
+    "glance_up",
+    "glance_down",
+    "look_left",
+    "look_right",
+    "look_up",
+    "look_down",
+    "brow_raise",
+    "brow_soft",
+    "brow_skeptic",
+    "brow_skeptic_left",
+    "brow_skeptic_right",
+    "brow_wiggle",
+    "mouth_smile",
+    "mouth_tiny",
+    "mouth_wiggle",
+}
+FACE_EMOTION_ALIASES = {
+    "question": "curious",
+    "surprise": "surprised",
+    "error": "help",
+    "panic": "help",
+    "face_down": "help",
+    "battery": "neutral",
+    "battery_low": "concerned",
+    "sleep": "tired",
+    "sleepy": "tired",
+    "bored": "tired",
+    "mischievous": "playful",
+    "smug": "playful",
+    "evil_grin": "playful",
+    "happy_squint": "super_happy",
+    "silent_giggle": "super_happy",
+    "surprise_pop": "surprised",
+    "micro_sleep": "tired",
+    "yawn": "tired",
+    "grumble": "annoyed",
+    "grumble_mouth": "annoyed",
+    "skeptical": "annoyed",
+    "offended": "annoyed",
+    "wink_left": "friendly",
+    "wink_right": "friendly",
+    "cross_eyes": "confused",
+    "eye_swap": "confused",
+    "derp": "confused",
+    "boing_eyes": "surprised",
+    "suspicious_squint": "annoyed",
+    "confused_dots": "confused",
+    "mouth_pop": "mouth_tiny",
+    "smirk_slide": "playful",
+    "sleepy_snapback": "tired",
+    "dead": "tired",
+    "glitch": "tired",
+}
+MOTION_PROFILE_NAMES = {
+    "slow_nod",
+    "fast_shake",
+    "curious_look",
+    "confused_sway",
+    "proud_look_up",
+    "tired_sink",
+    "rescue_dance",
+    "wake_stretch",
+    "sleep_pose",
+}
+LAST_ERRORS_LOCK = RLock()
+LAST_ERRORS: list[dict[str, Any]] = []
+REPLAY_LOCK = RLock()
+LAST_REPLAY_BY_PAIR: dict[str, dict[str, Any]] = {}
+REPLAY_DEBUG_BY_PAIR: dict[str, list[dict[str, Any]]] = {}
 
 
 class ConfigError(ValueError):
@@ -233,8 +349,16 @@ class CompanionConfig:
     state_store_path: str = DEFAULT_COMPANION_STATE_STORE
     history_store_path: str = DEFAULT_INTERACTION_HISTORY_STORE
     telemetry_store_path: str = DEFAULT_TELEMETRY_STORE
+    replay_debug_store_path: str = DEFAULT_REPLAY_DEBUG_STORE
     history_keep: int = 200
     telemetry_enabled: bool = True
+    replay_debug_keep: int = 10
+
+
+@dataclass(frozen=True)
+class WatchdogConfig:
+    stale_timeout_s: float = STACKCHAN_PRESENCE_TIMEOUT_S
+    reboot_on_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -245,6 +369,7 @@ class BridgeConfig:
     speech: SpeechConfig = field(default_factory=SpeechConfig)
     reminders: ReminderConfig = field(default_factory=ReminderConfig)
     companion: CompanionConfig = field(default_factory=CompanionConfig)
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
 
 
 @dataclass
@@ -263,6 +388,7 @@ class SensorReactionState:
     last_face_down_at: float = -9999.0
     last_proximity_at: float = -9999.0
     last_wake_at: float = -9999.0
+    proximity_quiet_until: float = -9999.0
 
 
 LifeSequence = list[tuple[int, dict[str, Any]]]
@@ -378,6 +504,7 @@ def load_config(
         state_store_path=env.get("H2S_COMPANION_STATE_STORE") or str(companion_raw.get("state_store_path") or DEFAULT_COMPANION_STATE_STORE),
         history_store_path=env.get("H2S_INTERACTION_HISTORY_STORE") or str(companion_raw.get("history_store_path") or DEFAULT_INTERACTION_HISTORY_STORE),
         telemetry_store_path=env.get("H2S_TELEMETRY_STORE") or str(companion_raw.get("telemetry_store_path") or DEFAULT_TELEMETRY_STORE),
+        replay_debug_store_path=env.get("H2S_REPLAY_DEBUG_STORE") or str(companion_raw.get("replay_debug_store_path") or DEFAULT_REPLAY_DEBUG_STORE),
         history_keep=parse_int(
             env.get("H2S_HISTORY_KEEP"),
             int(companion_raw.get("history_keep", 200)),
@@ -387,6 +514,26 @@ def load_config(
             env.get("H2S_TELEMETRY_ENABLED"),
             bool(companion_raw.get("telemetry_enabled", True)),
             "H2S_TELEMETRY_ENABLED",
+        ),
+        replay_debug_keep=parse_int(
+            env.get("H2S_REPLAY_DEBUG_KEEP"),
+            int(companion_raw.get("replay_debug_keep", 10)),
+            "H2S_REPLAY_DEBUG_KEEP",
+        ),
+    )
+    watchdog_raw = raw.get("watchdog") or {}
+    if not isinstance(watchdog_raw, dict):
+        raise ConfigError("watchdog must be an object when present")
+    watchdog = WatchdogConfig(
+        stale_timeout_s=parse_float(
+            env.get("H2S_WATCHDOG_STALE_TIMEOUT_S"),
+            float(watchdog_raw.get("stale_timeout_s", STACKCHAN_PRESENCE_TIMEOUT_S)),
+            "H2S_WATCHDOG_STALE_TIMEOUT_S",
+        ),
+        reboot_on_stale=parse_bool(
+            env.get("H2S_WATCHDOG_REBOOT_ON_STALE"),
+            bool(watchdog_raw.get("reboot_on_stale", False)),
+            "H2S_WATCHDOG_REBOOT_ON_STALE",
         ),
     )
 
@@ -444,7 +591,9 @@ def load_config(
             )
         }
 
-    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech, reminders=reminders, companion=companion)
+    config = BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech, reminders=reminders, companion=companion, watchdog=watchdog)
+    STACKCHAN_PRESENCE.timeout_s = max(1.0, watchdog.stale_timeout_s)
+    return config
 
 
 def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -753,7 +902,7 @@ def build_touch_emotion_actions(
 
     if event in {"touch_swipe_forward", "touch_swipe_backward"}:
         return [
-            {"action": "face", "emotion": "happy_squint", "intensity_pct": 84},
+            {"action": "face", "emotion": "friendly", "intensity_pct": 84},
             {
                 "action": "motion",
                 "curve": "spline",
@@ -783,7 +932,7 @@ def build_touch_emotion_actions(
 
     if previous_side and previous_side != side and now_s - previous_at <= SIDE_TOUCH_GIGGLE_WINDOW_S:
         return [
-            {"action": "face", "emotion": "silent_giggle", "intensity_pct": 86},
+            {"action": "face", "emotion": "super_happy", "intensity_pct": 86},
             {
                 "action": "motion",
                 "curve": "spline",
@@ -799,7 +948,7 @@ def build_touch_emotion_actions(
 
     if side == "left":
         return [
-            {"action": "face", "emotion": "happy_squint", "intensity_pct": 76},
+            {"action": "face", "emotion": "friendly", "intensity_pct": 76},
             {
                 "action": "motion",
                 "curve": "spline",
@@ -812,7 +961,7 @@ def build_touch_emotion_actions(
         ], ["side_touch_left"]
 
     return [
-        {"action": "face", "emotion": "smirk_slide", "intensity_pct": 78},
+        {"action": "face", "emotion": "curious", "intensity_pct": 78},
         {
             "action": "motion",
             "curve": "spline",
@@ -972,6 +1121,68 @@ def healthz_cli(args: argparse.Namespace) -> int:
     payload = build_bridge_healthz(config, pair, include_status=not args.no_status, status_timeout_s=args.timeout)
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if payload["stackchan"]["online"] or args.no_status else 3
+
+
+def watchdog_status_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    if not args.no_refresh:
+        try:
+            status = read_latest_status(config, pair, args.timeout)
+            if isinstance(status, dict):
+                note_stackchan_status(pair, status)
+        except Exception as exc:
+            print(f"watchdog refresh skipped: {exc}", file=sys.stderr, flush=True)
+    snapshot = STACKCHAN_PRESENCE.snapshot(pair)
+    if args.json:
+        print(json.dumps({"pair_id": pair.pair_id, "watchdog": snapshot}, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        age = snapshot["last_seen_age_s"]
+        age_text = "never" if age is None else f"{age:.1f}s"
+        state = "online" if snapshot["online"] else "stale/offline"
+        print(f"{pair.pair_id}: {state}, last_seen={age_text}, timeout={snapshot['stale_timeout_s']:.1f}s")
+        if snapshot.get("last_skip_reason"):
+            print(f"last skip: {snapshot['last_skip_reason']}")
+    return 0 if snapshot["online"] else 3
+
+
+def replay_list_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    entries = replay_debug_entries(pair, config)[-max(1, args.limit):]
+    if args.json:
+        print(json.dumps(entries, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for item in entries:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(item.get("ts", 0))))
+            rid = optional_string(item.get("request_id")) or "-"
+            source = optional_string(item.get("source")) or "-"
+            route = optional_string(item.get("route")) or "-"
+            error = optional_string(item.get("error"))
+            print(f"{ts} {rid} source={source} route={route}" + (f" error={error}" if error else ""))
+    return 0
+
+
+def replay_show_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    item = replay_debug_by_request_id(pair, args.request_id, config)
+    if item is None:
+        print(f"replay entry not found: {args.request_id}", file=sys.stderr)
+        return 3
+    print(json.dumps(item, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def replay_last_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    item = replay_debug_last(pair, config)
+    if item is None:
+        print("no replay entry available", file=sys.stderr)
+        return 3
+    print(json.dumps(item, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 REQUIRED_STATUS_PATHS = (
@@ -1153,6 +1364,17 @@ def companion_state_default(pair: PairConfig) -> dict[str, Any]:
     }
 
 
+def normalize_companion_mood(value: Any, fallback: str = "playful") -> str:
+    raw = optional_string(value)
+    if not raw:
+        raw = optional_string(fallback) or "playful"
+    mood = raw.strip().lower().replace("-", "_")
+    mood = MOOD_ALIASES.get(mood, mood)
+    if mood in COMPANION_MOODS:
+        return mood
+    return "playful"
+
+
 def read_companion_state(config: BridgeConfig, pair: PairConfig) -> dict[str, Any]:
     store = read_json_store(config.companion.state_store_path, companion_state_default(pair))
     pairs = store.setdefault("pairs", {})
@@ -1163,7 +1385,7 @@ def read_companion_state(config: BridgeConfig, pair: PairConfig) -> dict[str, An
     if not isinstance(state, dict):
         state = companion_state_default(pair)["pairs"][pair.pair_id]
         pairs[pair.pair_id] = state
-    state["mood"] = normalized_choice(state.get("mood"), COMPANION_MOODS, pair.mood_default, "companion_state.mood")
+    state["mood"] = normalize_companion_mood(state.get("mood"), pair.mood_default)
     state["privacy_mode"] = normalized_choice(state.get("privacy_mode"), PRIVACY_MODES, pair.privacy_mode, "companion_state.privacy_mode")
     state["proactivity"] = normalized_choice(state.get("proactivity"), PROACTIVITY_LEVELS, pair.proactivity, "companion_state.proactivity")
     return dict(state)
@@ -1180,7 +1402,7 @@ def write_companion_pair_state(config: BridgeConfig, pair: PairConfig, updates: 
         state = companion_state_default(pair)["pairs"][pair.pair_id]
     state.update(updates)
     state["pair_id"] = pair.pair_id
-    state["mood"] = normalized_choice(state.get("mood"), COMPANION_MOODS, pair.mood_default, "companion_state.mood")
+    state["mood"] = normalize_companion_mood(state.get("mood"), pair.mood_default)
     state["privacy_mode"] = normalized_choice(state.get("privacy_mode"), PRIVACY_MODES, pair.privacy_mode, "companion_state.privacy_mode")
     state["proactivity"] = normalized_choice(state.get("proactivity"), PROACTIVITY_LEVELS, pair.proactivity, "companion_state.proactivity")
     state["updated_at"] = time.time()
@@ -1191,20 +1413,68 @@ def write_companion_pair_state(config: BridgeConfig, pair: PairConfig, updates: 
 
 
 def mood_from_face_emotion(emotion: str) -> str | None:
-    emotion = emotion.strip().lower().replace("-", "_")
+    emotion = normalize_bridge_face_emotion(emotion)
     if emotion in {"help", "panic", "face_down", "error"}:
         return "help"
+    if emotion in {"concerned", "scared", "sad"}:
+        return "concerned"
     if emotion in {"thinking", "question", "confused"}:
         return "curious"
-    if emotion in {"sleepy", "tired", "micro_sleep", "yawn"}:
+    if emotion in {"sleepy", "tired"}:
         return "tired"
     if emotion in {"annoyed", "angry", "skeptical", "offended"}:
         return "annoyed"
-    if emotion in {"friendly", "happy", "super_happy", "mischievous", "smug", "thankful", "speaking"}:
+    if emotion in {"friendly", "happy", "super_happy", "thankful", "love", "speaking"}:
         return "playful"
     if emotion in {"neutral", "breathe", "soft_blink"}:
         return "calm"
     return None
+
+
+def normalize_bridge_face_emotion(value: Any, fallback: str = "neutral") -> str:
+    emotion = optional_string(value).strip().lower().replace("-", "_")
+    if not emotion:
+        emotion = fallback
+    emotion = FACE_EMOTION_ALIASES.get(emotion, emotion)
+    if emotion in FACE_BASE_EMOTIONS or emotion in FACE_TRANSIENT_EMOTIONS:
+        return emotion
+    return fallback if fallback in FACE_BASE_EMOTIONS else "neutral"
+
+
+def apply_companion_mood_hint(
+    config: BridgeConfig,
+    pair: PairConfig,
+    mood_value: Any,
+    intensity_value: Any = None,
+    *,
+    source: str = "hermes",
+) -> str | None:
+    mood_text = optional_string(mood_value)
+    if not mood_text:
+        return None
+    mood = normalize_companion_mood(mood_text, "playful")
+    updates: dict[str, Any] = {
+        "mood": mood,
+        "mood_source": source,
+    }
+    if intensity_value is not None:
+        updates["mood_intensity_pct"] = clamp_int(
+            parse_int_value(intensity_value, 60, "mood.intensity_pct"),
+            0,
+            100,
+        )
+    write_companion_pair_state(config, pair, updates)
+    return mood
+
+
+def apply_hermes_response_mood_hint(config: BridgeConfig, pair: PairConfig, response: dict[str, Any]) -> str | None:
+    mood_value = response.get("mood_hint")
+    if mood_value is None:
+        mood_value = response.get("mood")
+    intensity_value = response.get("mood_intensity_pct")
+    if intensity_value is None:
+        intensity_value = response.get("intensity_pct")
+    return apply_companion_mood_hint(config, pair, mood_value, intensity_value, source="hermes_response")
 
 
 def privacy_policy_for_mode(mode: str) -> dict[str, Any]:
@@ -1303,6 +1573,121 @@ def record_telemetry_event(config: BridgeConfig, pair: PairConfig, event: dict[s
         print(f"[bridge] telemetry skipped: {exc}", file=sys.stderr, flush=True)
 
 
+def record_bridge_error(kind: str, error: str, *, request_id: str | None = None) -> None:
+    item = {
+        "ts": time.time(),
+        "kind": kind,
+        "request_id": request_id,
+        "error": str(error)[:500],
+    }
+    with LAST_ERRORS_LOCK:
+        LAST_ERRORS.append(item)
+        del LAST_ERRORS[:-10]
+
+
+def recent_bridge_errors() -> list[dict[str, Any]]:
+    with LAST_ERRORS_LOCK:
+        return list(LAST_ERRORS)
+
+
+def remember_last_replay(
+    pair: PairConfig,
+    *,
+    reply: str,
+    tts_url: str,
+    tts_path: str,
+    request_id: str,
+) -> None:
+    if not reply or not tts_url:
+        return
+    with REPLAY_LOCK:
+        LAST_REPLAY_BY_PAIR[pair.pair_id] = {
+            "ts": time.time(),
+            "request_id": request_id,
+            "reply": reply[:MAX_STACKCHAN_TTS_CHARS],
+            "tts_url": tts_url,
+            "tts_path": tts_path,
+        }
+
+
+def latest_replay(pair: PairConfig) -> dict[str, Any] | None:
+    with REPLAY_LOCK:
+        replay = LAST_REPLAY_BY_PAIR.get(pair.pair_id)
+        return dict(replay) if isinstance(replay, dict) else None
+
+
+def replay_privacy_mode(config: BridgeConfig, pair: PairConfig) -> str:
+    state = read_companion_state(config, pair)
+    return privacy_policy_for_mode(state.get("privacy_mode", pair.privacy_mode))["mode"]
+
+
+def remember_replay_debug(
+    config: BridgeConfig,
+    pair: PairConfig,
+    entry: dict[str, Any],
+) -> None:
+    keep = max(1, int(config.companion.replay_debug_keep))
+    mode = replay_privacy_mode(config, pair)
+    item = {
+        "schema_version": SCHEMA_VERSION,
+        "ts": time.time(),
+        "pair_id": pair.pair_id,
+        "privacy_mode": mode,
+        **entry,
+    }
+    if mode == "private":
+        item = {
+            "schema_version": SCHEMA_VERSION,
+            "ts": item["ts"],
+            "pair_id": pair.pair_id,
+            "privacy_mode": mode,
+            "request_id": optional_string(entry.get("request_id")),
+            "source": optional_string(entry.get("source")),
+            "error": optional_string(entry.get("error")),
+        }
+    elif mode != "debug":
+        item.pop("audio_path", None)
+        item.pop("audio_file", None)
+        item.pop("tts_path", None)
+    with REPLAY_LOCK:
+        bucket = REPLAY_DEBUG_BY_PAIR.setdefault(pair.pair_id, [])
+        bucket.append(item)
+        del bucket[:-keep]
+    try:
+        append_jsonl(config.companion.replay_debug_store_path, item, keep=keep)
+    except Exception as exc:
+        print(f"[bridge] replay debug store skipped: {exc}", file=sys.stderr, flush=True)
+
+
+def replay_debug_entries(pair: PairConfig, config: BridgeConfig | None = None) -> list[dict[str, Any]]:
+    if config is not None:
+        path = expanded_store_path(config.companion.replay_debug_store_path)
+        if path.exists():
+            result: list[dict[str, Any]] = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and item.get("pair_id") == pair.pair_id:
+                    result.append(dict(item))
+            return result[-max(1, int(config.companion.replay_debug_keep)):]
+    with REPLAY_LOCK:
+        return [dict(item) for item in REPLAY_DEBUG_BY_PAIR.get(pair.pair_id, [])]
+
+
+def replay_debug_last(pair: PairConfig, config: BridgeConfig | None = None) -> dict[str, Any] | None:
+    entries = replay_debug_entries(pair, config)
+    return entries[-1] if entries else None
+
+
+def replay_debug_by_request_id(pair: PairConfig, request_id: str, config: BridgeConfig | None = None) -> dict[str, Any] | None:
+    for item in reversed(replay_debug_entries(pair, config)):
+        if item.get("request_id") == request_id:
+            return item
+    return None
+
+
 def read_recent_interactions(config: BridgeConfig, pair: PairConfig, limit: int = 5) -> list[dict[str, Any]]:
     path = expanded_store_path(config.companion.history_store_path)
     if not path.exists():
@@ -1380,6 +1765,7 @@ def build_hermes_context_package(
             "state": state.get("mood", pair.mood_default),
             "intensity_pct": state.get("mood_intensity_pct", 60),
             "proactivity": state.get("proactivity", pair.proactivity),
+            "allowed": sorted(COMPANION_MOODS),
         },
         "privacy": privacy,
         "time": {
@@ -1533,7 +1919,7 @@ def build_bridge_healthz(
 ) -> dict[str, Any]:
     state = read_companion_state(config, pair)
     privacy = privacy_policy_for_mode(state.get("privacy_mode", pair.privacy_mode))
-    age = STACKCHAN_PRESENCE.age_s(pair)
+    presence = STACKCHAN_PRESENCE.snapshot(pair)
     status: dict[str, Any] | None = None
     missing: list[str] = []
     if include_status:
@@ -1543,6 +1929,20 @@ def build_bridge_healthz(
                 missing = missing_status_paths(status)
         except Exception as exc:
             missing = [f"status_read_error:{exc}"]
+            record_bridge_error("status_read", str(exc))
+    hermes_ok: bool | None = None
+    hermes_error = ""
+    try:
+        http_get_text(hermes_health_url(config.hermes.base_url), config.hermes.api_key, 1.0)
+        hermes_ok = True
+    except Exception as exc:
+        hermes_ok = False
+        hermes_error = str(exc)[:240]
+    replay = latest_replay(pair)
+    replay_entries = replay_debug_entries(pair, config)
+    replay_last = replay_entries[-1] if replay_entries else None
+    sensor_status = status.get("sensors") if isinstance(status, dict) else None
+    audio_status = status.get("audio") if isinstance(status, dict) else None
     return {
         "ok": True,
         "service": "hermes2stackchan-bridge",
@@ -1554,8 +1954,12 @@ def build_bridge_healthz(
             "mqtt_prefix": pair.mqtt_prefix,
         },
         "stackchan": {
-            "online": stackchan_is_online(pair),
-            "last_seen_age_s": None if age is None else round(age, 3),
+            "online": presence["online"],
+            "last_seen_age_s": presence["last_seen_age_s"],
+            "stale_since_s": presence["stale_since_s"],
+            "last_status_ts": presence["last_status_ts"],
+            "last_skip_reason": presence["last_skip_reason"],
+            "last_skip_ts": presence["last_skip_ts"],
             "status_topic": pair.status_topic,
             "status_available": isinstance(status, dict),
             "status_missing": missing,
@@ -1580,6 +1984,46 @@ def build_bridge_healthz(
             "priorities": ACTION_PRIORITY_RANKS,
             "policy": "safety_and_user_interrupt; other actions queued by priority",
         },
+        "health": {
+            "mqtt": {"ok": True, "host": config.mqtt.host, "port": config.mqtt.port},
+            "hermes": {"ok": hermes_ok, "url": hermes_health_url(config.hermes.base_url), "error": hermes_error},
+            "stt": {"provider": config.speech.provider, "model": config.speech.groq_model, "configured": bool(config.speech.groq_api_key) if config.speech.provider == "groq" else True},
+            "tts": {"engine": config.speech.tts_engine, "voice": pair.voice, "last_replay_available": replay is not None},
+            "camera": {"available": nested_status_value(status, "camera_available") if isinstance(status, dict) else None},
+            "sensors": {
+                "imu_ready": nested_status_value(status, "sensors.imu.ready") if isinstance(status, dict) else None,
+                "ltr553_ready": nested_status_value(status, "sensors.ltr553.ready") if isinstance(status, dict) else None,
+                "status": sensor_status if isinstance(sensor_status, dict) else None,
+            },
+            "audio": audio_status if isinstance(audio_status, dict) else None,
+        },
+        "watchdog": {
+            "enabled": True,
+            "reboot_on_stale": config.watchdog.reboot_on_stale,
+            "stale_timeout_s": config.watchdog.stale_timeout_s,
+            "stale": not presence["online"],
+            "last_seen_age_s": presence["last_seen_age_s"],
+            "stale_since_s": presence["stale_since_s"],
+            "last_status_ts": presence["last_status_ts"],
+            "last_skip_reason": presence["last_skip_reason"],
+            "last_skip_ts": presence["last_skip_ts"],
+        },
+        "replay_buffer": {
+            "available": replay is not None,
+            "last_request_id": replay.get("request_id") if replay else None,
+            "last_ts": replay.get("ts") if replay else None,
+            "debug_count": len(replay_entries),
+            "debug_keep": config.companion.replay_debug_keep,
+            "last_debug_request_id": replay_last.get("request_id") if replay_last else None,
+            "last_debug_source": replay_last.get("source") if replay_last else None,
+            "last_debug_error": replay_last.get("error") if replay_last else None,
+        },
+        "offline_policy": {
+            "skip_actions_when_offline": True,
+            "local_fallback": True,
+            "http_status_when_offline": 503,
+        },
+        "last_errors": recent_bridge_errors(),
     }
 
 
@@ -1753,15 +2197,20 @@ def build_hermes_system_content(
         f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
         f"Your configured wakeword is {pair.wakeword!r}; your configured voice is {pair.voice!r}.",
         "Return JSON only. Do not wrap it in Markdown.",
-        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"display|face|move|motion|led|device|sound|system|reminder\",...}]}",
+        "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"mood_hint\":\"calm|curious|playful|tired|focused|concerned|annoyed|help\",\"actions\":[{\"action\":\"display|face|move|motion|led|device|sound|system|reminder|mood\",...}]}",
         "Answer in German unless the user explicitly asks for another language.",
         "Put the spoken answer only in the top-level reply field. Do not use action say for normal answers, direct messages, reminders, notifications, or command confirmations.",
         "Use display only when you want to show extra visible text beyond reply. The bridge will synthesize reply as audio for StackChan when TTS is enabled.",
         "You may add hardware actions when useful, but never invent unsupported parameters. The bridge and firmware enforce limits.",
         "Keep answers concise for spoken interaction unless the user asks for detail.",
         "Use the companion context before guessing: mood, privacy mode, local capabilities, recent interactions, sensor summary, and status summary are authoritative.",
+        "You may suggest mood_hint or action mood, but the bridge decides final mood. Do not use old gag faces for mood.",
+        "Allowed face base emotions: neutral, calm, friendly, happy, super_happy, thankful, love, curious, playful, focused, concerned, annoyed, help, sad, angry, surprised, tired, confused, scared, listening, thinking, speaking, charging.",
+        "Allowed face transients: soft_blink, blink, breathe, deep_breathe, glance_left, glance_right, glance_up, glance_down, look_left, look_right, look_up, look_down, brow_raise, brow_soft, brow_skeptic, brow_skeptic_left, brow_skeptic_right, brow_wiggle, mouth_smile, mouth_tiny, mouth_wiggle.",
+        "Never use old removed faces such as happy_squint, derp, cross_eyes, surprise_pop, micro_sleep, silent_giggle, smirk_slide, mischievous, smug, or evil_grin. For explicit happy/friendly user requests use friendly or super_happy.",
         "Respect privacy_mode: private means no camera, no Hermes-dependent external enrichment, and minimal retention; focus means avoid proactive chatter.",
         "For normal personality, prefer playful but bounded face/motion choices. Do not stack contradictory actions.",
+        "For playful dance or show-off requests, use a playful/friendly mood and finish with a friendly/playful face. If you turn LEDs on for a dance or temporary effect, also include a later/off cleanup or rely on the bridge cleanup; never leave party/scanner/solid LEDs on indefinitely unless the user explicitly asked to control LEDs.",
         "If your reply asks the user a real follow-up question and you expect an immediate answer, set follow_up_listen to true.",
         "If your reply is only a statement, command confirmation, or rhetorical question, set follow_up_listen to false.",
         "For reminders or notifications, use action reminder with text and delay_s or due_at. Example: {\"action\":\"reminder\",\"text\":\"Wasser trinken\",\"delay_s\":120}.",
@@ -1912,6 +2361,8 @@ def actions_to_topic_payloads(
     messages: list[tuple[str, dict[str, Any]]] = []
     errors: list[str] = []
     skip_actions = skip_actions or set()
+    actions, validation_errors = validate_action_combinations(actions)
+    errors.extend(validation_errors)
     for index, action in enumerate(actions):
         name = ""
         if isinstance(action, dict):
@@ -1919,6 +2370,21 @@ def actions_to_topic_payloads(
             if name in skip_actions:
                 continue
         try:
+            if name in {"mood", "set_mood", "mood_hint"}:
+                if config is None:
+                    raise ConfigError("mood action needs bridge config")
+                mood_value = action.get("mood") or action.get("state") or action.get("mood_hint")
+                intensity_value = action.get("intensity_pct") if action.get("intensity_pct") is not None else action.get("mood_intensity_pct")
+                applied = apply_companion_mood_hint(
+                    config,
+                    pair,
+                    mood_value,
+                    intensity_value,
+                    source="hermes_action",
+                )
+                if applied is None:
+                    raise ConfigError("mood action needs mood")
+                continue
             if name in {"search_image", "image_search", "web_image", "internet_image", "net_image"}:
                 if config is None:
                     raise ConfigError("image_search action needs bridge config")
@@ -1952,10 +2418,61 @@ def actions_to_topic_payloads(
                 audio_action = {"action": "audio", "audio_action": "play_tts_url", "url": tts_url}
                 messages.append(action_to_topic_payload(pair, audio_action, f"{request_id_prefix}-{index:02d}"))
                 continue
+            if name == "audio":
+                audio_action = optional_string(action.get("audio_action") or action.get("command")).strip().lower().replace("-", "_")
+                if audio_action == "replay_last":
+                    replay = latest_replay(pair)
+                    if not replay or not replay.get("tts_url"):
+                        raise ConfigError("no replay audio available")
+                    messages.append(
+                        action_to_topic_payload(
+                            pair,
+                            {"action": "audio", "audio_action": "play_tts_url", "url": replay["tts_url"]},
+                            f"{request_id_prefix}-{index:02d}",
+                        )
+                    )
+                    continue
             messages.append(action_to_topic_payload(pair, action, f"{request_id_prefix}-{index:02d}"))
         except ConfigError as exc:
             errors.append(str(exc))
     return messages, errors
+
+
+def validate_action_combinations(actions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    clean = [action for action in actions if isinstance(action, dict)]
+    errors: list[str] = []
+    has_motion = any(action_name(action) in {"motion", "motion_profile"} for action in clean)
+    has_display_sleep = any(
+        action_name(action) in {"display_sleep", "system"} and optional_string(action.get("system_action") or action.get("command") or action.get("action")) in {"display_sleep", "system"}
+        for action in clean
+    ) or any(action_name(action) == "device" and action.get("display_sleep") is True for action in clean)
+    has_display_wake = any(
+        action_name(action) in {"display_wake", "system"} and optional_string(action.get("system_action") or action.get("command") or action.get("action")) in {"display_wake", "system"}
+        for action in clean
+    ) or any(action_name(action) == "device" and action.get("display_wake") is True for action in clean)
+    led_modes = [optional_string(action.get("mode")) for action in clean if action_name(action) == "led"]
+    has_led_off = "off" in led_modes
+    has_led_on = any(mode in {"party", "scanner", "solid", "blink", "alarm"} for mode in led_modes)
+    has_sleep_face = any(action_name(action) == "face" and optional_string(action.get("emotion")) in {"sleep", "sleepy", "error", "help"} for action in clean)
+    has_active_face = any(action_name(action) == "face" and optional_string(action.get("emotion")) in {"speaking", "listening"} for action in clean)
+
+    filtered: list[dict[str, Any]] = []
+    for action in clean:
+        name = action_name(action)
+        if has_motion and name == "move":
+            errors.append("move dropped because motion/motion_profile is present")
+            continue
+        if has_display_sleep and has_display_wake and name in {"display_sleep"}:
+            errors.append("display_sleep dropped because display_wake is also present")
+            continue
+        if has_led_off and has_led_on and name == "led" and optional_string(action.get("mode")) == "off":
+            errors.append("led off dropped because an active led mode is also present")
+            continue
+        if has_sleep_face and has_active_face and name == "face" and optional_string(action.get("emotion")) in {"speaking", "listening"}:
+            errors.append("speaking/listening face dropped because sleep/error/help face is present")
+            continue
+        filtered.append(action)
+    return filtered, errors
 
 
 def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -2013,9 +2530,10 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         return pair.display_topic, payload
 
     if name == "face":
+        emotion = normalize_bridge_face_emotion(optional_string(action.get("emotion")) or "neutral")
         payload = with_request_id(
             {
-                "emotion": optional_string(action.get("emotion")) or "neutral",
+                "emotion": emotion,
                 "intensity_pct": parse_int_value(action.get("intensity_pct"), 60, "face.intensity_pct"),
             },
             action_request_id,
@@ -2064,6 +2582,22 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
             payload["segment_ms"] = clamp_int(segment_ms, 0, 4000)
         return pair.motion_topic, with_request_id(payload, action_request_id)
 
+    if name == "motion_profile":
+        profile = optional_string(action.get("profile") or action.get("motion") or action.get("name"))
+        if not profile:
+            raise ConfigError("motion_profile action needs profile")
+        points, default_speed = build_named_motion_profile_points(
+            profile,
+            parse_int_value(action.get("intensity_pct"), 70, "motion_profile.intensity_pct"),
+        )
+        speed_pct = clamp_int(parse_int_value(action.get("speed_pct"), default_speed, "motion_profile.speed_pct"), 1, 100)
+        payload = {
+            "curve": optional_string(action.get("curve")) or "spline",
+            "speed_pct": speed_pct,
+            "points": points,
+        }
+        return pair.motion_topic, with_request_id(payload, action_request_id)
+
     if name == "led":
         payload: dict[str, Any] = {"mode": optional_string(action.get("mode")) or "solid"}
         for key in ("r", "g", "b"):
@@ -2087,6 +2621,9 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         }
         pattern = optional_string(action.get("pattern") or action.get("kind") or action.get("sound"))
         if pattern:
+            pattern = pattern.strip().lower().replace("-", "_")
+            if pattern not in SAFE_SOUND_PATTERNS:
+                raise ConfigError(f"unsupported sound pattern: {pattern}")
             payload["pattern"] = pattern
         if action.get("volume_pct") is not None:
             payload["volume_pct"] = action["volume_pct"]
@@ -2099,7 +2636,9 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
         if not audio_action:
             raise ConfigError("audio action needs audio_action or command")
         audio_action = audio_action.strip().lower().replace("-", "_")
-        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "play_tts_url"}:
+        if audio_action == "stop":
+            audio_action = "stop_playback"
+        if audio_action not in {"start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "play_tts_url", "stop_playback"}:
             raise ConfigError(f"unsupported audio action: {audio_action}")
         payload: dict[str, Any] = {"action": audio_action}
         for key in ("source", "wakeword", "reason"):
@@ -2168,7 +2707,10 @@ class StackChanPresence:
         self.timeout_s = timeout_s
         self._lock = RLock()
         self._last_seen: dict[str, float] = {}
+        self._last_seen_wall: dict[str, float] = {}
         self._last_log: dict[str, str] = {}
+        self._last_skip_reason: dict[str, str] = {}
+        self._last_skip_at: dict[str, float] = {}
 
     def mark_status(self, pair: PairConfig, status: dict[str, Any], *, retained: bool = False) -> None:
         if retained:
@@ -2182,10 +2724,12 @@ class StackChanPresence:
             return
         with self._lock:
             self._last_seen[pair.pair_id] = time.monotonic()
+            self._last_seen_wall[pair.pair_id] = time.time()
 
     def mark_seen(self, pair: PairConfig) -> None:
         with self._lock:
             self._last_seen[pair.pair_id] = time.monotonic()
+            self._last_seen_wall[pair.pair_id] = time.time()
 
     def is_online(self, pair: PairConfig, now_s: float | None = None) -> bool:
         now = time.monotonic() if now_s is None else now_s
@@ -2206,15 +2750,44 @@ class StackChanPresence:
         age_text = "never" if age is None else f"{age:.1f}s"
         message = f"StackChan offline/stale for {age_text}; skipped {reason}"
         with self._lock:
+            self._last_skip_reason[pair.pair_id] = reason
+            self._last_skip_at[pair.pair_id] = time.time()
             if self._last_log.get(pair.pair_id) == message:
                 return
             self._last_log[pair.pair_id] = message
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] {message}", flush=True)
 
+    def snapshot(self, pair: PairConfig, now_s: float | None = None) -> dict[str, Any]:
+        now = time.monotonic() if now_s is None else now_s
+        with self._lock:
+            seen = self._last_seen.get(pair.pair_id)
+            seen_wall = self._last_seen_wall.get(pair.pair_id)
+            skip_reason = self._last_skip_reason.get(pair.pair_id, "")
+            skip_at = self._last_skip_at.get(pair.pair_id)
+        age = None if seen is None else max(0.0, now - seen)
+        online = age is not None and age <= self.timeout_s
+        stale_since_s = None
+        if age is None:
+            stale_since_s = None
+        elif age > self.timeout_s:
+            stale_since_s = round(age - self.timeout_s, 3)
+        return {
+            "online": online,
+            "last_seen_age_s": None if age is None else round(age, 3),
+            "stale_since_s": stale_since_s,
+            "last_status_ts": seen_wall,
+            "last_skip_reason": skip_reason,
+            "last_skip_ts": skip_at,
+            "stale_timeout_s": self.timeout_s,
+        }
+
     def clear(self) -> None:
         with self._lock:
             self._last_seen.clear()
+            self._last_seen_wall.clear()
             self._last_log.clear()
+            self._last_skip_reason.clear()
+            self._last_skip_at.clear()
 
 
 STACKCHAN_PRESENCE = StackChanPresence()
@@ -2579,14 +3152,14 @@ def local_math_reply_from_command(command: str) -> tuple[str, list[dict[str, Any
 def local_random_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
     padded = f" {command} "
     if " wuerfel " in padded or command.startswith("wuerfel") or "wuerfeln" in command:
-        return f"Ich wuerfle {random.randint(1, 6)}.", [{"action": "face", "emotion": "mischievous", "intensity_pct": 62}], ""
+        return f"Ich wuerfle {random.randint(1, 6)}.", [{"action": "face", "emotion": "playful", "intensity_pct": 62}], ""
     if "kopf oder zahl" in command:
-        return f"Ich nehme {random.choice(('Kopf', 'Zahl'))}.", [{"action": "face", "emotion": "mischievous", "intensity_pct": 62}], ""
+        return f"Ich nehme {random.choice(('Kopf', 'Zahl'))}.", [{"action": "face", "emotion": "playful", "intensity_pct": 62}], ""
     if command.startswith(("waehle ", "such dir ", "entscheide ")) and " oder " in command:
         tail = re.sub(r"^(waehle|such dir|entscheide)\s+", "", command).strip()
         options = [part.strip(" .") for part in tail.split(" oder ") if part.strip(" .")]
         if len(options) >= 2:
-            return f"Ich nehme {random.choice(options)}.", [{"action": "face", "emotion": "mischievous", "intensity_pct": 62}], ""
+            return f"Ich nehme {random.choice(options)}.", [{"action": "face", "emotion": "playful", "intensity_pct": 62}], ""
     return None
 
 
@@ -2601,6 +3174,17 @@ def local_identity_reply_from_command(command: str) -> tuple[str, list[dict[str,
             [{"action": "face", "emotion": "friendly", "intensity_pct": 68}],
             "",
         )
+    return None
+
+
+def local_audio_control_reply_from_transcript(text: str, pair: PairConfig) -> tuple[str, list[dict[str, Any]], str] | None:
+    command = strip_spoken_command_prefixes(normalize_spoken_command_text(text))
+    if any(token in f" {command} " for token in (" sag nochmal ", " nochmal ", " wiederhole ", " wiederholen ")):
+        if latest_replay(pair):
+            return "Nochmal.", [{"action": "audio", "audio_action": "replay_last"}], ""
+        return "Ich habe noch nichts zum Wiederholen.", [{"action": "face", "emotion": "question", "intensity_pct": 58}], ""
+    if any(token in f" {command} " for token in (" sei still ", " stopp ", " stop ", " ruhe ", " halt den mund ")):
+        return "Stopp.", [{"action": "audio", "audio_action": "stop"}], ""
     return None
 
 
@@ -2796,7 +3380,7 @@ def direct_status_reply_from_transcript(
         score = status_int_at(status, "sensors.imu.motion_score_pct", 0)
         active = status_bool(nested_status_value(status, "sensors.imu.motion_active")) is True
         if active:
-            return f"Bewegung erkannt, Score {score} Prozent.", [{"action": "face", "emotion": "surprise_pop", "intensity_pct": 75}], ""
+            return f"Bewegung erkannt, Score {score} Prozent.", [{"action": "face", "emotion": "surprised", "intensity_pct": 75}], ""
         return f"Keine starke Bewegung, Score {score} Prozent.", [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
 
     if "sensor" in command or "sensoren" in command:
@@ -2811,6 +3395,91 @@ def direct_status_reply_from_transcript(
         )
         return text, [{"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
 
+    return None
+
+
+def local_face_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    padded = f" {command} "
+    face_words = (
+        " guck ",
+        " gucke ",
+        " gucken ",
+        " schau ",
+        " schaue ",
+        " schauen ",
+        " blick ",
+        " blicke ",
+        " gesicht ",
+        " aussehen ",
+    )
+    if not any(word in padded for word in face_words):
+        return None
+
+    presets: tuple[tuple[tuple[str, ...], str, str, int, str | None], ...] = (
+        (
+            ("super gluecklich", "sehr gluecklich", "mega gluecklich", "ueberfreundlich", "total freundlich"),
+            "Extra freundlich.",
+            "super_happy",
+            92,
+            "playful",
+        ),
+        (
+            ("gluecklich", "happy", "froehlich", "freudig", "laechel", "laecheln", "freundlich", "lieb", "nett"),
+            "So schaue ich freundlich.",
+            "friendly",
+            88,
+            "calm",
+        ),
+        (
+            ("traurig", "bedrueckt", "besorgt"),
+            "Traurig.",
+            "sad",
+            72,
+            "concerned",
+        ),
+        (
+            ("muede", "schlaefrig", "verschlafen"),
+            "Muede.",
+            "tired",
+            70,
+            "tired",
+        ),
+        (
+            ("boese", "wuetend", "sauer", "genervt", "grumpy", "mies"),
+            "Genervt.",
+            "annoyed",
+            74,
+            "annoyed",
+        ),
+        (
+            ("ueberrascht", "erschrocken", "erstaunt"),
+            "Ueberrascht.",
+            "surprised",
+            76,
+            "curious",
+        ),
+        (
+            ("neugierig", "fragend", "frage"),
+            "Neugierig.",
+            "curious",
+            72,
+            "curious",
+        ),
+        (
+            ("normal", "neutral", "ruhig"),
+            "Normal.",
+            "friendly",
+            66,
+            "calm",
+        ),
+    )
+
+    for words, reply, emotion, intensity, mood in presets:
+        if any(word in padded for word in words):
+            actions: list[dict[str, Any]] = [{"action": "face", "emotion": emotion, "intensity_pct": intensity}]
+            if mood:
+                actions.append({"action": "mood", "mood": mood, "intensity_pct": max(58, min(90, intensity - 8))})
+            return reply, actions, ""
     return None
 
 
@@ -2840,6 +3509,10 @@ def direct_local_command_from_transcript(
     ):
         if local_reply:
             return local_reply
+
+    face_reply = local_face_reply_from_command(command)
+    if face_reply:
+        return face_reply
 
     def is_command_phrase(phrase: str) -> bool:
         return command == phrase or command.startswith(f"{phrase} ")
@@ -2946,15 +3619,15 @@ def direct_local_command_from_transcript(
 
     if any(token in f" {command} " for token in ("kopf", "schau", "guck", "blicke")):
         if any(token in f" {command} " for token in (" links ", " nach links ")):
-            return "Links.", [{"action": "move", "direction": "left"}, {"action": "face", "emotion": "glance_left", "intensity_pct": 65}], ""
+            return "Links.", [{"action": "move", "direction": "left"}], ""
         if any(token in f" {command} " for token in (" rechts ", " nach rechts ")):
-            return "Rechts.", [{"action": "move", "direction": "right"}, {"action": "face", "emotion": "glance_right", "intensity_pct": 65}], ""
+            return "Rechts.", [{"action": "move", "direction": "right"}], ""
         if any(token in f" {command} " for token in (" oben ", " hoch ", " nach oben ")):
-            return "Hoch.", [{"action": "move", "pitch_target_pct": 65}, {"action": "face", "emotion": "glance_up", "intensity_pct": 65}], ""
+            return "Hoch.", [{"action": "move", "pitch_target_pct": 65}], ""
         if any(token in f" {command} " for token in (" unten ", " runter ", " nach unten ")):
-            return "Runter.", [{"action": "move", "pitch_target_pct": 25}, {"action": "face", "emotion": "glance_down", "intensity_pct": 65}], ""
+            return "Runter.", [{"action": "move", "pitch_target_pct": 25}], ""
         if any(token in f" {command} " for token in (" mitte ", " gerade ", " grade ", " zentrum ")):
-            return "Mitte.", [{"action": "move", "yaw_target_pct": 0, "pitch_target_pct": DEFAULT_IDLE_PITCH_PCT}, {"action": "face", "emotion": "neutral", "intensity_pct": 60}], ""
+            return "Mitte.", [{"action": "move", "yaw_target_pct": 0, "pitch_target_pct": DEFAULT_IDLE_PITCH_PCT}], ""
 
     status_reply = direct_status_reply_from_transcript(command, status)
     if status_reply:
@@ -3380,11 +4053,22 @@ def status_is_recording(status: dict[str, Any]) -> bool:
 
 
 def status_is_busy(status: dict[str, Any]) -> bool:
-    return (
-        status_is_recording(status)
-        or status_bool(status.get("speaking")) is True
-        or status_bool(nested_status_value(status, "head.motion_active")) is True
-    )
+    return bool(status_busy_reasons(status))
+
+
+def status_busy_reasons(status: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if status_is_recording(status):
+        reasons.append("recording")
+    if status_bool(status.get("speaking")) is True:
+        reasons.append("speaking")
+    if status_bool(nested_status_value(status, "head.motion_active")) is True:
+        reasons.append("motion")
+    return reasons
+
+
+def idle_activity_reasons_from_busy_reasons(reasons: set[str]) -> set[str]:
+    return set(reasons).difference({"motion"})
 
 
 def sensor_status_is_sideways(status: dict[str, Any]) -> bool:
@@ -3476,6 +4160,7 @@ def build_sensor_reaction_actions(
     reasons: list[str] = []
     display_sleeping = status_bool(status.get("display_sleeping")) is True
     recording = status_is_recording(status)
+    speaking = status_bool(status.get("speaking")) is True or status_bool(nested_status_value(status, "audio.playing")) is True
     head_motion_active = status_bool(nested_status_value(status, "head.motion_active")) is True
     source_hint = source_hint.strip().lower()
 
@@ -3491,63 +4176,68 @@ def build_sensor_reaction_actions(
         return actions, reasons
 
     proximity_ready = status_bool(nested_status_value(status, "sensors.ltr553.ready")) is True
-    proximity_delta = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
-    proximity_raw = status_int_at(status, "sensors.ltr553.proximity_raw", 0)
-    proximity_near = status_bool(nested_status_value(status, "sensors.ltr553.near")) is True
-    force_proximity = source_hint == "proximity"
-    near_signal = proximity_ready and (
-        force_proximity
-        or proximity_near
-        or proximity_delta >= SENSOR_PROXIMITY_ON_DELTA
-        or proximity_raw >= SENSOR_PROXIMITY_ON_RAW
-    )
-    clear_signal = (
-        not proximity_near
-        and proximity_delta <= SENSOR_PROXIMITY_OFF_DELTA
-        and proximity_raw <= SENSOR_PROXIMITY_OFF_RAW
-    )
-    if near_signal:
-        if force_proximity:
-            state.proximity_seen_count = max(state.proximity_seen_count, SENSOR_PROXIMITY_STABLE_SAMPLES - 1)
-        state.proximity_seen_count += 1
-        state.proximity_clear_count = 0
-    elif clear_signal:
-        state.proximity_clear_count += 1
+    proximity_quiet = now_s < state.proximity_quiet_until
+    if proximity_quiet:
         state.proximity_seen_count = 0
-
-    if (
-        proximity_ready
-        and not state.proximity_active
-        and state.proximity_seen_count >= SENSOR_PROXIMITY_STABLE_SAMPLES
-        and now_s - state.last_proximity_at >= SENSOR_REACTION_COOLDOWN_S
-    ):
-        current_pitch = status_int_at(status, "head.tilt_pct", DEFAULT_IDLE_PITCH_PCT)
-        if current_pitch <= PITCH_TARGET_MIN_PCT + 4:
-            current_pitch = DEFAULT_IDLE_PITCH_PCT
-        state.proximity_restore_pitch_pct = clamp_int(current_pitch, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT)
-        target_pitch = clamp_int(
-            state.proximity_restore_pitch_pct - SENSOR_PROXIMITY_HEAD_DROP_PCT,
-            PITCH_TARGET_MIN_PCT,
-            PITCH_TARGET_MAX_PCT,
+        state.proximity_clear_count = 0
+    else:
+        proximity_delta = status_int_at(status, "sensors.ltr553.proximity_delta", 0)
+        proximity_raw = status_int_at(status, "sensors.ltr553.proximity_raw", 0)
+        proximity_near = status_bool(nested_status_value(status, "sensors.ltr553.near")) is True
+        force_proximity = source_hint == "proximity"
+        near_signal = proximity_ready and (
+            force_proximity
+            or proximity_near
+            or proximity_delta >= SENSOR_PROXIMITY_ON_DELTA
+            or proximity_raw >= SENSOR_PROXIMITY_ON_RAW
         )
-        maybe_wake("proximity")
-        actions.extend([
-            {"action": "face", "emotion": "glance_down", "intensity_pct": 78},
-            {"action": "move", "pitch_target_pct": target_pitch},
-        ])
-        reasons.append("proximity_near")
-        state.proximity_active = True
-        state.last_proximity_at = now_s
+        clear_signal = (
+            not proximity_near
+            and proximity_delta <= SENSOR_PROXIMITY_OFF_DELTA
+            and proximity_raw <= SENSOR_PROXIMITY_OFF_RAW
+        )
+        if near_signal:
+            if force_proximity:
+                state.proximity_seen_count = max(state.proximity_seen_count, SENSOR_PROXIMITY_STABLE_SAMPLES - 1)
+            state.proximity_seen_count += 1
+            state.proximity_clear_count = 0
+        elif clear_signal:
+            state.proximity_clear_count += 1
+            state.proximity_seen_count = 0
 
-    if (
-        state.proximity_active
-        and state.proximity_clear_count >= SENSOR_PROXIMITY_CLEAR_SAMPLES
-        and now_s - state.last_proximity_at >= SENSOR_REACTION_COOLDOWN_S
-    ):
-        actions.append({"action": "move", "pitch_target_pct": state.proximity_restore_pitch_pct})
-        reasons.append("proximity_clear")
-        state.proximity_active = False
-        state.last_proximity_at = now_s
+        if (
+            proximity_ready
+            and not state.proximity_active
+            and state.proximity_seen_count >= SENSOR_PROXIMITY_STABLE_SAMPLES
+            and now_s - state.last_proximity_at >= SENSOR_REACTION_COOLDOWN_S
+        ):
+            current_pitch = status_int_at(status, "head.tilt_pct", DEFAULT_IDLE_PITCH_PCT)
+            if current_pitch <= PITCH_TARGET_MIN_PCT + 4:
+                current_pitch = DEFAULT_IDLE_PITCH_PCT
+            state.proximity_restore_pitch_pct = clamp_int(current_pitch, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT)
+            target_pitch = clamp_int(
+                state.proximity_restore_pitch_pct - SENSOR_PROXIMITY_HEAD_DROP_PCT,
+                PITCH_TARGET_MIN_PCT,
+                PITCH_TARGET_MAX_PCT,
+            )
+            maybe_wake("proximity")
+            actions.extend([
+                {"action": "face", "emotion": "glance_down", "intensity_pct": 78},
+                {"action": "move", "pitch_target_pct": target_pitch},
+            ])
+            reasons.append("proximity_near")
+            state.proximity_active = True
+            state.last_proximity_at = now_s
+
+        if (
+            state.proximity_active
+            and state.proximity_clear_count >= SENSOR_PROXIMITY_CLEAR_SAMPLES
+            and now_s - state.last_proximity_at >= SENSOR_REACTION_COOLDOWN_S
+        ):
+            actions.append({"action": "move", "pitch_target_pct": state.proximity_restore_pitch_pct})
+            reasons.append("proximity_clear")
+            state.proximity_active = False
+            state.last_proximity_at = now_s
 
     imu_ready = status_bool(nested_status_value(status, "sensors.imu.ready")) is True
     motion_score = status_int_at(status, "sensors.imu.motion_score_pct", 0)
@@ -3570,8 +4260,16 @@ def build_sensor_reaction_actions(
         and now_s - state.last_shake_at >= SENSOR_SHAKE_COOLDOWN_S
     ):
         maybe_wake("shake")
-        actions.append({"action": "face", "emotion": "surprise_pop", "intensity_pct": 90})
-        reasons.append("shake")
+        if speaking:
+            actions.extend([
+                {"action": "audio", "audio_action": "stop_playback"},
+                {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
+                {"action": "face", "emotion": "concerned", "intensity_pct": 74},
+            ])
+            reasons.append("shake_stop_tts")
+        else:
+            actions.append({"action": "face", "emotion": "surprised", "intensity_pct": 90})
+            reasons.append("shake")
         state.last_shake_at = now_s
 
     if imu_event:
@@ -3668,6 +4366,21 @@ def pause_life_animation(pair_id: str, seconds: float, reason: str) -> None:
     )
 
 
+def shorten_life_animation_pause(pair_id: str, seconds: float, reason: str) -> None:
+    until = time.monotonic() + max(0.0, seconds)
+    with LIFE_PAUSE_LOCK:
+        current = LIFE_PAUSED_UNTIL.get(pair_id, 0.0)
+        if current <= time.monotonic():
+            return
+        LIFE_PAUSED_UNTIL[pair_id] = min(current, until)
+        remaining = max(0.0, LIFE_PAUSED_UNTIL[pair_id] - time.monotonic())
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge] life animation pause shortened for {pair_id} "
+        f"to {remaining:.1f}s: {reason}",
+        flush=True,
+    )
+
+
 def life_animation_paused(pair_id: str) -> bool:
     with LIFE_PAUSE_LOCK:
         until = LIFE_PAUSED_UNTIL.get(pair_id, 0.0)
@@ -3677,47 +4390,7 @@ def life_animation_paused(pair_id: str) -> bool:
         return True
 
 
-TRANSIENT_FACE_EMOTIONS = {
-    "blink",
-    "soft_blink",
-    "glance_left",
-    "glance_right",
-    "glance_up",
-    "glance_down",
-    "mouth_smile",
-    "mouth_tiny",
-    "mouth_wiggle",
-    "look_left",
-    "look_right",
-    "look_up",
-    "look_down",
-    "brow_raise",
-    "brow_soft",
-    "brow_skeptic",
-    "brow_skeptic_left",
-    "brow_skeptic_right",
-    "brow_wiggle",
-    "breathe",
-    "deep_breathe",
-    "micro_sleep",
-    "question",
-    "wink_left",
-    "wink_right",
-    "surprise_pop",
-    "grumble",
-    "yawn",
-    "happy_squint",
-    "cross_eyes",
-    "eye_swap",
-    "derp",
-    "boing_eyes",
-    "suspicious_squint",
-    "confused_dots",
-    "mouth_pop",
-    "smirk_slide",
-    "silent_giggle",
-    "sleepy_snapback",
-}
+TRANSIENT_FACE_EMOTIONS = set(FACE_TRANSIENT_EMOTIONS)
 
 
 def current_face_action(status: dict[str, Any] | None, default_intensity: int = 60) -> dict[str, Any]:
@@ -4361,35 +5034,70 @@ def build_life_sequence(
         return []
 
     restore = current_face_action(status)
-    mood = restore["emotion"]
-    base_intensity = int(restore["intensity_pct"])
+    companion_mood = normalize_companion_mood(
+        status.get("companion_mood") if isinstance(status, dict) else None,
+        mood_from_face_emotion(restore["emotion"]) or "playful",
+    )
+    mood = {
+        "calm": "calm",
+        "curious": "curious",
+        "playful": "playful",
+        "tired": "tired",
+        "focused": "focused",
+        "concerned": "concerned",
+        "annoyed": "annoyed",
+        "help": "concerned",
+    }[companion_mood]
+    mood_intensity = status.get("companion_mood_intensity_pct") if isinstance(status, dict) else None
+    if isinstance(mood_intensity, int):
+        base_intensity = clamp_int(mood_intensity, 35, 90)
+    else:
+        base_intensity = int(restore["intensity_pct"])
+    if companion_mood in {"focused", "concerned", "help"}:
+        base_intensity = clamp_int(base_intensity - 6, 35, 82)
+    elif companion_mood == "playful":
+        base_intensity = clamp_int(base_intensity + 8, 45, 90)
+    elif companion_mood == "tired":
+        base_intensity = clamp_int(base_intensity - 10, 35, 76)
 
     roll = rng.random()
     variant_name = "template_idle"
-    if roll < 0.34:
+    blink_cutoff = 0.42 if companion_mood in {"focused", "tired", "concerned", "help"} else 0.30 if companion_mood == "playful" else 0.34
+    glance_cutoff = blink_cutoff + (0.24 if companion_mood in {"curious", "playful"} else 0.18)
+    brow_cutoff = glance_cutoff + (0.18 if companion_mood in {"curious", "concerned", "annoyed"} else 0.12)
+    breathe_cutoff = brow_cutoff + (0.20 if companion_mood in {"calm", "tired", "focused"} else 0.11)
+    mouth_cutoff = breathe_cutoff + (0.12 if companion_mood in {"playful", "curious"} else 0.08)
+    breathe_cutoff = min(breathe_cutoff, 0.88)
+    mouth_cutoff = min(max(mouth_cutoff, breathe_cutoff + 0.06), 0.94)
+    if companion_mood in {"focused", "tired", "help"}:
+        small_motion_cutoff = mouth_cutoff
+    else:
+        small_motion_cutoff = min(0.985, mouth_cutoff + (0.09 if companion_mood in {"playful", "curious"} else 0.045))
+    big_motion_cutoff = small_motion_cutoff if companion_mood in {"focused", "tired", "help"} else 0.995 if companion_mood == "playful" else 0.985
+    if roll < blink_cutoff:
         variant_name = "template_blink"
         sequence = [(0, life_face("soft_blink", base_intensity, variant_name))]
-    elif roll < 0.55:
+    elif roll < glance_cutoff:
         variant_name = "template_glance"
         glance = rng.choice(["glance_left", "glance_right", "glance_up", "glance_down"])
         sequence = [
             (0, life_face(glance, base_intensity, variant_name)),
             (rng.choice([760, 920, 1080]), life_face("soft_blink", base_intensity, variant_name)),
         ]
-    elif roll < 0.68:
+    elif roll < brow_cutoff:
         variant_name = "template_brow"
         sequence = [(0, life_face(
             rng.choice(["brow_raise", "brow_soft", "brow_skeptic", "brow_skeptic_right", "brow_wiggle"]),
             base_intensity,
             variant_name,
         ))]
-    elif roll < 0.81:
+    elif roll < breathe_cutoff:
         variant_name = "template_breathe"
         sequence = [(0, life_face(rng.choice(["breathe", "deep_breathe"]), base_intensity, variant_name))]
-    elif roll < 0.91:
+    elif roll < mouth_cutoff:
         variant_name = "template_mouth"
         sequence = [(0, life_face(rng.choice(["mouth_smile", "mouth_tiny", "mouth_wiggle"]), base_intensity, variant_name))]
-    elif roll < 0.98:
+    elif roll < small_motion_cutoff:
         variant_name = "template_small_motion"
         glance, motion = build_subtle_life_motion(rng)
         motion["variant"] = variant_name
@@ -4398,7 +5106,7 @@ def build_life_sequence(
             (760, motion),
             (900, life_face("soft_blink", base_intensity, variant_name)),
         ]
-    else:
+    elif roll < big_motion_cutoff:
         variant_name = "template_big_scan"
         side = rng.choice([-1, 1])
         first_glance = "glance_right" if side > 0 else "glance_left"
@@ -4413,6 +5121,8 @@ def build_life_sequence(
             (900, life_face(second_glance, base_intensity, variant_name)),
             (900, life_face("soft_blink", base_intensity, variant_name)),
         ]
+    else:
+        sequence = [(0, life_face(mood, base_intensity, variant_name))]
 
     sequence = densify_life_sequence(sequence, rng, base_intensity, variant_name)
     if not include_motion:
@@ -4469,18 +5179,57 @@ def transcript_mentions_led_control(transcript: str) -> bool:
     return any(word in f" {command} " for word in (" led ", " leds ", " lampe ", " lampen ", " licht ", " lichter ", " neon "))
 
 
+def transcript_mentions_dance(transcript: str) -> bool:
+    command = f" {normalize_spoken_command_text(transcript)} "
+    return any(
+        word in command
+        for word in (
+            " tanz ",
+            " tanze ",
+            " tanzen ",
+            " getanzt ",
+            " dance ",
+            " dancing ",
+        )
+    )
+
+
+def transcript_mentions_alarm_intent(transcript: str) -> bool:
+    command = f" {normalize_spoken_command_text(transcript)} "
+    return any(
+        word in command
+        for word in (
+            " hilfe ",
+            " help ",
+            " alarm ",
+            " notfall ",
+            " gefahr ",
+            " umgefallen ",
+            " hingefallen ",
+        )
+    )
+
+
 def speech_cleanup_actions(transcript: str, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if transcript_mentions_led_control(transcript):
         return []
-    has_alarm_led = any(
-        action_name(action) == "led"
-        and optional_string(action.get("mode")) in {"alarm", "blink", "party"}
-        for action in actions
-        if isinstance(action, dict)
-    )
-    if has_alarm_led:
-        return []
-    return [{"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0}]
+    if transcript_mentions_alarm_intent(transcript):
+        has_alarm_led = any(
+            action_name(action) == "led"
+            and optional_string(action.get("mode")) in {"alarm", "blink"}
+            for action in actions
+            if isinstance(action, dict)
+        )
+        if has_alarm_led:
+            return []
+    cleanup: list[dict[str, Any]] = [{"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0}]
+    if transcript_mentions_dance(transcript):
+        cleanup.extend(
+            [
+                {"action": "face", "emotion": "playful", "intensity_pct": 72},
+            ]
+        )
+    return cleanup
 
 
 def mqtt_settle_delay_after_publish_s(topic: str, payload: dict[str, Any], pair: PairConfig | None = None) -> float:
@@ -4498,6 +5247,16 @@ def mqtt_settle_delay_after_publish_s(topic: str, payload: dict[str, Any], pair:
         return min(2.6, 0.9 + len(text) / 360.0)
     if topic == pair.motion_topic:
         return life_action_settle_delay_s({"action": "motion", "points": payload.get("points")})
+    return 0.0
+
+
+def motion_publish_pause_s(topic: str, payload: dict[str, Any], pair: PairConfig | None) -> float:
+    if pair is None:
+        return 0.0
+    if topic == pair.motion_topic:
+        return max(1.8, mqtt_settle_delay_after_publish_s(topic, payload, pair) + 1.0)
+    if topic == pair.move_topic:
+        return 2.6
     return 0.0
 
 
@@ -4531,7 +5290,14 @@ def dispatch_mqtt_actions(
         connect_and_start(client, config.mqtt)
         if wait_ack:
             client.subscribe([(pair.ack_topic, 1), (pair.error_topic, 1)])
+        motion_block_until = 0.0
         for topic, payload in action_messages:
+            if topic == pair.face_topic and motion_block_until > time.monotonic():
+                time.sleep(max(0.0, motion_block_until - time.monotonic()))
+            motion_pause = motion_publish_pause_s(topic, payload, pair)
+            if motion_pause > 0:
+                pause_life_animation(pair.pair_id, motion_pause, "motion command")
+                motion_block_until = max(motion_block_until, time.monotonic() + motion_pause)
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "queued"), "source": "cli-dispatch"})
             result = client.publish(topic, body, qos=1, retain=False)
@@ -4591,6 +5357,7 @@ def ask_hermes(args: argparse.Namespace) -> int:
     capabilities = read_optional_text(pair.capabilities_file, config_path)
     personality = read_optional_text(pair.personality_file, config_path)
     response = ask_hermes_http(config, pair, capabilities, personality, status, user_text)
+    apply_hermes_response_mood_hint(config, pair, response)
     actions = ensure_reply_action(response)
     scheduled_reminders: list[dict[str, Any]] = []
     reminder_errors: list[str] = []
@@ -4658,7 +5425,20 @@ def publish_action_messages(
             for topic, payload in action_messages:
                 record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "skipped_offline"), "source": source})
         return
+    motion_block_until = 0.0
     for topic, payload in action_messages:
+        if pair is not None and source == "idle-life" and life_animation_paused(pair.pair_id):
+            print("[bridge] life action skipped: paused before publish", flush=True)
+            return
+        if pair is not None and topic == pair.face_topic and motion_block_until > time.monotonic():
+            time.sleep(max(0.0, motion_block_until - time.monotonic()))
+            if source == "idle-life" and life_animation_paused(pair.pair_id):
+                print("[bridge] life action skipped: paused after motion wait", flush=True)
+                return
+        motion_pause = motion_publish_pause_s(topic, payload, pair)
+        if pair is not None and motion_pause > 0:
+            pause_life_animation(pair.pair_id, motion_pause, "motion command")
+            motion_block_until = max(motion_block_until, time.monotonic() + motion_pause)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if pair is not None and config is not None:
             record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "queued"), "source": source})
@@ -4795,6 +5575,14 @@ def animate_life(args: argparse.Namespace) -> int:
     motion_limiter = LifeMotionLimiter(args.small_motion_gap_s, args.big_motion_gap_s)
 
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        if message.topic in {pair.move_topic, pair.motion_topic}:
+            try:
+                payload = json.loads(message.payload.decode("utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+            pause_s = motion_publish_pause_s(message.topic, payload if isinstance(payload, dict) else {}, pair)
+            pause_life_animation(pair.pair_id, max(1.8, pause_s), "motion command observed")
+            return
         if message.topic != pair.status_topic:
             return
         try:
@@ -4805,11 +5593,19 @@ def animate_life(args: argparse.Namespace) -> int:
             if message_is_retained(message):
                 return
             note_stackchan_status(pair, status)
+            if status_bool(nested_status_value(status, "head.motion_active")):
+                pause_life_animation(pair.pair_id, 1.2, "motion active")
 
     try:
         client.on_message = on_message
         connect_and_start(client, config.mqtt)
-        client.subscribe(pair.status_topic, qos=0)
+        client.subscribe(
+            [
+                (pair.status_topic, 0),
+                (pair.move_topic, 0),
+                (pair.motion_topic, 0),
+            ]
+        )
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] life animation active for {pair.pair_id}", flush=True)
         while True:
             if not stackchan_is_online(pair):
@@ -4823,6 +5619,11 @@ def animate_life(args: argparse.Namespace) -> int:
                 time.sleep(min(1.0, max(0.1, args.min_interval_s)))
                 continue
             status = read_latest_status(config, pair, args.status_timeout)
+            if isinstance(status, dict):
+                companion_state = read_companion_state(config, pair)
+                status = dict(status)
+                status["companion_mood"] = companion_state.get("mood", pair.mood_default)
+                status["companion_mood_intensity_pct"] = companion_state.get("mood_intensity_pct", 60)
             sequence = build_life_sequence(status, rng, include_motion=not args.no_motion)
             if sequence:
                 for delay_ms, action in sequence:
@@ -4830,11 +5631,11 @@ def animate_life(args: argparse.Namespace) -> int:
                         time.sleep(delay_ms / 1000.0)
                     if life_animation_paused(pair.pair_id):
                         break
+                    status = read_latest_status(config, pair, args.status_timeout)
+                    if not status_allows_life_animation(status):
+                        print("[bridge] life action skipped: StackChan is no longer idle on face", flush=True)
+                        break
                     if action_name(action) == "motion":
-                        status = read_latest_status(config, pair, args.status_timeout)
-                        if not status_allows_life_animation(status):
-                            print("[bridge] life motion skipped: StackChan is no longer idle on face", flush=True)
-                            break
                         if not motion_limiter.allow(action):
                             print(
                                 f"[bridge] life motion skipped: {life_motion_size(action)} motion rate limit",
@@ -5114,6 +5915,98 @@ def build_motion_profile_points(args: argparse.Namespace) -> list[dict[str, int]
     raise ConfigError(f"unsupported motion profile: {profile}")
 
 
+def build_named_motion_profile_points(profile: str, intensity_pct: int = 70) -> tuple[list[dict[str, int]], int]:
+    profile = profile.strip().lower().replace("-", "_")
+    intensity = clamp_int(intensity_pct, 0, 100)
+    amp = 0.55 + intensity / 180.0
+
+    def point(yaw: int, pitch: int, duration_ms: int, speed_pct: int, hold_ms: int = 0) -> dict[str, int]:
+        item = {
+            "yaw_pct": clamp_int(yaw, YAW_TARGET_MIN_PCT, YAW_TARGET_MAX_PCT),
+            "pitch_pct": clamp_int(pitch, PITCH_TARGET_MIN_PCT, PITCH_TARGET_MAX_PCT),
+            "duration_ms": clamp_int(duration_ms, 60, 4000),
+            "speed_pct": clamp_int(speed_pct, 1, 100),
+        }
+        if hold_ms:
+            item["hold_ms"] = clamp_int(hold_ms, 0, 4000)
+        return item
+
+    base = DEFAULT_IDLE_PITCH_PCT
+    if profile == "slow_nod":
+        speed = 18
+        return [
+            point(0, base, 380, speed),
+            point(0, round(base + 18 * amp), 760, speed, 120),
+            point(0, round(base - 12 * amp), 820, speed, 100),
+            point(0, base, 720, 14),
+        ], speed
+    if profile == "fast_shake":
+        speed = 64
+        yaw = round(32 * amp)
+        return [
+            point(-yaw, base, 120, speed),
+            point(yaw, base, 130, speed),
+            point(-round(yaw * 0.8), base, 115, speed),
+            point(round(yaw * 0.65), base, 120, speed),
+            point(0, base, 180, 46),
+        ], speed
+    if profile == "curious_look":
+        speed = 22
+        return [
+            point(-28, base + 5, 720, speed, 180),
+            point(18, base + 9, 920, speed, 220),
+            point(0, base, 780, 16),
+        ], speed
+    if profile == "confused_sway":
+        speed = 30
+        return [
+            point(-22, base + 4, 360, speed),
+            point(18, base - 6, 420, speed),
+            point(-12, base + 7, 360, speed),
+            point(12, base - 4, 380, speed),
+            point(0, base, 520, 20),
+        ], speed
+    if profile == "proud_look_up":
+        speed = 16
+        return [
+            point(0, base + 20, 900, speed, 350),
+            point(8, base + 22, 500, speed, 240),
+            point(0, base, 1100, 12),
+        ], speed
+    if profile == "tired_sink":
+        speed = 11
+        return [
+            point(0, base - 8, 1200, speed, 180),
+            point(-4, base - 16, 1400, speed, 500),
+            point(0, base, 1300, 10),
+        ], speed
+    if profile == "rescue_dance":
+        speed = 70
+        return [
+            point(-26, base + 5, 120, speed),
+            point(26, base + 2, 130, speed),
+            point(-18, base + 8, 120, speed),
+            point(18, base + 4, 130, speed),
+            point(0, base + 10, 180, 55, 120),
+            point(0, base, 250, 32),
+        ], speed
+    if profile == "wake_stretch":
+        speed = 24
+        return [
+            point(0, PITCH_TARGET_MIN_PCT + 8, 700, 18, 160),
+            point(-18, base + 12, 760, speed, 120),
+            point(18, base + 15, 780, speed, 120),
+            point(0, base, 820, 18),
+        ], speed
+    if profile == "sleep_pose":
+        speed = 14
+        return [
+            point(0, base - 8, 700, speed),
+            point(0, PITCH_TARGET_MIN_PCT + 4, 1200, speed, 400),
+        ], speed
+    raise ConfigError(f"unsupported motion profile: {profile}")
+
+
 def send_led(args: argparse.Namespace) -> int:
     config = load_config(Path(args.config), Path(args.env))
     pair = get_pair(config, args.pair)
@@ -5379,6 +6272,18 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         if args.verbose:
             print(f"[bridge] fast-touch {event} -> led in {elapsed_ms:.2f}ms", flush=True)
 
+    def publish_audio_control(action: dict[str, Any], event: str) -> None:
+        try:
+            messages, errors = actions_to_topic_payloads(pair, [action], f"touch-audio-{uuid.uuid4().hex[:8]}", config=config)
+            for error in errors:
+                print(f"[bridge] touch audio ignored: {error}", file=sys.stderr, flush=True)
+            publish_action_messages(client, messages, pair, wait=False, config=config, source=f"touch-{event}")
+            if args.verbose:
+                print(f"[bridge] touch {event} audio action: {action}", flush=True)
+        except Exception as exc:
+            record_bridge_error("touch_audio", str(exc))
+            print(f"[bridge] touch audio failed: {exc}", file=sys.stderr, flush=True)
+
     def cancel_pending_off() -> None:
         nonlocal pending_off
         if pending_off is not None:
@@ -5421,6 +6326,8 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
             event = "touch_down"
         elif b'"event":"touch_up"' in raw_payload:
             event = "touch_up"
+        elif b'"event":"touch_tap"' in raw_payload:
+            event = "touch_tap"
         elif b'"event":"recording_started"' in raw_payload:
             event = "recording_started"
         elif b'"event":"recording_stopped"' in raw_payload:
@@ -5449,7 +6356,7 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
                     print(f"[bridge] touch event invalid json topic={message.topic}", flush=True)
                 return
             event = optional_string(data.get("event"))
-            if event not in {"touch_down", "touch_up", "recording_started", "recording_stopped"}:
+            if event not in {"touch_down", "touch_up", "touch_tap", "recording_started", "recording_stopped"}:
                 return
         if event in {"touch_down", "touch_up"} and (
             b'"source":"head_touch_left"' in raw_payload or b'"source":"head_touch_right"' in raw_payload
@@ -5457,9 +6364,18 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
             if args.verbose:
                 print(f"[bridge] fast-touch {event} ignored for side head touch", flush=True)
             return
-        if event == last_event:
+        if event == last_event and event not in {"touch_down", "touch_up", "touch_tap"}:
             return
         last_event = event
+
+        if event == "touch_tap" and b'"source":"display_touch"' in raw_payload:
+            publish_audio_control({"action": "audio", "audio_action": "replay_last"}, event)
+            return
+
+        if event == "touch_down" and b'"source":"display_touch"' in raw_payload:
+            status = read_latest_status(config, pair, timeout_s=0.05)
+            if isinstance(status, dict) and status_bool(status.get("speaking")):
+                publish_audio_control({"action": "audio", "audio_action": "stop"}, event)
 
         if event in {"touch_down", "recording_started", "status_recording_true"}:
             if event == "touch_down":
@@ -5629,6 +6545,19 @@ def watch_sensors(args: argparse.Namespace) -> int:
         if not isinstance(payload, dict):
             return
 
+        if message.topic in {pair.move_topic, pair.motion_topic}:
+            pause_s = motion_publish_pause_s(message.topic, payload, pair)
+            state.proximity_quiet_until = max(state.proximity_quiet_until, time.monotonic() + max(1.2, pause_s))
+            state.proximity_seen_count = 0
+            state.proximity_clear_count = 0
+            if args.verbose:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [bridge] proximity reactions paused after motion command "
+                    f"for {max(1.2, pause_s):.1f}s",
+                    flush=True,
+                )
+            return
+
         if message.topic == pair.events_topic:
             note_stackchan_status(pair, payload)
             if payload.get("event") != "interaction":
@@ -5671,7 +6600,7 @@ def watch_sensors(args: argparse.Namespace) -> int:
     client.on_message = on_message
     try:
         connect_and_start(client, config.mqtt)
-        client.subscribe([(pair.status_topic, 0), (pair.events_topic, 0)])
+        client.subscribe([(pair.status_topic, 0), (pair.events_topic, 0), (pair.move_topic, 0), (pair.motion_topic, 0)])
         print(
             f"[{time.strftime('%H:%M:%S')}] [bridge] sensor watcher active on {pair.status_topic}; "
             "IMU shake/sideways + LTR553 proximity wake/reactions",
@@ -5699,7 +6628,7 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
     last_sleep_sent_at = 0.0
     sleep_sent = False
     display_sleeping = False
-    busy = False
+    busy_reasons: set[str] = set()
     done = Event()
 
     def mark_activity(reason: str, log: bool = True) -> None:
@@ -5710,7 +6639,7 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] idle timer reset: {reason}", flush=True)
 
     def on_message(_client: Any, _userdata: Any, message: Any) -> None:
-        nonlocal display_sleeping, busy, sleep_sent
+        nonlocal display_sleeping, busy_reasons, sleep_sent
         try:
             payload = json.loads(message.payload.decode("utf-8"))
         except json.JSONDecodeError:
@@ -5731,12 +6660,14 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
                     display_sleeping = False
                     mark_activity("display woke")
 
-                is_busy = status_is_busy(payload)
-                if is_busy:
-                    mark_activity("recording/speaking", log=not busy)
-                elif busy:
-                    mark_activity("recording/speaking stopped")
-                busy = is_busy
+                reasons = set(status_busy_reasons(payload))
+                activity_reasons = idle_activity_reasons_from_busy_reasons(reasons)
+                previous_activity_reasons = idle_activity_reasons_from_busy_reasons(busy_reasons)
+                if activity_reasons:
+                    mark_activity("/".join(sorted(activity_reasons)), log=activity_reasons != previous_activity_reasons)
+                elif previous_activity_reasons:
+                    mark_activity(f"{'/'.join(sorted(previous_activity_reasons))} stopped")
+                busy_reasons = reasons
                 return
 
             if message.topic == pair.events_topic:
@@ -5772,7 +6703,7 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
                 now = time.monotonic()
                 should_sleep = (
                     not display_sleeping
-                    and not busy
+                    and not busy_reasons
                     and (now - last_activity_at) >= timeout_s
                     and (not sleep_sent or (now - last_sleep_sent_at) >= retry_s)
                 )
@@ -5797,6 +6728,79 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
             if args.once:
                 done.set()
         return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+
+def watch_watchdog(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    done = Event()
+    last_stale_log_at = 0.0
+    last_reboot_at = 0.0
+    reboot_cooldown_s = max(30.0, float(args.reboot_cooldown_s))
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        if message.topic != pair.status_topic or message_is_retained(message):
+            return
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(status, dict):
+            note_stackchan_status(pair, status)
+
+    client.on_message = on_message
+    connect_and_start(client, config.mqtt)
+    client.subscribe(pair.status_topic, qos=0)
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [bridge] watchdog active for {pair.pair_id}: "
+        f"timeout={config.watchdog.stale_timeout_s:.1f}s reboot_on_stale={config.watchdog.reboot_on_stale}",
+        flush=True,
+    )
+    try:
+        while True:
+            snapshot = STACKCHAN_PRESENCE.snapshot(pair)
+            now = time.time()
+            if not snapshot["online"]:
+                if now - last_stale_log_at >= max(5.0, float(args.log_interval_s)):
+                    last_stale_log_at = now
+                    age = snapshot.get("last_seen_age_s")
+                    age_text = "never" if age is None else f"{float(age):.1f}s"
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [bridge] watchdog stale/offline "
+                        f"pair={pair.pair_id} last_seen={age_text}",
+                        flush=True,
+                    )
+                if config.watchdog.reboot_on_stale and now - last_reboot_at >= reboot_cooldown_s:
+                    last_reboot_at = now
+                    request_id = f"watchdog-reboot-{uuid.uuid4().hex[:10]}"
+                    payload = {"schema_version": SCHEMA_VERSION, "action": "reboot", "request_id": request_id}
+                    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    client.publish(pair.system_topic, body, qos=1, retain=False)
+                    record_telemetry_event(
+                        config,
+                        pair,
+                        {
+                            **action_queue_record(pair, pair.system_topic, payload, "queued"),
+                            "source": "watchdog",
+                            "watchdog_reboot_on_stale": True,
+                        },
+                    )
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [bridge] watchdog sent reboot request_id={request_id}",
+                        flush=True,
+                    )
+                    if args.once:
+                        done.set()
+            elif args.once:
+                done.set()
+            if done.wait(max(0.2, float(args.poll_s))):
+                return 0
     except KeyboardInterrupt:
         return 0
     finally:
@@ -6553,6 +7557,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 image_bytes,
                 content_type,
             )
+            apply_hermes_response_mood_hint(self.server.config, self.server.pair, hermes_response)
             hermes_ms = round((time.monotonic() - hermes_started) * 1000)
             display_text = speech_text_from_hermes_response(hermes_response, "Ich habe das Bild bekommen.")
             actions = ensure_reply_action(hermes_response)
@@ -6622,6 +7627,29 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     "actions_published": len(action_messages),
                 },
             )
+            remember_replay_debug(
+                self.server.config,
+                self.server.pair,
+                {
+                    "source": "photo",
+                    "request_id": request_id,
+                    "route": "hermes",
+                    "prompt": prompt,
+                    "reply": display_text,
+                    "tts_url": tts_url,
+                    "tts_path": tts_path,
+                    "image_bytes": len(image_bytes),
+                    "latencies_ms": {
+                        "status": status_ms,
+                        "hermes": hermes_ms,
+                        "tts": tts_ms,
+                        "mqtt": mqtt_ms,
+                        "total": total_ms,
+                    },
+                    "actions": len(action_messages),
+                    "action_errors": action_errors,
+                },
+            )
             record_telemetry_event(
                 self.server.config,
                 self.server.pair,
@@ -6652,6 +7680,16 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
         except Exception as exc:
+            remember_replay_debug(
+                self.server.config,
+                self.server.pair,
+                {
+                    "source": "photo",
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "image_bytes": length if "length" in locals() else 0,
+                },
+            )
             print(f"[bridge-http] photo error request_id={request_id}: {exc}", flush=True)
             self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
 
@@ -6693,6 +7731,13 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             tts_path = make_tts_wav(spoken_text, self.server.config.speech, f"notify-{request_id}")
             tts_ms = round((time.monotonic() - tts_started) * 1000)
             tts_url = self.public_tts_url(tts_path)
+            remember_last_replay(
+                self.server.pair,
+                reply=spoken_text,
+                tts_url=tts_url,
+                tts_path=tts_path,
+                request_id=request_id,
+            )
             actions = notify_actions_from_payload(payload, display_text, bool(tts_url))
             action_messages, action_errors = actions_to_topic_payloads(
                 self.server.pair,
@@ -6735,6 +7780,26 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     "actions_published": len(action_messages),
                 },
             )
+            remember_replay_debug(
+                self.server.config,
+                self.server.pair,
+                {
+                    "source": "notify",
+                    "request_id": request_id,
+                    "route": "external",
+                    "reply": spoken_text,
+                    "display": display_text,
+                    "tts_url": tts_url,
+                    "tts_path": tts_path,
+                    "latencies_ms": {
+                        "tts": tts_ms,
+                        "mqtt": mqtt_ms,
+                        "total": total_ms,
+                    },
+                    "actions": len(action_messages),
+                    "action_errors": action_errors,
+                },
+            )
             record_telemetry_event(
                 self.server.config,
                 self.server.pair,
@@ -6764,6 +7829,15 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
         except Exception as exc:
+            remember_replay_debug(
+                self.server.config,
+                self.server.pair,
+                {
+                    "source": "notify",
+                    "request_id": request_id,
+                    "error": str(exc),
+                },
+            )
             print(f"[bridge-http] notify error request_id={request_id}: {exc}", flush=True)
             self.send_json(500, {"ok": False, "request_id": request_id, "error": str(exc)})
 
@@ -6906,8 +7980,13 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 status: dict[str, Any] | None = None
                 status_ms = 0
-                direct_command = local_history_reply_from_transcript(transcript, self.server.config, self.server.pair)
+                direct_command = local_audio_control_reply_from_transcript(transcript, self.server.pair)
                 if direct_command:
+                    print(f"[bridge-http] local intent=audio_control request_id={request_id}: hermes=0ms", flush=True)
+                audio_direct = direct_command is not None
+                if direct_command is None:
+                    direct_command = local_history_reply_from_transcript(transcript, self.server.config, self.server.pair)
+                if direct_command and not audio_direct:
                     print(f"[bridge-http] local intent=history request_id={request_id}: hermes=0ms", flush=True)
                 if direct_command is None:
                     direct_command = direct_local_command_from_transcript(transcript)
@@ -6977,7 +8056,9 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                                 status,
                                 transcript,
                             )
+                            apply_hermes_response_mood_hint(self.server.config, self.server.pair, hermes_response)
                         except Exception as exc:
+                            record_bridge_error("hermes", str(exc), request_id=request_id)
                             hermes_response = {
                                 "reply": "Hermes braucht gerade zu lange. Ich bin aber noch da.",
                                 "actions": [{"action": "face", "emotion": "error", "intensity_pct": 62}],
@@ -7036,6 +8117,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 tts_path = ""
                 action_errors.append(f"TTS failed: {exc}")
+                record_bridge_error("tts", str(exc), request_id=request_id)
                 print(f"[bridge-http] TTS fallback request_id={request_id}: {exc}", flush=True)
                 if display_text:
                     publish_action_messages(
@@ -7048,8 +8130,20 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             tts_ms = round((time.monotonic() - tts_started) * 1000) if display_text else 0
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             tts_url = f"http://{host}{tts_path}" if tts_path else ""
+            remember_last_replay(
+                self.server.pair,
+                reply=display_text,
+                tts_url=tts_url,
+                tts_path=tts_path,
+                request_id=request_id,
+            )
             total_ms = round((time.monotonic() - started) * 1000)
             processing_indicator.stop()
+            shorten_life_animation_pause(
+                self.server.pair.pair_id,
+                8.0 if tts_url else 2.0,
+                f"speech response ready {request_id}",
+            )
             print(
                 f"[bridge-http] transcript after {stt_ms}ms via {backend}: {transcript!r}; "
                 f"hermes={hermes_ms}ms status={status_ms}ms actions={action_count} mqtt={mqtt_ms}ms tts={tts_ms}ms "
@@ -7072,6 +8166,34 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     "local": hermes_ms == 0,
                     "follow_up_listen": follow_up_listen,
                     "actions_published": action_count,
+                },
+            )
+            remember_replay_debug(
+                self.server.config,
+                self.server.pair,
+                {
+                    "source": "speech",
+                    "request_id": request_id,
+                    "route": "local" if hermes_ms == 0 else "hermes",
+                    "backend": backend,
+                    "transcript": transcript,
+                    "reply": display_text,
+                    "tts_url": tts_url,
+                    "tts_path": tts_path,
+                    "audio_bytes": len(audio),
+                    "audio_path": str(archive_path) if archive_path else "",
+                    "latencies_ms": {
+                        "read": read_ms,
+                        "stt": stt_ms,
+                        "status": status_ms,
+                        "hermes": hermes_ms,
+                        "mqtt": mqtt_ms,
+                        "tts": tts_ms,
+                        "total": total_ms,
+                    },
+                    "actions": action_count,
+                    "action_errors": action_errors,
+                    "follow_up_listen": follow_up_listen,
                 },
             )
             record_telemetry_event(
@@ -7111,6 +8233,18 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             processing_indicator.stop()
             error_text = f"SPRACHBRIDGE FEHLER: {exc}"
+            record_bridge_error("speech", str(exc), request_id=request_id)
+            remember_replay_debug(
+                self.server.config,
+                self.server.pair,
+                {
+                    "source": "speech",
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "audio_bytes": len(audio) if "audio" in locals() else 0,
+                    "audio_path": str(archive_path) if "archive_path" in locals() and archive_path else "",
+                },
+            )
             print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
             try:
                 publish_action_messages(
@@ -7365,6 +8499,20 @@ def run_bridge(args: argparse.Namespace) -> int:
                 once=False,
             ),
         ))
+    if not args.no_watchdog:
+        workers.append((
+            "watchdog",
+            watch_watchdog,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                poll_s=args.watchdog_poll_s,
+                log_interval_s=args.watchdog_log_interval_s,
+                reboot_cooldown_s=args.watchdog_reboot_cooldown_s,
+                once=False,
+            ),
+        ))
     if not args.no_info:
         workers.append((
             "info-mode",
@@ -7485,7 +8633,7 @@ def build_parser() -> argparse.ArgumentParser:
     face.add_argument(
         "--emotion",
         default="neutral",
-        help="neutral, friendly, happy, super_happy, thinking, mischievous, panic, help, speaking, error, etc.",
+        help="neutral, friendly, happy, super_happy, thinking, curious, playful, concerned, help, speaking, etc.",
     )
     face.add_argument("--intensity-pct", type=int, default=60, help="Expression intensity 0..100.")
     face.set_defaults(func=send_face)
@@ -7553,7 +8701,7 @@ def build_parser() -> argparse.ArgumentParser:
     audio.add_argument(
         "--action",
         required=True,
-        choices=["start_recording", "stop_recording", "set_wakeword", "simulate_wakeword"],
+        choices=["start_recording", "stop_recording", "set_wakeword", "simulate_wakeword", "stop_playback", "stop"],
         help="Audio-control action to send.",
     )
     audio.add_argument("--source", default=None, help="Recording source, for example wakeword, push_to_talk, or manual.")
@@ -7624,6 +8772,37 @@ def build_parser() -> argparse.ArgumentParser:
     healthz_parser.add_argument("--timeout", type=float, default=0.3, help="Retained status wait timeout in seconds.")
     healthz_parser.add_argument("--no-status", action="store_true", help="Do not read retained StackChan status.")
     healthz_parser.set_defaults(func=healthz_cli)
+
+    watchdog_parser = subcommands.add_parser("watchdog-status", help="Print StackChan online/stale watchdog state.")
+    watchdog_parser.add_argument("--pair", default="desk", help="Pair id to read.")
+    watchdog_parser.add_argument("--timeout", type=float, default=0.4, help="Optional retained status wait timeout.")
+    watchdog_parser.add_argument("--refresh", action="store_true", help="Deprecated: retained status refresh is now the default.")
+    watchdog_parser.add_argument("--no-refresh", action="store_true", help="Only print the current in-process presence snapshot.")
+    watchdog_parser.add_argument("--json", action="store_true", help="Print JSON.")
+    watchdog_parser.set_defaults(func=watchdog_status_cli)
+
+    replay_list = subcommands.add_parser("replay-list", help="List recent replay-debug entries.")
+    replay_list.add_argument("--pair", default="desk", help="Pair id to read.")
+    replay_list.add_argument("--limit", type=int, default=10, help="Number of entries.")
+    replay_list.add_argument("--json", action="store_true", help="Print JSON.")
+    replay_list.set_defaults(func=replay_list_cli)
+
+    replay_show = subcommands.add_parser("replay-show", help="Show one replay-debug entry by request id.")
+    replay_show.add_argument("--pair", default="desk", help="Pair id to read.")
+    replay_show.add_argument("--request-id", required=True, help="Request id to show.")
+    replay_show.set_defaults(func=replay_show_cli)
+
+    replay_last = subcommands.add_parser("replay-last", help="Show the latest replay-debug entry.")
+    replay_last.add_argument("--pair", default="desk", help="Pair id to read.")
+    replay_last.set_defaults(func=replay_last_cli)
+
+    watchdog_watch = subcommands.add_parser("watch-watchdog", help="Monitor live StackChan status and optionally reboot on stale.")
+    watchdog_watch.add_argument("--pair", default="desk", help="Pair id to watch.")
+    watchdog_watch.add_argument("--poll-s", type=float, default=1.0, help="Polling interval in seconds.")
+    watchdog_watch.add_argument("--log-interval-s", type=float, default=15.0, help="Minimum seconds between stale log lines.")
+    watchdog_watch.add_argument("--reboot-cooldown-s", type=float, default=120.0, help="Minimum seconds between optional stale reboot attempts.")
+    watchdog_watch.add_argument("--once", action="store_true", help="Exit after the first online or reboot decision.")
+    watchdog_watch.set_defaults(func=watch_watchdog)
 
     hermes_health_parser = subcommands.add_parser("hermes-health", help="Check the configured Hermes HTTP health endpoint.")
     hermes_health_parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds.")
@@ -7743,6 +8922,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-sensors", action="store_true", help="Disable IMU/LTR553 sensor reactions.")
     run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
     run.add_argument("--no-settings", action="store_true", help="Disable retained device settings restore worker.")
+    run.add_argument("--no-watchdog", action="store_true", help="Disable live stale/offline watchdog logging/recovery worker.")
     run.add_argument("--no-info", action="store_true", help="Disable sticky info-mode minute refresh worker.")
     run.add_argument("--no-idle-sleep", action="store_true", help="Disable automatic display sleep after quiet idle timeout.")
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
@@ -7759,6 +8939,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--settings-timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
     run.add_argument("--settings-display-wake", action="store_true", help="Also wake display when restoring retained settings.")
     run.add_argument("--settings-reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
+    run.add_argument("--watchdog-poll-s", type=float, default=1.0, help="Watchdog live-status polling interval.")
+    run.add_argument("--watchdog-log-interval-s", type=float, default=15.0, help="Minimum seconds between stale watchdog log lines.")
+    run.add_argument("--watchdog-reboot-cooldown-s", type=float, default=120.0, help="Minimum seconds between optional stale reboot attempts.")
     run.add_argument("--info-interval-s", type=float, default=2.0, help="Info-mode refresh check interval.")
     run.add_argument("--idle-sleep-timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
     run.add_argument("--idle-sleep-poll-s", type=float, default=1.0, help="Idle sleep check interval.")

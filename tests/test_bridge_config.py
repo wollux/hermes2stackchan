@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bridge.hermes2stackchan_bridge import (
     ConfigError,
     action_to_topic_payload,
+    actions_to_topic_payloads,
+    apply_hermes_response_mood_hint,
     battery_snapshot,
     bridge_base_url_from_audio_url,
     build_display_payload,
@@ -24,6 +26,7 @@ from bridge.hermes2stackchan_bridge import (
     build_life_sequence,
     build_multipart_form_data,
     build_motion_profile_points,
+    build_named_motion_profile_points,
     build_restore_device_payload,
     build_device_settings_snapshot,
     build_power_change_actions,
@@ -51,6 +54,7 @@ from bridge.hermes2stackchan_bridge import (
     mqtt_settle_delay_after_publish_s,
     notify_actions_from_payload,
     notify_text_from_payload,
+    normalize_companion_mood,
     normalize_motion_points,
     pending_reminders,
     reminder_actions,
@@ -64,10 +68,17 @@ from bridge.hermes2stackchan_bridge import (
     build_hermes_messages,
     build_hermes_vision_messages,
     build_bridge_healthz,
+    latest_replay,
+    remember_replay_debug,
+    remember_last_replay,
+    replay_debug_entries,
+    replay_debug_last,
+    validate_action_combinations,
     build_hermes_context_package,
     image_data_url,
     image_result_aspect_score,
     image_search_queries,
+    idle_activity_reasons_from_busy_reasons,
     command_counts_as_idle_activity,
     current_face_action,
     request_id_counts_as_idle_activity,
@@ -82,6 +93,8 @@ from bridge.hermes2stackchan_bridge import (
     waiting_animation_delay_s,
     privacy_policy_for_mode,
     record_interaction_event,
+    read_companion_state,
+    write_companion_pair_state,
     local_history_reply_from_transcript,
     speech_cleanup_actions,
     transcript_mentions_led_control,
@@ -156,6 +169,60 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(context["privacy"]["mode"], "normal")
         self.assertIn("time_date_weekday_calendar_week", context["local_capabilities"])
         self.assertEqual(context["status_summary"]["battery_pct"], 82)
+        self.assertIn("concerned", context["mood"]["allowed"])
+
+    def test_companion_mood_migration_and_hermes_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_store = Path(tmp) / "state.json"
+            state_store.write_text(
+                json.dumps({"schema_version": "1.0", "pairs": {"desk": {"mood": "worried"}}}),
+                encoding="utf-8",
+            )
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(state_store)},
+            )
+            pair = config.pairs["desk"]
+
+            migrated = read_companion_state(config, pair)
+            self.assertEqual(migrated["mood"], "concerned")
+
+            applied = apply_hermes_response_mood_hint(
+                config,
+                pair,
+                {"reply": "Ich passe auf.", "mood_hint": "focused", "mood_intensity_pct": 72},
+            )
+            self.assertEqual(applied, "focused")
+            state = read_companion_state(config, pair)
+            self.assertEqual(state["mood"], "focused")
+            self.assertEqual(state["mood_intensity_pct"], 72)
+
+    def test_mood_action_updates_state_without_mqtt_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json")},
+            )
+            pair = config.pairs["desk"]
+
+            messages, errors = actions_to_topic_payloads(
+                pair,
+                [{"action": "mood", "mood": "concern", "intensity_pct": 68}],
+                "test-mood",
+                config=config,
+            )
+
+            self.assertEqual(messages, [])
+            self.assertEqual(errors, [])
+            state = read_companion_state(config, pair)
+            self.assertEqual(state["mood"], "concerned")
+            self.assertEqual(state["mood_intensity_pct"], 68)
+
+    def test_normalize_companion_mood_unknown_falls_back_to_playful(self) -> None:
+        self.assertEqual(normalize_companion_mood("wat"), "playful")
+        self.assertEqual(normalize_companion_mood("question"), "curious")
 
     def test_hermes_prompt_includes_companion_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,7 +267,160 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["service"], "hermes2stackchan-bridge")
         self.assertIn("companion", payload)
         self.assertIn("queue", payload)
+        self.assertIn("health", payload)
+        self.assertIn("watchdog", payload)
+        self.assertIn("replay_buffer", payload)
+        self.assertIn("offline_policy", payload)
+        self.assertIn("last_errors", payload)
         self.assertEqual(payload["stackchan"]["status_available"], False)
+
+    def test_healthz_payload_exposes_watchdog_presence_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={
+                    "H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json"),
+                    "H2S_WATCHDOG_STALE_TIMEOUT_S": "7",
+                },
+            )
+            pair = config.pairs["desk"]
+            STACKCHAN_PRESENCE.clear()
+            STACKCHAN_PRESENCE.note_skip(pair, "unit-test offline")
+            payload = build_bridge_healthz(config, pair, include_status=False)
+
+        self.assertTrue(payload["watchdog"]["stale"])
+        self.assertEqual(payload["watchdog"]["stale_timeout_s"], 7.0)
+        self.assertEqual(payload["watchdog"]["reboot_on_stale"], False)
+        self.assertEqual(payload["watchdog"]["last_skip_reason"], "unit-test offline")
+        self.assertIn("last_seen_age_s", payload["watchdog"])
+        self.assertIn("stale_since_s", payload["watchdog"])
+        self.assertIn("last_status_ts", payload["stackchan"])
+        self.assertIn("last_skip_ts", payload["stackchan"])
+
+    def test_replay_memory_and_audio_action(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+        remember_last_replay(pair, reply="Hallo", tts_url="http://bridge/stackchan/tts/x.wav", tts_path="/stackchan/tts/x.wav", request_id="r1")
+
+        replay = latest_replay(pair)
+        self.assertIsNotNone(replay)
+        messages, errors = actions_to_topic_payloads(
+            pair,
+            [{"action": "audio", "audio_action": "replay_last"}],
+            "test-replay",
+            config=config,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(messages[0][0], pair.audio_topic)
+        self.assertEqual(messages[0][1]["action"], "play_tts_url")
+        self.assertEqual(messages[0][1]["url"], "http://bridge/stackchan/tts/x.wav")
+
+    def test_replay_debug_buffer_respects_privacy_and_keep_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={
+                    "H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json"),
+                    "H2S_REPLAY_DEBUG_STORE": str(Path(tmp) / "replay.jsonl"),
+                    "H2S_REPLAY_DEBUG_KEEP": "2",
+                },
+            )
+            pair = config.pairs["desk"]
+            remember_replay_debug(
+                config,
+                pair,
+                {
+                    "source": "speech",
+                    "request_id": "debug-r1",
+                    "transcript": "Hallo",
+                    "reply": "Hallo zurueck",
+                    "audio_path": "/tmp/secret.wav",
+                    "tts_path": "/stackchan/tts/secret.wav",
+                },
+            )
+            normal_entry = replay_debug_last(pair, config)
+            self.assertIsNotNone(normal_entry)
+            self.assertEqual(normal_entry["reply"], "Hallo zurueck")
+            self.assertNotIn("audio_path", normal_entry)
+            self.assertNotIn("tts_path", normal_entry)
+
+            write_companion_pair_state(config, pair, {"privacy_mode": "private"})
+            remember_replay_debug(
+                config,
+                pair,
+                {
+                    "source": "speech",
+                    "request_id": "debug-r2",
+                    "transcript": "Privat",
+                    "reply": "Geheim",
+                    "error": "kaputt",
+                    "audio_path": "/tmp/private.wav",
+                },
+            )
+            private_entry = replay_debug_last(pair, config)
+            self.assertEqual(private_entry["privacy_mode"], "private")
+            self.assertEqual(private_entry["error"], "kaputt")
+            self.assertNotIn("transcript", private_entry)
+            self.assertNotIn("reply", private_entry)
+            self.assertNotIn("audio_path", private_entry)
+
+            remember_replay_debug(config, pair, {"source": "speech", "request_id": "debug-r3"})
+            entries = replay_debug_entries(pair, config)
+            self.assertEqual(len(entries), 2)
+            self.assertEqual([entry["request_id"] for entry in entries], ["debug-r2", "debug-r3"])
+
+    def test_motion_profile_action_generates_motion_payload(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        messages, errors = actions_to_topic_payloads(
+            pair,
+            [{"action": "motion_profile", "profile": "fast_shake", "intensity_pct": 80}],
+            "test-motion-profile",
+            config=config,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(messages[0][0], pair.motion_topic)
+        self.assertEqual(messages[0][1]["curve"], "spline")
+        self.assertGreaterEqual(len(messages[0][1]["points"]), 4)
+
+    def test_named_motion_profiles_are_safe(self) -> None:
+        for profile in (
+            "slow_nod",
+            "fast_shake",
+            "curious_look",
+            "confused_sway",
+            "proud_look_up",
+            "tired_sink",
+            "rescue_dance",
+            "wake_stretch",
+            "sleep_pose",
+        ):
+            points, speed = build_named_motion_profile_points(profile, 75)
+            self.assertTrue(points)
+            self.assertGreaterEqual(speed, 1)
+            for point in points:
+                self.assertGreaterEqual(point["yaw_pct"], -100)
+                self.assertLessEqual(point["yaw_pct"], 100)
+                self.assertGreaterEqual(point["pitch_pct"], 0)
+                self.assertLessEqual(point["pitch_pct"], 100)
+
+    def test_action_validation_drops_conflicting_move_and_led_off(self) -> None:
+        actions, errors = validate_action_combinations([
+            {"action": "move", "direction": "left"},
+            {"action": "motion_profile", "profile": "curious_look"},
+            {"action": "led", "mode": "off"},
+            {"action": "led", "mode": "party", "r": 255, "g": 0, "b": 100},
+        ])
+
+        names = [action["action"] for action in actions]
+        self.assertNotIn("move", names)
+        self.assertEqual([action.get("mode") for action in actions if action["action"] == "led"], ["party"])
+        self.assertTrue(errors)
 
     def test_local_history_reply_uses_user_readable_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -399,6 +619,10 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertFalse(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_wake"}))
         self.assertTrue(command_counts_as_idle_activity(pair, pair.display_topic, {"text": "Hallo", "request_id": "notify-123"}))
         self.assertTrue(command_counts_as_idle_activity(pair, pair.system_topic, {"action": "display_wake", "request_id": "reminder-123"}))
+
+    def test_idle_sleep_does_not_count_motion_as_activity(self) -> None:
+        self.assertEqual(idle_activity_reasons_from_busy_reasons({"motion"}), set())
+        self.assertEqual(idle_activity_reasons_from_busy_reasons({"motion", "speaking"}), {"speaking"})
 
     def test_idle_sleep_payload_turns_display_off_only(self) -> None:
         payload = build_idle_sleep_payload("idle-sleep-test")
@@ -760,6 +984,35 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(direct_local_command_from_transcript("Mach ein Foto.")[1][0]["system_action"], "take_photo")
         self.assertEqual(direct_local_command_from_transcript("Piep.")[1][0]["action"], "sound")
 
+    def test_direct_local_face_commands_skip_hermes(self) -> None:
+        happy = direct_local_command_from_transcript("Gluecklich gucken.")
+        self.assertEqual(happy[1][0], {"action": "face", "emotion": "friendly", "intensity_pct": 88})
+        self.assertEqual(happy[1][1]["action"], "mood")
+        self.assertEqual(happy[1][1]["mood"], "calm")
+
+        extra_happy = direct_local_command_from_transcript("Bitte sehr gluecklich schauen.")
+        self.assertEqual(extra_happy[1][0]["emotion"], "super_happy")
+        self.assertEqual(extra_happy[1][1]["mood"], "playful")
+
+        annoyed = direct_local_command_from_transcript("Grumpy Gesicht.")
+        self.assertEqual(annoyed[1][0]["emotion"], "annoyed")
+
+    def test_legacy_face_names_are_mapped_before_mqtt(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        self.assertEqual(
+            action_to_topic_payload(pair, {"action": "face", "emotion": "happy_squint"}, "face-1")[1]["emotion"],
+            "super_happy",
+        )
+        self.assertEqual(
+            action_to_topic_payload(pair, {"action": "face", "emotion": "surprise_pop"}, "face-2")[1]["emotion"],
+            "surprised",
+        )
+        self.assertEqual(
+            action_to_topic_payload(pair, {"action": "face", "emotion": "mischievous"}, "face-3")[1]["emotion"],
+            "playful",
+        )
+
     def test_direct_local_combined_tasks_go_to_hermes(self) -> None:
         self.assertIsNone(direct_local_command_from_transcript("Helligkeit 80 und sag mir das Wetter."))
         self.assertIsNone(direct_local_command_from_transcript("Mach den Bildschirm aus und erinnere mich morgen."))
@@ -881,7 +1134,7 @@ class BridgeConfigTests(unittest.TestCase):
             "recording": False,
             "speaking": False,
             "ui": {"mode": "face"},
-            "face": {"emotion": "cross_eyes", "intensity_pct": 71},
+            "face": {"emotion": "soft_blink", "intensity_pct": 71},
         }
 
         self.assertEqual(current_face_action(status), {"action": "face", "emotion": "neutral", "intensity_pct": 71})
@@ -1061,10 +1314,38 @@ class BridgeConfigTests(unittest.TestCase):
         later_actions, later_reasons = build_sensor_reaction_actions(shake, state, now_s=35.0, source_hint="imu")
 
         self.assertEqual(reasons, ["shake"])
-        self.assertEqual(actions, [{"action": "face", "emotion": "surprise_pop", "intensity_pct": 90}])
+        self.assertEqual(actions, [{"action": "face", "emotion": "surprised", "intensity_pct": 90}])
         self.assertEqual(immediate_actions, [])
         self.assertEqual(later_reasons, ["shake"])
-        self.assertEqual(later_actions[0]["emotion"], "surprise_pop")
+        self.assertEqual(later_actions[0]["emotion"], "surprised")
+
+    def test_sensor_reaction_shake_stops_tts_when_speaking(self) -> None:
+        state = SensorReactionState()
+        shake = self.sensor_status(speaking=True, motion_score_pct=75, motion_active=True)
+
+        actions, reasons = build_sensor_reaction_actions(shake, state, now_s=30.0, source_hint="imu")
+
+        self.assertEqual(reasons, ["shake_stop_tts"])
+        self.assertEqual(
+            actions[0],
+            {"action": "audio", "audio_action": "stop_playback"},
+        )
+        self.assertEqual(actions[1], {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
+        self.assertEqual(actions[2], {"action": "face", "emotion": "concerned", "intensity_pct": 74})
+
+    def test_sensor_reaction_shake_during_servo_motion_is_ignored(self) -> None:
+        state = SensorReactionState()
+        shake = self.sensor_status(
+            speaking=True,
+            motion_score_pct=95,
+            motion_active=True,
+            head_motion_active=True,
+        )
+
+        actions, reasons = build_sensor_reaction_actions(shake, state, now_s=30.0, source_hint="imu")
+
+        self.assertEqual(actions, [])
+        self.assertEqual(reasons, [])
 
     def test_sensor_reaction_sideways_requires_orientation_event(self) -> None:
         state = SensorReactionState()
@@ -1328,7 +1609,7 @@ class BridgeConfigTests(unittest.TestCase):
         for action in left_actions + giggle_actions:
             self.assertNotIn(action["action"], forbidden)
         self.assertTrue(any(action["action"] == "face" for action in left_actions))
-        self.assertTrue(any(action.get("emotion") == "silent_giggle" for action in giggle_actions))
+        self.assertTrue(any(action.get("emotion") == "super_happy" for action in giggle_actions))
 
     def test_head_pet_swipe_uses_side_emotion_without_led_or_audio(self) -> None:
         state = TouchEmotionState()
@@ -1397,6 +1678,27 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(seen), 5)
         self.assertTrue(all(variant.startswith("template_") for variant in seen))
+
+    def test_life_sequence_uses_companion_mood_as_base_face(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+            "companion_mood": "focused",
+            "companion_mood_intensity_pct": 74,
+        }
+
+        emotions = [
+            action["emotion"]
+            for seed in range(250)
+            for _delay, action in build_life_sequence(status, random.Random(seed), include_motion=False)
+            if action["action"] == "face"
+        ]
+
+        self.assertIn("focused", emotions)
+        self.assertNotIn("playful", emotions)
 
     def test_life_sequence_blinks_often(self) -> None:
         status = {

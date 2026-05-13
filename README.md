@@ -19,14 +19,14 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Retained status on `hermes-stackchan/desk/status`.
 - Structured ACK, error, and event topics.
 - Display text/image commands are accepted for compatibility, and `send-info` shows a sticky time/date info mode with a small face.
-- Firmware-rendered Robot Face template moods from `robot-face.html`: dark panel, white eyes/mouth/brows, subtle emotions, calm blink/breathe/glance/mouth transients.
-- Idle life animation from the bridge while StackChan is idle, limited to calm template-compatible face impulses and occasional safe head motion.
-- Automatic idle sleep: after five quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
+- Firmware-rendered Robot Face template moods from `robot-face.html`: black background, white eyes/mouth/brows, subtle mood emotions, calm blink/breathe/glance/mouth transients, and smooth face transitions.
+- Idle life animation from the bridge while StackChan is idle, mood-aware and limited to calm template-compatible face impulses plus occasional safe head motion.
+- Automatic idle sleep: after ten quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
 - Wake on interaction: head touch, display touch, commanded movement, IMU movement, and LTR553 proximity wake the display through the CRT wake animation.
 - Head movement with soft limits and smooth waypoint paths.
-- Expressive motion commands for nodding, shaking, scans, circles, and Hermes-selected motion profiles.
+- Expressive motion commands for nodding, shaking, scans, circles, and bridge-generated named motion profiles such as `slow_nod`, `fast_shake`, `curious_look`, `rescue_dance`, `wake_stretch`, and `sleep_pose`.
 - LED/neon commands and recording-level LED feedback.
-- Speaker volume and local tone test commands.
+- Speaker volume and safe local tone patterns: success, error, question, camera, alarm, and notify.
 - Display brightness, display sleep, display wake, shutdown, reboot, ping, and status commands.
 - Battery and power status in retained MQTT state.
 - Interaction sensor status for BMI270 IMU motion and LTR553 proximity/ambient light.
@@ -35,24 +35,26 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Temperature fields for SoC and servos where available.
 - ES7210 microphone recording.
 - Built-in WakeNet wakeword `Computer`.
-- Push-to-talk from touch.
+- Display touch: hold starts push-to-talk; short tap replays the last TTS answer; tap while speaking requests playback stop.
 - Local voice activity detection: stop after speech plus short silence.
 - HTTP WAV upload from StackChan to the bridge.
 - Groq Whisper STT through the bridge.
 - Local spoken shortcuts before Hermes for simple one-step hardware/status commands like volume, brightness, display on/off, battery, temperature, and sensor questions.
 - Hermes chat call with current StackChan status, capabilities, and personality.
-- V1.0 companion context package for Hermes: pair profile, wakeword, voice, persistent mood, privacy mode, proactivity, status summary, local capabilities, and recent interaction history.
+- V1.0 companion context package for Hermes: pair profile, wakeword, voice, persistent mood (`calm`, `curious`, `playful`, `tired`, `focused`, `concerned`, `annoyed`, `help`), privacy mode, proactivity, status summary, local capabilities, and recent interaction history.
 - Persistent per-pair companion state: mood, mood intensity, privacy mode, and proactivity survive bridge restarts.
 - Mode-based privacy policy: normal/focus/private/demo/debug control text history, audio retention, proactive speech, Hermes access, and camera access.
 - User-readable interaction history and local telemetry JSONL stores outside git.
-- Extended bridge health endpoint `/healthz` plus CLI `healthz`.
+- Extended bridge health endpoint `/healthz` plus CLI `healthz`, including MQTT, StackChan stale/offline, Hermes, STT, TTS, camera, sensors, watchdog policy, replay state, and recent bridge errors.
 - Action priority telemetry for safety, user, conversation, notification, proactive, and idle actions.
 - Visual "Moment..." bridge response: non-local speech requests get a thinking face/heartbeat while Hermes works, without spoken filler.
 - Speech-session cleanup turns LEDs off after normal non-LED voice requests, so a Hermes/weather/action mistake cannot leave a blue lamp stuck.
 - Validated Hermes hardware actions dispatched over MQTT.
 - Edge/Katja German TTS generation.
 - TTS WAV returned to StackChan and played through the speaker.
+- Firmware-side light lip sync: during TTS WAV playback, StackChan derives the mouth opening from the PCM playback level and publishes `audio.playback_level_pct` for debugging.
 - Follow-up listening mode: when Hermes asks a real question, StackChan speaks first and then starts recording again.
+- TTS replay buffer: the bridge remembers the last TTS answer per pair for `sag nochmal` and display tap replay.
 - Bridge image display endpoint: Hermes can send an image URL/base64/data URL and the bridge converts it for the StackChan display.
 - Bridge internet image search: Hermes can ask for `image_search`; the bridge searches Openverse, picks a display-friendly 4:3 result, converts it to JPEG, and shows it on StackChan.
 - Bridge camera upload endpoint: StackChan photos can be posted to Hermes vision and answered through display/TTS/audio.
@@ -257,8 +259,12 @@ H2S_REMINDER_DISPLAY_MS=9000
 H2S_COMPANION_STATE_STORE=~/.hermes/hermes2stackchan/companion_state.json
 H2S_INTERACTION_HISTORY_STORE=~/.hermes/hermes2stackchan/interaction_history.jsonl
 H2S_TELEMETRY_STORE=~/.hermes/hermes2stackchan/telemetry.jsonl
+H2S_REPLAY_DEBUG_STORE=~/.hermes/hermes2stackchan/replay_debug.jsonl
 H2S_HISTORY_KEEP=200
 H2S_TELEMETRY_ENABLED=true
+H2S_WATCHDOG_STALE_TIMEOUT_S=15
+H2S_WATCHDOG_REBOOT_ON_STALE=false
+H2S_REPLAY_DEBUG_KEEP=10
 ```
 
 Install Python package:
@@ -384,8 +390,11 @@ Read status:
 scripts/h2s_bridge.sh read-status --pair desk
 scripts/h2s_bridge.sh status-health --pair desk
 scripts/h2s_bridge.sh healthz --pair desk
+scripts/h2s_bridge.sh watchdog-status --pair desk
 scripts/h2s_bridge.sh read-companion --pair desk --with-status
 scripts/h2s_bridge.sh list-history --pair desk
+scripts/h2s_bridge.sh replay-list --pair desk
+scripts/h2s_bridge.sh replay-last --pair desk
 ```
 
 Set the persistent companion mode:
@@ -414,8 +423,8 @@ scripts/h2s_bridge.sh send-info --pair desk --wait-ack
 Set a face:
 
 ```bash
-scripts/h2s_bridge.sh send-face --pair desk --emotion happy --wait-ack
-scripts/h2s_bridge.sh send-face --pair desk --emotion blink --wait-ack
+scripts/h2s_bridge.sh send-face --pair desk --emotion friendly --wait-ack
+scripts/h2s_bridge.sh send-face --pair desk --emotion soft_blink --wait-ack
 scripts/h2s_bridge.sh send-face --pair desk --emotion deep_breathe --wait-ack
 ```
 
@@ -501,7 +510,7 @@ Expected Hermes JSON shape:
   "reply": "Hallo, ich bin bereit.",
   "follow_up_listen": false,
   "actions": [
-    {"action": "face", "emotion": "happy", "intensity_pct": 70}
+    {"action": "face", "emotion": "friendly", "intensity_pct": 70}
   ]
 }
 ```

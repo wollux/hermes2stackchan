@@ -25,10 +25,16 @@ This is the reproducible V1.0 integration path for one Hermes and one StackChan.
 {
   "reply": "Mache ich.",
   "actions": [
-    {"action": "face", "emotion": "happy", "intensity_pct": 70}
+    {"action": "face", "emotion": "friendly", "intensity_pct": 70}
   ]
 }
 ```
+
+For face actions, use only the current template emotions documented in
+`capabilities/bridge-capabilities-desk.md`. The warm default for happy or
+friendly requests is `friendly`; use `super_happy` only for exaggerated joy.
+Do not use removed legacy faces such as `happy_squint`, `surprise_pop`,
+`mischievous`, `smug`, `derp`, `glitch`, or `dead`.
 
 9. Bridge publishes valid hardware/display actions to MQTT.
 10. Bridge creates TTS for `reply` and returns or sends a `tts_url`.
