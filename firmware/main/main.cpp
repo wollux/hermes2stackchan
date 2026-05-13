@@ -4176,7 +4176,7 @@ void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
     int dx = 0;
     int dy = 0;
     if (std::abs(yaw_delta_pct) > kDeadbandPct) {
-        dx = yaw_delta_pct < 0 ? -11 : 11;
+        dx = yaw_delta_pct < 0 ? 11 : -11;
     }
     if (std::abs(pitch_delta_pct) > kDeadbandPct) {
         dy = pitch_delta_pct > 0 ? -9 : 9;
@@ -4189,17 +4189,6 @@ void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
     g_motion_gaze_dx = dx;
     g_motion_gaze_dy = dy;
     g_motion_gaze_active = true;
-
-    const int64_t now_ms = esp_timer_get_time() / 1000;
-    if (g_display_sleeping ||
-        std::strcmp(g_ui_mode, "display") == 0 ||
-        std::strcmp(g_ui_mode, "image") == 0 ||
-        (now_ms - g_last_motion_gaze_draw_ms) < 80) {
-        return;
-    }
-
-    g_last_motion_gaze_draw_ms = now_ms;
-    render_current_face_pose_no_transition();
 }
 
 void clear_motion_gaze()
@@ -4210,11 +4199,28 @@ void clear_motion_gaze()
     g_motion_gaze_dx = 0;
     g_motion_gaze_dy = 0;
     g_motion_gaze_active = false;
-    g_last_motion_gaze_draw_ms = esp_timer_get_time() / 1000;
-    if (!g_display_sleeping &&
-        std::strcmp(g_ui_mode, "display") != 0 &&
-        std::strcmp(g_ui_mode, "image") != 0) {
-        render_current_face_pose_no_transition();
+    g_last_motion_gaze_draw_ms = 0;
+}
+
+void motion_gaze_task(void*)
+{
+    bool drew_active_gaze = false;
+    while (true) {
+        const bool can_draw = !g_display_sleeping &&
+                              std::strcmp(g_ui_mode, "display") != 0 &&
+                              std::strcmp(g_ui_mode, "image") != 0;
+        if (g_motion_gaze_active && can_draw) {
+            const int64_t now_ms = esp_timer_get_time() / 1000;
+            if ((now_ms - g_last_motion_gaze_draw_ms) >= 120) {
+                g_last_motion_gaze_draw_ms = now_ms;
+                render_current_face_pose_no_transition();
+                drew_active_gaze = true;
+            }
+        } else if (drew_active_gaze && can_draw) {
+            render_current_face_pose_no_transition();
+            drew_active_gaze = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 }
 
@@ -7365,6 +7371,7 @@ extern "C" void app_main()
         xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
+    xTaskCreate(motion_gaze_task, "motion_gaze", 4096, nullptr, 2, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
