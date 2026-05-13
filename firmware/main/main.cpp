@@ -185,14 +185,23 @@ char g_face_emotion[24] = "neutral";
 int g_face_intensity_pct = 60;
 char g_pre_recording_face_emotion[24] = "neutral";
 int g_pre_recording_face_intensity_pct = 60;
+bool g_pre_recording_info_mode = false;
+bool g_pre_tts_info_mode = false;
+bool g_info_mode_active = false;
+char g_info_time[16] = "";
+char g_info_date[24] = "";
+char g_info_weekday[24] = "";
 int g_face_blush_alpha_pct = 0;
 int g_face_hearts_alpha_pct = 0;
 bool g_face_fx_alpha_initialized = false;
 bool g_face_pose_initialized = false;
 volatile int g_motion_gaze_dx = 0;
 volatile int g_motion_gaze_dy = 0;
+volatile int g_motion_gaze_render_dx = 0;
+volatile int g_motion_gaze_render_dy = 0;
 volatile bool g_motion_gaze_active = false;
 volatile uint32_t g_motion_gaze_revision = 0;
+bool g_force_face_redraw = false;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -301,6 +310,7 @@ struct PhotoTaskArgs {
 enum class UiCommandType : uint8_t {
     Display,
     Image,
+    Info,
     Face,
     Say,
 };
@@ -310,6 +320,9 @@ struct UiCommand {
     char text[768];
     char url[256];
     char emotion[24];
+    char info_time[16];
+    char info_date[24];
+    char info_weekday[24];
     int intensity_pct;
     int duration_ms;
     int image_width;
@@ -1300,6 +1313,9 @@ void draw_face_extras();
 void draw_tv_off_animation();
 void draw_tv_on_animation();
 void draw_face(const char* emotion, int intensity_pct);
+void draw_info_screen(const char* time_text, const char* date_text, const char* weekday_text);
+void copy_cstr(char* destination, size_t destination_len, const char* source);
+void copy_display_text(char* destination, size_t destination_len, const char* source);
 bool enqueue_motion_command(const MotionCommand& command);
 
 struct FrameGuard {
@@ -1717,11 +1733,7 @@ void draw_thought_bubbles_overlay()
 
 void draw_face_extras()
 {
-    if (g_face_extra_mode == FaceExtraMode::VoiceWaveform) {
-        draw_voice_waveform_overlay();
-    } else if (g_face_extra_mode == FaceExtraMode::ThoughtBubbles) {
-        draw_thought_bubbles_overlay();
-    }
+    // The robot-face template is the single display truth: no extra overlays on the face.
 }
 
 const uint8_t* glyph_for(char raw)
@@ -1924,57 +1936,98 @@ bool str_eq(const char* value, const char* expected)
     return value && expected && std::strcmp(value, expected) == 0;
 }
 
+bool is_transient_face_emotion(const char* emotion);
+
+bool is_robot_template_emotion(const char* emotion)
+{
+    return str_eq(emotion, "neutral") ||
+           str_eq(emotion, "happy") ||
+           str_eq(emotion, "sad") ||
+           str_eq(emotion, "angry") ||
+           str_eq(emotion, "surprised") ||
+           str_eq(emotion, "tired") ||
+           str_eq(emotion, "annoyed") ||
+           str_eq(emotion, "confused") ||
+           str_eq(emotion, "scared") ||
+           str_eq(emotion, "love") ||
+           str_eq(emotion, "dead") ||
+           str_eq(emotion, "glitch");
+}
+
+bool accepts_robot_template_face_command(const char* emotion)
+{
+    if (!emotion || !*emotion) {
+        return true;
+    }
+    if (is_robot_template_emotion(emotion)) {
+        return true;
+    }
+
+    return is_transient_face_emotion(emotion) ||
+           str_eq(emotion, "question") ||
+           str_eq(emotion, "curious") ||
+           str_eq(emotion, "thinking") ||
+           str_eq(emotion, "surprise") ||
+           str_eq(emotion, "sleep") ||
+           str_eq(emotion, "sleepy") ||
+           str_eq(emotion, "bored") ||
+           str_eq(emotion, "grumble") ||
+           str_eq(emotion, "skeptical") ||
+           str_eq(emotion, "offended") ||
+           str_eq(emotion, "friendly") ||
+           str_eq(emotion, "super_happy") ||
+           str_eq(emotion, "thankful") ||
+           str_eq(emotion, "charging") ||
+           str_eq(emotion, "panic") ||
+           str_eq(emotion, "help") ||
+           str_eq(emotion, "face_down") ||
+           str_eq(emotion, "error") ||
+           str_eq(emotion, "battery_low");
+}
+
 const char* normalize_face_emotion(const char* emotion)
 {
     if (!emotion || !*emotion) {
         return "neutral";
     }
 
-    if (str_eq(emotion, "question") || str_eq(emotion, "curious")) {
+    if (is_robot_template_emotion(emotion)) {
+        return emotion;
+    }
+
+    if (str_eq(emotion, "question") ||
+        str_eq(emotion, "curious") ||
+        str_eq(emotion, "thinking")) {
         return "confused";
     }
     if (str_eq(emotion, "surprise")) {
         return "surprised";
     }
-    if (str_eq(emotion, "sleep")) {
-        return "sleepy";
+    if (str_eq(emotion, "sleep") ||
+        str_eq(emotion, "sleepy") ||
+        str_eq(emotion, "bored") ||
+        str_eq(emotion, "micro_sleep") ||
+        str_eq(emotion, "yawn")) {
+        return "tired";
     }
-    if (str_eq(emotion, "grumble") || str_eq(emotion, "grumble_mouth")) {
+    if (str_eq(emotion, "grumble") ||
+        str_eq(emotion, "grumble_mouth") ||
+        str_eq(emotion, "skeptical") ||
+        str_eq(emotion, "offended")) {
         return "annoyed";
     }
-    if (str_eq(emotion, "mouth_smile") || str_eq(emotion, "tiny_laugh")) {
-        return "friendly";
+    if (str_eq(emotion, "friendly") ||
+        str_eq(emotion, "super_happy") ||
+        str_eq(emotion, "thankful") ||
+        str_eq(emotion, "charging")) {
+        return "happy";
     }
-    if (str_eq(emotion, "mouth_tiny")) {
-        return "shy";
-    }
-    if (str_eq(emotion, "look_up_think")) {
-        return "thinking";
-    }
-    if (str_eq(emotion, "look_down_table") || str_eq(emotion, "bored_sigh")) {
-        return "bored";
-    }
-    if (str_eq(emotion, "blink")) {
-        return "soft_blink";
-    }
-
-    static const char* known[] = {
-        "neutral", "happy", "sad", "angry", "surprised", "tired", "annoyed", "confused",
-        "scared", "love", "dead", "glitch", "super_happy", "friendly", "mischievous",
-        "smug", "proud", "shy", "skeptical", "offended", "panic", "dramatic",
-        "evil_grin", "sleepy", "bored", "thinking", "listening", "speaking",
-        "charging", "battery", "battery_low", "error", "face_down", "help", "thankful",
-        "soft_blink", "wink", "wink_left", "wink_right", "glance_left", "glance_right",
-        "glance_up", "glance_down", "look_left", "look_right", "look_up", "look_down",
-        "breathe", "deep_breathe", "micro_sleep", "surprise_pop", "happy_squint",
-        "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint",
-        "confused_dots", "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
-        "mouth_wiggle", "yawn",
-    };
-    for (const char* known_emotion : known) {
-        if (str_eq(emotion, known_emotion)) {
-            return known_emotion;
-        }
+    if (str_eq(emotion, "panic") ||
+        str_eq(emotion, "help") ||
+        str_eq(emotion, "face_down") ||
+        str_eq(emotion, "error") ||
+        str_eq(emotion, "battery_low")) {
+        return "scared";
     }
     return "neutral";
 }
@@ -1989,38 +2042,27 @@ void copy_face_emotion(const char* emotion, int intensity_pct)
 
 bool is_transient_face_emotion(const char* emotion)
 {
-    return std::strcmp(emotion, "blink") == 0 ||
-           std::strcmp(emotion, "soft_blink") == 0 ||
-           std::strcmp(emotion, "glance_left") == 0 ||
-           std::strcmp(emotion, "glance_right") == 0 ||
-           std::strcmp(emotion, "glance_up") == 0 ||
-           std::strcmp(emotion, "glance_down") == 0 ||
-           std::strcmp(emotion, "mouth_smile") == 0 ||
-           std::strcmp(emotion, "mouth_tiny") == 0 ||
-           std::strcmp(emotion, "mouth_wiggle") == 0 ||
-           std::strcmp(emotion, "look_left") == 0 ||
-           std::strcmp(emotion, "look_right") == 0 ||
-           std::strcmp(emotion, "look_up") == 0 ||
-           std::strcmp(emotion, "look_down") == 0 ||
-           std::strcmp(emotion, "breathe") == 0 ||
-           std::strcmp(emotion, "deep_breathe") == 0 ||
-           std::strcmp(emotion, "micro_sleep") == 0 ||
-           std::strcmp(emotion, "wink_left") == 0 ||
-	           std::strcmp(emotion, "wink_right") == 0 ||
-	           std::strcmp(emotion, "surprise_pop") == 0 ||
-	           std::strcmp(emotion, "grumble") == 0 ||
-	           std::strcmp(emotion, "yawn") == 0 ||
-	           std::strcmp(emotion, "happy_squint") == 0 ||
-	           std::strcmp(emotion, "cross_eyes") == 0 ||
-	           std::strcmp(emotion, "eye_swap") == 0 ||
-	           std::strcmp(emotion, "derp") == 0 ||
-	           std::strcmp(emotion, "boing_eyes") == 0 ||
-	           std::strcmp(emotion, "suspicious_squint") == 0 ||
-	           std::strcmp(emotion, "confused_dots") == 0 ||
-	           std::strcmp(emotion, "mouth_pop") == 0 ||
-	           std::strcmp(emotion, "smirk_slide") == 0 ||
-	           std::strcmp(emotion, "silent_giggle") == 0 ||
-	           std::strcmp(emotion, "sleepy_snapback") == 0;
+    return str_eq(emotion, "blink") ||
+           str_eq(emotion, "soft_blink") ||
+           str_eq(emotion, "breathe") ||
+           str_eq(emotion, "deep_breathe") ||
+           str_eq(emotion, "glance_left") ||
+           str_eq(emotion, "glance_right") ||
+           str_eq(emotion, "glance_up") ||
+           str_eq(emotion, "glance_down") ||
+           str_eq(emotion, "look_left") ||
+           str_eq(emotion, "look_right") ||
+           str_eq(emotion, "look_up") ||
+           str_eq(emotion, "look_down") ||
+           str_eq(emotion, "brow_raise") ||
+           str_eq(emotion, "brow_soft") ||
+           str_eq(emotion, "brow_skeptic") ||
+           str_eq(emotion, "brow_skeptic_left") ||
+           str_eq(emotion, "brow_skeptic_right") ||
+           str_eq(emotion, "brow_wiggle") ||
+           str_eq(emotion, "mouth_smile") ||
+           str_eq(emotion, "mouth_tiny") ||
+           str_eq(emotion, "mouth_wiggle");
 }
 
 void draw_face(const char* emotion, int intensity_pct);
@@ -2587,14 +2629,9 @@ bool build_face_pose(const char* emotion, int intensity_pct, FacePose& pose)
 
 void render_current_face_pose_no_transition()
 {
-    FacePose pose = {};
-    if (build_face_pose(normalize_face_emotion(g_face_emotion),
-                        clamp_int(g_face_intensity_pct, 0, 100),
-                        pose)) {
-        g_face_blush_alpha_pct = pose.blush_alpha;
-        g_face_hearts_alpha_pct = pose.hearts_alpha;
-        render_face_pose(pose);
-    }
+    g_force_face_redraw = true;
+    draw_face(g_face_emotion, g_face_intensity_pct);
+    g_force_face_redraw = false;
 }
 
 void render_face_pose(const FacePose& pose)
@@ -2961,8 +2998,14 @@ bool animate_face_fx_transition(const char* emotion, int intensity_pct)
     return true;
 }
 
+bool animate_template_transient_face(const char* emotion, int intensity_pct);
+
 void animate_transient_face(const char* emotion, int intensity_pct)
 {
+    if (animate_template_transient_face(emotion, intensity_pct)) {
+        return;
+    }
+
     char base_emotion[24] = {};
     std::strncpy(base_emotion, g_face_emotion, sizeof(base_emotion) - 1);
     if (is_transient_face_emotion(base_emotion)) {
@@ -3313,171 +3356,473 @@ void animate_transient_face(const char* emotion, int intensity_pct)
     return_to_base_face(base_emotion, base_intensity);
 }
 
+struct RobotFaceConfig {
+    int eye_open_pct = 100;
+    int eye_size_pct = 100;
+    int pupil_pct = 100;
+    int brow_l[4] = {77, 71, 122, 71};
+    int brow_r[4] = {198, 71, 243, 71};
+    int mouth[6] = {122, 173, 160, 173, 198, 173};
+    bool mouth_o = false;
+    int look_x = 0;
+    int look_y = 0;
+    uint16_t line_color = 0;
+    uint16_t accent_color = 0;
+    bool blush = false;
+    bool sweat = false;
+    bool anger = false;
+    bool dead = false;
+    bool heart = false;
+};
+
+void copy_robot_points(int (&target)[4], int a, int b, int c, int d)
+{
+    target[0] = a;
+    target[1] = b;
+    target[2] = c;
+    target[3] = d;
+}
+
+void copy_robot_mouth(int (&target)[6], int a, int b, int c, int d, int e, int f)
+{
+    target[0] = a;
+    target[1] = b;
+    target[2] = c;
+    target[3] = d;
+    target[4] = e;
+    target[5] = f;
+}
+
+void nudge_robot_brow_y(int (&target)[4], int start_delta, int end_delta)
+{
+    target[1] = clamp_int(target[1] + start_delta, 42, 86);
+    target[3] = clamp_int(target[3] + end_delta, 42, 86);
+}
+
+void apply_robot_brow_pose(RobotFaceConfig& config, int brow_mode, int brow_phase)
+{
+    const int phase = clamp_int(brow_phase, -4, 4);
+    const int amount = std::abs(phase);
+    if (brow_mode == 1) {
+        nudge_robot_brow_y(config.brow_l, -amount * 3, -amount * 2);
+        nudge_robot_brow_y(config.brow_r, -amount * 2, -amount * 3);
+    } else if (brow_mode == 2) {
+        nudge_robot_brow_y(config.brow_l, -amount * 4, -amount * 2);
+        nudge_robot_brow_y(config.brow_r, amount, amount * 2);
+    } else if (brow_mode == 3) {
+        nudge_robot_brow_y(config.brow_l, amount * 2, amount);
+        nudge_robot_brow_y(config.brow_r, -amount * 2, -amount * 4);
+    } else if (brow_mode == 4) {
+        nudge_robot_brow_y(config.brow_l, -amount * 2, -amount);
+        nudge_robot_brow_y(config.brow_r, -amount, -amount * 2);
+    } else if (brow_mode == 5) {
+        const int direction = phase < 0 ? -1 : 1;
+        nudge_robot_brow_y(config.brow_l, -direction * amount * 3, -direction * amount);
+        nudge_robot_brow_y(config.brow_r, direction * amount, direction * amount * 3);
+    }
+}
+
+RobotFaceConfig robot_face_config(const char* emotion, int intensity_pct)
+{
+    RobotFaceConfig config = {};
+    config.line_color = rgb565(245, 248, 250);
+    config.accent_color = config.line_color;
+    const int energy = clamp_int(intensity_pct, 0, 100);
+    const int awake_boost = (energy - 60) / 12;
+    config.eye_open_pct = clamp_int(100 + awake_boost, 82, 118);
+
+    if (str_eq(emotion, "happy")) {
+        config.eye_open_pct = 92;
+        config.eye_size_pct = 103;
+        config.pupil_pct = 95;
+        copy_robot_points(config.brow_l, 77, 66, 122, 62);
+        copy_robot_points(config.brow_r, 198, 62, 243, 66);
+        copy_robot_mouth(config.mouth, 115, 164, 160, 195, 205, 164);
+    } else if (str_eq(emotion, "sad")) {
+        config.eye_open_pct = 84;
+        config.eye_size_pct = 98;
+        config.pupil_pct = 105;
+        copy_robot_points(config.brow_l, 77, 66, 122, 78);
+        copy_robot_points(config.brow_r, 198, 78, 243, 66);
+        copy_robot_mouth(config.mouth, 122, 186, 160, 161, 198, 186);
+        config.look_y = 5;
+    } else if (str_eq(emotion, "angry")) {
+        config.eye_open_pct = 88;
+        config.pupil_pct = 85;
+        copy_robot_points(config.brow_l, 76, 62, 123, 78);
+        copy_robot_points(config.brow_r, 197, 78, 244, 62);
+        copy_robot_mouth(config.mouth, 122, 182, 160, 173, 198, 182);
+    } else if (str_eq(emotion, "surprised")) {
+        config.eye_open_pct = 118;
+        config.eye_size_pct = 108;
+        config.pupil_pct = 65;
+        copy_robot_points(config.brow_l, 77, 55, 122, 55);
+        copy_robot_points(config.brow_r, 198, 55, 243, 55);
+        config.mouth_o = true;
+    } else if (str_eq(emotion, "tired")) {
+        config.eye_open_pct = 58;
+        config.eye_size_pct = 98;
+        copy_robot_points(config.brow_l, 77, 77, 122, 77);
+        copy_robot_points(config.brow_r, 198, 77, 243, 77);
+        copy_robot_mouth(config.mouth, 128, 179, 160, 176, 192, 179);
+        config.look_x = -3;
+        config.look_y = 3;
+    } else if (str_eq(emotion, "annoyed")) {
+        config.eye_open_pct = 64;
+        config.pupil_pct = 90;
+        copy_robot_points(config.brow_l, 77, 68, 122, 69);
+        copy_robot_points(config.brow_r, 198, 68, 243, 66);
+        copy_robot_mouth(config.mouth, 125, 176, 160, 179, 195, 176);
+        config.look_x = 5;
+    } else if (str_eq(emotion, "confused")) {
+        config.eye_open_pct = 96;
+        config.pupil_pct = 95;
+        copy_robot_points(config.brow_l, 77, 58, 122, 72);
+        copy_robot_points(config.brow_r, 198, 76, 243, 62);
+        copy_robot_mouth(config.mouth, 124, 176, 151, 164, 180, 176);
+        config.look_x = -4;
+    } else if (str_eq(emotion, "scared")) {
+        config.eye_open_pct = 116;
+        config.eye_size_pct = 105;
+        config.pupil_pct = 70;
+        copy_robot_points(config.brow_l, 77, 56, 122, 62);
+        copy_robot_points(config.brow_r, 198, 62, 243, 56);
+        copy_robot_mouth(config.mouth, 134, 184, 160, 193, 186, 184);
+        config.look_x = -4;
+        config.sweat = true;
+    } else if (str_eq(emotion, "love")) {
+        config.eye_open_pct = 100;
+        config.eye_size_pct = 102;
+        copy_robot_points(config.brow_l, 77, 59, 122, 59);
+        copy_robot_points(config.brow_r, 198, 59, 243, 59);
+        copy_robot_mouth(config.mouth, 115, 165, 160, 198, 205, 165);
+    } else if (str_eq(emotion, "dead")) {
+        config.eye_open_pct = 62;
+        config.pupil_pct = 80;
+        copy_robot_points(config.brow_l, 77, 77, 122, 77);
+        copy_robot_points(config.brow_r, 198, 77, 243, 77);
+        copy_robot_mouth(config.mouth, 126, 180, 160, 176, 194, 180);
+    } else if (str_eq(emotion, "glitch")) {
+        config.eye_open_pct = 100;
+        config.eye_size_pct = 102;
+        config.pupil_pct = 90;
+        copy_robot_points(config.brow_l, 77, 64, 122, 76);
+        copy_robot_points(config.brow_r, 198, 76, 243, 64);
+        copy_robot_mouth(config.mouth, 122, 178, 160, 168, 198, 178);
+        config.look_x = 4;
+    }
+    return config;
+}
+
+void draw_robot_face_config(RobotFaceConfig config, bool include_motion_gaze)
+{
+    const uint16_t screen = kBlack;
+    int look_x = config.look_x;
+    int look_y = config.look_y;
+    if (include_motion_gaze &&
+        (g_motion_gaze_active ||
+         g_motion_gaze_render_dx != 0 ||
+         g_motion_gaze_render_dy != 0)) {
+        look_x = clamp_int(static_cast<int>(g_motion_gaze_render_dx), -18, 18);
+        look_y = clamp_int(static_cast<int>(g_motion_gaze_render_dy), -14, 14);
+    }
+
+    FaceFrameGuard frame;
+    clear(screen);
+
+    const int left_x = 99;
+    const int right_x = 221;
+    const int eye_y = 109;
+    const int eye_rx = clamp_int(27 * config.eye_size_pct / 100, 16, 36);
+    const int eye_ry = clamp_int(29 * config.eye_open_pct / 100, 4, 40);
+    const int pupil_r = clamp_int(7 * config.pupil_pct / 100, 0, 10);
+
+    if (config.blush) {
+        draw_ellipse(86, 154, 14, 5, rgb565(8, 34, 38));
+        draw_ellipse(234, 154, 14, 5, rgb565(8, 34, 38));
+    }
+
+    draw_line(config.brow_l[0], config.brow_l[1], config.brow_l[2], config.brow_l[3], config.line_color, 5);
+    draw_line(config.brow_r[0], config.brow_r[1], config.brow_r[2], config.brow_r[3], config.line_color, 5);
+
+    draw_ellipse(left_x, eye_y, eye_rx, eye_ry, config.line_color);
+    draw_ellipse(right_x, eye_y, eye_rx, eye_ry, config.line_color);
+    if (pupil_r > 0 && eye_ry > 5) {
+        draw_ellipse(left_x + look_x, eye_y + look_y, pupil_r, pupil_r, screen);
+        draw_ellipse(right_x + look_x, eye_y + look_y, pupil_r, pupil_r, screen);
+    }
+    if (config.heart) {
+        draw_tiny_heart(68, 78, 13, config.line_color);
+        draw_tiny_heart(252, 78, 13, config.line_color);
+    }
+
+    if (config.dead) {
+        draw_line(left_x - 18, eye_y - 18, left_x + 18, eye_y + 18, screen, 6);
+        draw_line(left_x + 18, eye_y - 18, left_x - 18, eye_y + 18, screen, 6);
+        draw_line(right_x - 18, eye_y - 18, right_x + 18, eye_y + 18, screen, 6);
+        draw_line(right_x + 18, eye_y - 18, right_x - 18, eye_y + 18, screen, 6);
+    }
+
+    if (config.mouth_o) {
+        draw_ellipse(160, 173, 20, 24, config.line_color);
+        draw_ellipse(160, 173, 11, 14, screen);
+    } else {
+        draw_quadratic_curve(config.mouth[0], config.mouth[1],
+                             config.mouth[2], config.mouth[3],
+                             config.mouth[4], config.mouth[5],
+                             config.line_color,
+                             6,
+                             30);
+    }
+
+    if (config.sweat) {
+        draw_ellipse(251, 103, 6, 11, rgb565(102, 247, 255));
+    }
+    if (config.anger) {
+        draw_line(256, 54, 275, 41, config.line_color, 5);
+        draw_line(266, 41, 266, 58, config.line_color, 4);
+    }
+}
+
+void draw_robot_face_from_template(const char* emotion, int intensity_pct)
+{
+    draw_robot_face_config(robot_face_config(emotion, intensity_pct), true);
+}
+
+void draw_template_transient_frame(const char* base_emotion,
+                                   int base_intensity,
+                                   int eye_open_pct,
+                                   int eye_size_delta_pct,
+                                   int look_x,
+                                   int look_y,
+                                   int mouth_mode,
+                                   int mouth_shift,
+                                   int brow_mode = 0,
+                                   int brow_phase = 0)
+{
+    RobotFaceConfig config = robot_face_config(base_emotion, base_intensity);
+    if (eye_open_pct >= 0) {
+        config.eye_open_pct = clamp_int(eye_open_pct, 8, 125);
+    }
+    config.eye_size_pct = clamp_int(config.eye_size_pct + eye_size_delta_pct, 90, 112);
+    config.look_x = clamp_int(look_x, -16, 16);
+    config.look_y = clamp_int(look_y, -12, 12);
+    apply_robot_brow_pose(config, brow_mode, brow_phase);
+
+    if (mouth_mode == 1) {
+        copy_robot_mouth(config.mouth, 116, 166 + mouth_shift, 160, 191 + mouth_shift, 204, 166 + mouth_shift);
+    } else if (mouth_mode == 2) {
+        copy_robot_mouth(config.mouth, 136, 176 + mouth_shift, 160, 181 + mouth_shift, 184, 176 + mouth_shift);
+    } else if (mouth_mode == 3) {
+        copy_robot_mouth(config.mouth, 124 + mouth_shift, 176, 160 + mouth_shift, 181, 196 + mouth_shift, 176);
+    }
+
+    draw_robot_face_config(config, false);
+}
+
+bool animate_template_transient_face(const char* emotion, int intensity_pct)
+{
+    if (!is_transient_face_emotion(emotion)) {
+        return false;
+    }
+    if (g_motion_gaze_active) {
+        return true;
+    }
+
+    wake_display_if_needed();
+    copy_ui_mode("face");
+    g_info_mode_active = false;
+    const char* base_emotion = normalize_face_emotion(g_face_emotion);
+    const int base_intensity = clamp_int(g_face_intensity_pct > 0 ? g_face_intensity_pct : intensity_pct, 35, 90);
+
+    if (str_eq(emotion, "blink") || str_eq(emotion, "soft_blink")) {
+        const int heights[] = {100, 72, 30, 10, 36, 78, 100};
+        for (int height : heights) {
+            draw_template_transient_frame(base_emotion, base_intensity, height, 0, 0, 0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(32));
+        }
+        draw_robot_face_from_template(base_emotion, base_intensity);
+        return true;
+    }
+
+    if (str_eq(emotion, "breathe") || str_eq(emotion, "deep_breathe")) {
+        const bool deep = str_eq(emotion, "deep_breathe");
+        const int phases[] = {0, 1, 2, 3, 2, 1, 0, -1, 0};
+        for (int phase : phases) {
+            draw_template_transient_frame(base_emotion,
+                                          clamp_int(base_intensity + phase, 35, 90),
+                                          clamp_int(100 + phase * (deep ? 3 : 2), 86, 112),
+                                          deep ? phase : phase / 2,
+                                          0,
+                                          phase > 0 ? -1 : 0,
+                                          phase > 1 ? 1 : 0,
+                                          phase);
+            vTaskDelay(pdMS_TO_TICKS(deep ? 110 : 82));
+        }
+        draw_robot_face_from_template(base_emotion, base_intensity);
+        return true;
+    }
+
+    if (str_eq(emotion, "brow_raise") ||
+        str_eq(emotion, "brow_soft") ||
+        str_eq(emotion, "brow_skeptic") ||
+        str_eq(emotion, "brow_skeptic_left") ||
+        str_eq(emotion, "brow_skeptic_right") ||
+        str_eq(emotion, "brow_wiggle")) {
+        int brow_mode = 1;
+        if (str_eq(emotion, "brow_soft")) {
+            brow_mode = 4;
+        } else if (str_eq(emotion, "brow_skeptic") || str_eq(emotion, "brow_skeptic_left")) {
+            brow_mode = 2;
+        } else if (str_eq(emotion, "brow_skeptic_right")) {
+            brow_mode = 3;
+        } else if (str_eq(emotion, "brow_wiggle")) {
+            brow_mode = 5;
+        }
+        const int smooth_phases[] = {0, 1, 2, 3, 2, 1, 0};
+        const int wiggle_phases[] = {0, 1, -1, 2, -2, 1, 0};
+        const int* phases = brow_mode == 5 ? wiggle_phases : smooth_phases;
+        const int phase_count = brow_mode == 5 ? static_cast<int>(sizeof(wiggle_phases) / sizeof(wiggle_phases[0]))
+                                                : static_cast<int>(sizeof(smooth_phases) / sizeof(smooth_phases[0]));
+        for (int i = 0; i < phase_count; ++i) {
+            draw_template_transient_frame(base_emotion,
+                                          base_intensity,
+                                          -1,
+                                          0,
+                                          0,
+                                          0,
+                                          0,
+                                          0,
+                                          brow_mode,
+                                          phases[i]);
+            vTaskDelay(pdMS_TO_TICKS(brow_mode == 5 ? 70 : 90));
+        }
+        draw_robot_face_from_template(base_emotion, base_intensity);
+        return true;
+    }
+
+    int target_x = 0;
+    int target_y = 0;
+    if (str_eq(emotion, "glance_left") || str_eq(emotion, "look_left")) {
+        target_x = -12;
+    } else if (str_eq(emotion, "glance_right") || str_eq(emotion, "look_right")) {
+        target_x = 12;
+    } else if (str_eq(emotion, "glance_up") || str_eq(emotion, "look_up")) {
+        target_y = -9;
+    } else if (str_eq(emotion, "glance_down") || str_eq(emotion, "look_down")) {
+        target_y = 9;
+    }
+    if (target_x != 0 || target_y != 0) {
+        const float phases[] = {0.0f, 0.55f, 1.0f, 1.0f, 0.55f, 0.0f};
+        for (float phase : phases) {
+            draw_template_transient_frame(base_emotion,
+                                          base_intensity,
+                                          -1,
+                                          0,
+                                          static_cast<int>(std::lround(target_x * phase)),
+                                          static_cast<int>(std::lround(target_y * phase)),
+                                          0,
+                                          0,
+                                          target_y < 0 ? 1 : target_x < 0 ? 2 : target_x > 0 ? 3 : target_y > 0 ? 4 : 0,
+                                          static_cast<int>(std::lround(2.0f * phase)));
+            vTaskDelay(pdMS_TO_TICKS(95));
+        }
+        draw_robot_face_from_template(base_emotion, base_intensity);
+        return true;
+    }
+
+    if (str_eq(emotion, "mouth_smile") || str_eq(emotion, "mouth_tiny") || str_eq(emotion, "mouth_wiggle")) {
+        const int mode = str_eq(emotion, "mouth_smile") ? 1 : str_eq(emotion, "mouth_tiny") ? 2 : 3;
+        const int shifts[] = {0, 2, -1, 1, 0};
+        for (int shift : shifts) {
+            draw_template_transient_frame(base_emotion, base_intensity, -1, 0, 0, 0, mode, shift);
+            vTaskDelay(pdMS_TO_TICKS(90));
+        }
+        draw_robot_face_from_template(base_emotion, base_intensity);
+        return true;
+    }
+
+    return false;
+}
+
+void draw_info_mini_face()
+{
+    const uint16_t line = rgb565(245, 248, 250);
+    const uint16_t cutout = kBlack;
+    const int ox = 232;
+    const int oy = 158;
+
+    draw_ellipse(ox + 30, oy + 30, 8, 13, line);
+    draw_ellipse(ox + 66, oy + 30, 8, 13, line);
+    draw_ellipse(ox + 30, oy + 31, 3, 5, cutout);
+    draw_ellipse(ox + 66, oy + 31, 3, 5, cutout);
+    draw_line(ox + 18, oy + 12, ox + 40, oy + 10, line, 2);
+    draw_line(ox + 56, oy + 10, ox + 78, oy + 12, line, 2);
+    draw_quadratic_curve(ox + 34, oy + 66, ox + 48, oy + 76, ox + 62, oy + 66, line, 3, 16);
+}
+
+void draw_info_screen(const char* time_text, const char* date_text, const char* weekday_text)
+{
+    char clean_time[sizeof(g_info_time)] = {};
+    char clean_date[sizeof(g_info_date)] = {};
+    char clean_weekday[sizeof(g_info_weekday)] = {};
+    copy_display_text(clean_time, sizeof(clean_time), time_text && *time_text ? time_text : "--:--");
+    copy_display_text(clean_date, sizeof(clean_date), date_text && *date_text ? date_text : "--.--.----");
+    copy_display_text(clean_weekday, sizeof(clean_weekday), weekday_text && *weekday_text ? weekday_text : "INFO");
+    copy_cstr(g_info_time, sizeof(g_info_time), clean_time);
+    copy_cstr(g_info_date, sizeof(g_info_date), clean_date);
+    copy_cstr(g_info_weekday, sizeof(g_info_weekday), clean_weekday);
+
+    wake_display_if_needed();
+    copy_ui_mode("info");
+    g_info_mode_active = true;
+
+    const uint16_t line = rgb565(245, 248, 250);
+    const uint16_t dim = rgb565(52, 56, 60);
+    FrameGuard frame;
+    clear(kBlack);
+    draw_centered_text(34, g_info_time, 7, line);
+    draw_rect(42, 98, 236, 2, dim);
+    draw_centered_text(122, g_info_weekday, 3, line);
+    draw_centered_text(154, g_info_date, 3, line);
+    draw_info_mini_face();
+}
+
 void draw_face(const char* emotion, int intensity_pct)
 {
+    if (!accepts_robot_template_face_command(emotion)) {
+        ESP_LOGD(kTag, "ignored non-template face emotion: %s", emotion ? emotion : "");
+        return;
+    }
+
     wake_display_if_needed();
-    copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
     const char* target_emotion = normalize_face_emotion(emotion);
     const int target_intensity = clamp_int(intensity_pct, 0, 100);
-    if (!is_transient_face_emotion(target_emotion) &&
-        animate_face_transition(target_emotion, target_intensity)) {
-        copy_face_emotion(target_emotion, target_intensity);
+    if (!g_force_face_redraw &&
+        !g_motion_gaze_active &&
+        g_motion_gaze_render_dx == 0 &&
+        g_motion_gaze_render_dy == 0 &&
+        std::strcmp(g_ui_mode, "face") == 0 &&
+        str_eq(g_face_emotion, target_emotion) &&
+        std::abs(g_face_intensity_pct - target_intensity) < 6) {
         return;
     }
+
+    copy_ui_mode("face");
+    g_info_mode_active = false;
     copy_face_emotion(target_emotion, target_intensity);
-    if (animate_face_fx_transition(g_face_emotion, target_intensity)) {
-        return;
-    }
-    FaceFrameGuard frame;
-
-	    const uint16_t white = rgb565(245, 250, 255);
-	    const uint16_t cyan = rgb565(20, 180, 255);
-	    const uint16_t warm = rgb565(255, 230, 120);
-	    const uint16_t green = rgb565(80, 255, 130);
-	    const uint16_t red = rgb565(255, 55, 70);
-	    const uint16_t face_color = emotion_eye_color(g_face_emotion);
-    const uint16_t accent = std::strcmp(g_face_emotion, "sleep") == 0 ? rgb565(80, 130, 160) : cyan;
-    const int pulse = clamp_int(target_intensity / 18, 0, 6);
-	    const int left_x = 100;
-	    const int right_x = 220;
-	    const int eye_y = 84;
-	    const int mouth_y = 168;
-
-    clear(kBlack);
-
-    if (draw_mood_preset(g_face_emotion, target_intensity)) {
-        return;
-    }
-
-		if (std::strcmp(g_face_emotion, "blink") == 0 ||
-		    std::strcmp(g_face_emotion, "soft_blink") == 0) {
-			draw_designed_eyes(left_x, right_x, eye_y, 18 + pulse, 18 + pulse / 2, 0, 0, face_color);
-			draw_simple_mouth(160, mouth_y, 58, 14, 0, white);
-			return;
-		}
-
-    if (std::strcmp(g_face_emotion, "look_left") == 0 ||
-        std::strcmp(g_face_emotion, "look_right") == 0 ||
-        std::strcmp(g_face_emotion, "look_up") == 0 ||
-        std::strcmp(g_face_emotion, "look_down") == 0) {
-        const int dx = std::strcmp(g_face_emotion, "look_left") == 0 ? -18 :
-                       std::strcmp(g_face_emotion, "look_right") == 0 ? 18 : 0;
-		const int dy = std::strcmp(g_face_emotion, "look_up") == 0 ? -10 :
-		               std::strcmp(g_face_emotion, "look_down") == 0 ? 12 : 0;
-			draw_designed_eyes(left_x, right_x, eye_y,
-			                   18 + pulse, 32 + pulse, dx, dy, face_color);
-			draw_simple_mouth(160 + dx / 5, mouth_y + dy / 4, 68, 18, 0, white);
-			return;
-		}
-
-		if (std::strcmp(g_face_emotion, "sleep") == 0) {
-			draw_flat_eye(left_x, eye_y + 2, 52, -2, accent);
-			draw_flat_eye(right_x, eye_y + 2, 52, 2, accent);
-			draw_simple_mouth(160, mouth_y + 5, 52, 12, 3, white);
-			return;
-		}
-
-		if (std::strcmp(g_face_emotion, "happy") == 0) {
-			draw_happy_eye(left_x, eye_y, 58 + pulse, 20, face_color);
-			draw_happy_eye(right_x, eye_y, 58 + pulse, 20, face_color);
-			draw_simple_mouth(160, mouth_y - 1, 82, 28 + pulse, 1, white);
-			return;
-		}
-
-	    if (std::strcmp(g_face_emotion, "angry") == 0) {
-	        draw_line(left_x - 30, eye_y - 24, left_x + 22, eye_y + 16, face_color, 7);
-	        draw_line(right_x + 30, eye_y - 24, right_x - 22, eye_y + 16, face_color, 7);
-	        draw_line(122, mouth_y + 8, 198, mouth_y + 2, face_color, 5);
-	        return;
-	    }
-
-		if (std::strcmp(g_face_emotion, "sad") == 0) {
-			draw_designed_eyes(left_x, right_x, eye_y + 2, 17, 31 + pulse, 0, 7, face_color);
-			draw_mouth_curve(160, mouth_y + 17, 72, 22, false, white);
-			return;
-		}
-
-		if (std::strcmp(g_face_emotion, "surprised") == 0 || std::strcmp(g_face_emotion, "question") == 0) {
-			if (std::strcmp(g_face_emotion, "question") == 0) {
-				draw_single_eye(left_x, eye_y, 18 + pulse, 34 + pulse, -3, -3, face_color);
-				draw_flat_eye(right_x, eye_y - 1, 56, -6, face_color);
-			} else {
-				draw_designed_eyes(left_x, right_x, eye_y, 27 + pulse, 34 + pulse, 0, 0, face_color);
-			}
-			if (std::strcmp(g_face_emotion, "question") == 0) {
-				draw_simple_mouth(160, mouth_y + 2, 66, 20, 7, white);
-			} else {
-				draw_simple_mouth(160, mouth_y, 62 + pulse, 30 + pulse, 6, white);
-			}
-			return;
-		}
-
-		if (std::strcmp(g_face_emotion, "wink") == 0) {
-			draw_flat_eye(left_x, eye_y, 56, -4, face_color);
-			draw_single_eye(right_x, eye_y, 19 + pulse, 33 + pulse, -2, 0, face_color);
-			draw_simple_mouth(164, mouth_y - 2, 70, 22, 5, white);
-			return;
-		}
-
-		if (std::strcmp(g_face_emotion, "speaking") == 0) {
-			draw_designed_eyes(left_x, right_x, eye_y, 18 + pulse, 32 + pulse, 0, 0, face_color);
-			draw_simple_mouth(160, mouth_y, 68 + pulse * 3, 25 + pulse, 6, accent);
-			return;
-		}
-
-    if (std::strcmp(g_face_emotion, "error") == 0) {
-	        draw_line(left_x - 24, eye_y - 24, left_x + 24, eye_y + 24, red, 6);
-	        draw_line(left_x + 24, eye_y - 24, left_x - 24, eye_y + 24, red, 6);
-	        draw_line(right_x - 24, eye_y - 24, right_x + 24, eye_y + 24, red, 6);
-	        draw_line(right_x + 24, eye_y - 24, right_x - 24, eye_y + 24, red, 6);
-	        draw_mouth_curve(160, mouth_y + 20, 74, 24, false, red);
-	        return;
-	    }
-
-    if (std::strcmp(g_face_emotion, "battery") == 0 ||
-        std::strcmp(g_face_emotion, "charging") == 0 ||
-        std::strcmp(g_face_emotion, "battery_low") == 0) {
-        const uint16_t battery_color = std::strcmp(g_face_emotion, "battery_low") == 0
-                                           ? red
-                                       : std::strcmp(g_face_emotion, "charging") == 0
-                                           ? green
-                                           : warm;
-	        draw_designed_eyes(left_x, right_x, eye_y, 17 + pulse, 31 + pulse, 0, 0, face_color);
-        const int x0 = 112;
-        const int x1 = 204;
-        const int y0 = mouth_y - 16;
-        const int y1 = mouth_y + 16;
-        draw_line(x0, y0, x1, y0, battery_color, 4);
-        draw_line(x0, y1, x1, y1, battery_color, 4);
-        draw_line(x0, y0, x0, y1, battery_color, 4);
-        draw_line(x1, y0, x1, y1, battery_color, 4);
-        draw_line(x1 + 7, mouth_y - 8, x1 + 7, mouth_y + 8, battery_color, 6);
-        if (std::strcmp(g_face_emotion, "charging") == 0) {
-            draw_line(166, mouth_y - 13, 154, mouth_y + 3, white, 4);
-            draw_line(154, mouth_y + 3, 172, mouth_y + 3, white, 4);
-            draw_line(172, mouth_y + 3, 158, mouth_y + 15, white, 4);
-        } else if (std::strcmp(g_face_emotion, "battery_low") == 0) {
-            draw_line(130, mouth_y + 20, 190, mouth_y + 18, red, 4);
-        } else {
-            for (int x = 124; x <= 184; x += 10) {
-                draw_line(x, mouth_y - 8, x, mouth_y + 8, green, 6);
-            }
-        }
-        return;
-    }
-
-		draw_designed_eyes(left_x, right_x, eye_y, 18 + pulse, 32 + pulse, 0, 0, face_color);
-		draw_simple_mouth(160, mouth_y, 68, 18, 0, white);
-	}
+    draw_robot_face_from_template(g_face_emotion, g_face_intensity_pct);
+}
 
 void display_boot()
 {
-    draw_wrapped_message("HERMES2STACKCHAN", "MQTT DISPLAY READY", rgb565(0, 220, 230));
+    draw_face("neutral", 65);
 }
 
 void display_error(const char* message)
 {
-    draw_wrapped_message("ERROR", message, rgb565(255, 50, 50));
+    ESP_LOGE(kTag, "display error: %s", message ? message : "");
+    draw_face("scared", 75);
 }
 
 void save_device_settings()
@@ -4185,7 +4530,9 @@ void set_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct, bool
     int dx = 0;
     int dy = 0;
     if (std::abs(yaw_delta_pct) > kDeadbandPct) {
-        dx = yaw_delta_pct < 0 ? 16 : -16;
+        // Yaw servo sign is device-centric; the face must read correctly
+        // from the human looking at the display.
+        dx = yaw_delta_pct > 0 ? -16 : 16;
     }
     if (std::abs(pitch_delta_pct) > kDeadbandPct) {
         dy = pitch_delta_pct > 0 ? -12 : 12;
@@ -4228,31 +4575,51 @@ void clear_motion_gaze()
     g_motion_gaze_revision = g_motion_gaze_revision + 1;
 }
 
+int smooth_gaze_value(int current, int target)
+{
+    const int diff = target - current;
+    if (diff == 0) {
+        return current;
+    }
+    int step = std::max(1, static_cast<int>(std::lround(std::abs(diff) * 0.42f)));
+    step = std::min(step, 8);
+    if (std::abs(diff) <= step) {
+        return target;
+    }
+    return current + (diff > 0 ? step : -step);
+}
+
 void motion_gaze_task(void*)
 {
     uint32_t last_revision = g_motion_gaze_revision;
-    bool drew_active_gaze = false;
-    int64_t last_draw_ms = 0;
+    bool drew_visible_gaze = false;
     while (true) {
         const bool can_draw = can_draw_motion_gaze();
         const bool active = g_motion_gaze_active;
         const uint32_t revision = g_motion_gaze_revision;
-        const int64_t now_ms = esp_timer_get_time() / 1000;
 
-        if (active && can_draw) {
-            const bool changed = revision != last_revision;
-            const bool enough_time = (now_ms - last_draw_ms) >= 260;
-            if (!drew_active_gaze || (changed && enough_time)) {
+        const int target_dx = active ? clamp_int(static_cast<int>(g_motion_gaze_dx), -18, 18) : 0;
+        const int target_dy = active ? clamp_int(static_cast<int>(g_motion_gaze_dy), -14, 14) : 0;
+        const int current_dx = clamp_int(static_cast<int>(g_motion_gaze_render_dx), -18, 18);
+        const int current_dy = clamp_int(static_cast<int>(g_motion_gaze_render_dy), -14, 14);
+        const int next_dx = smooth_gaze_value(current_dx, target_dx);
+        const int next_dy = smooth_gaze_value(current_dy, target_dy);
+
+        if (can_draw) {
+            const bool changed_target = revision != last_revision;
+            const bool changed_frame = next_dx != current_dx || next_dy != current_dy;
+            const bool needs_first_draw = active && !drew_visible_gaze;
+            if (changed_target || changed_frame || needs_first_draw) {
+                g_motion_gaze_render_dx = next_dx;
+                g_motion_gaze_render_dy = next_dy;
                 last_revision = revision;
-                last_draw_ms = now_ms;
                 render_current_face_pose_no_transition();
-                drew_active_gaze = true;
+                drew_visible_gaze = active || next_dx != 0 || next_dy != 0;
             }
-        } else if (!active && drew_active_gaze && can_draw) {
-            last_revision = revision;
-            last_draw_ms = now_ms;
-            render_current_face_pose_no_transition();
-            drew_active_gaze = false;
+        } else if (!active && (current_dx != 0 || current_dy != 0)) {
+            g_motion_gaze_render_dx = next_dx;
+            g_motion_gaze_render_dy = next_dy;
+            drew_visible_gaze = next_dx != 0 || next_dy != 0;
         }
         vTaskDelay(pdMS_TO_TICKS(40));
     }
@@ -5170,11 +5537,15 @@ bool extract_json_bool(const char* json, const char* key, bool default_value = f
 
 void enqueue_direction_glance(int yaw_change_pct, int pitch_change_pct)
 {
+    if (g_info_mode_active) {
+        return;
+    }
     const int deadband = 3;
     const char* emotion = "";
     if (std::abs(yaw_change_pct) >= std::abs(pitch_change_pct) &&
         std::abs(yaw_change_pct) > deadband) {
-        emotion = yaw_change_pct < 0 ? "glance_left" : "glance_right";
+        // Mirror yaw into viewer/display coordinates, matching motion gaze.
+        emotion = yaw_change_pct < 0 ? "glance_right" : "glance_left";
     } else if (std::abs(pitch_change_pct) > deadband) {
         emotion = pitch_change_pct < 0 ? "glance_down" : "glance_up";
     }
@@ -5233,9 +5604,57 @@ void handle_display_command(const char* data, int len)
         return;
     }
 
+    if (std::strcmp(mode, "face") == 0) {
+        UiCommand command = {};
+        command.type = UiCommandType::Face;
+        command.intensity_pct = g_face_intensity_pct;
+        copy_cstr(command.emotion, sizeof(command.emotion), g_face_emotion);
+        if (!enqueue_ui_command(command)) {
+            publish_error(request_id, "display", "ui queue full");
+            cJSON_Delete(root);
+            return;
+        }
+
+        publish_ack(request_id, "display", "face queued");
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (std::strcmp(mode, "info") == 0) {
+        const char* time_text = json_string(root, "time");
+        const char* date_text = json_string(root, "date");
+        const char* weekday_text = json_string(root, "weekday");
+        if (!time_text || !*time_text || !date_text || !*date_text || !weekday_text || !*weekday_text) {
+            publish_error(request_id, "display", "expected info time/date/weekday");
+            cJSON_Delete(root);
+            return;
+        }
+
+        UiCommand command = {};
+        command.type = UiCommandType::Info;
+        command.duration_ms = std::max(0, json_int(root, "duration_ms", 0));
+        copy_display_text(command.info_time, sizeof(command.info_time), time_text);
+        copy_display_text(command.info_date, sizeof(command.info_date), date_text);
+        copy_display_text(command.info_weekday, sizeof(command.info_weekday), weekday_text);
+        ESP_LOGI(kTag, "info display command queued: %s %s %s request_id=%s",
+                 command.info_time,
+                 command.info_weekday,
+                 command.info_date,
+                 request_id && *request_id ? request_id : "");
+        if (!enqueue_ui_command(command)) {
+            publish_error(request_id, "display", "ui queue full");
+            cJSON_Delete(root);
+            return;
+        }
+
+        publish_ack(request_id, "display", "info queued");
+        cJSON_Delete(root);
+        return;
+    }
+
     const char* text = json_string(root, "text");
     if (std::strcmp(mode, "text") != 0 || !text || !*text) {
-        publish_error(request_id, "display", "expected mode text/image and valid payload");
+        publish_error(request_id, "display", "expected mode text/image/info/face and valid payload");
         cJSON_Delete(root);
         return;
     }
@@ -5282,6 +5701,19 @@ void handle_face_command(const char* data, int len)
         }
     }
     intensity_pct = clamp_int(intensity_pct, 0, 100);
+
+    if (g_info_mode_active && request_id && std::strncmp(request_id, "life-", 5) == 0) {
+        publish_ack(request_id, "face", "life face ignored during info mode");
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (!accepts_robot_template_face_command(emotion)) {
+        ESP_LOGD(kTag, "ignored non-template face command: %s", emotion ? emotion : "");
+        publish_ack(request_id, "face", "non-template face ignored");
+        cJSON_Delete(root);
+        return;
+    }
 
     UiCommand command = {};
     command.type = UiCommandType::Face;
@@ -5541,6 +5973,7 @@ void set_recording_state(bool enabled, const char* source, const char* request_i
             publish_status();
             return;
         }
+        g_pre_recording_info_mode = g_info_mode_active && std::strcmp(g_ui_mode, "info") == 0;
         if (!is_transient_face_emotion(g_face_emotion) &&
             std::strcmp(g_face_emotion, "speaking") != 0 &&
             std::strcmp(g_face_emotion, "listening") != 0) {
@@ -5573,9 +6006,14 @@ void set_recording_state(bool enabled, const char* source, const char* request_i
         g_face_extra_mode = FaceExtraMode::None;
         reset_voice_meter();
         copy_cstr(g_recording_source, sizeof(g_recording_source), "none");
-        copy_cstr(g_ui_mode, sizeof(g_ui_mode), "face");
-        copy_face_emotion(g_pre_recording_face_emotion, g_pre_recording_face_intensity_pct);
-        draw_face(g_face_emotion, g_face_intensity_pct);
+        if (g_pre_recording_info_mode && g_info_time[0] != '\0') {
+            draw_info_screen(g_info_time, g_info_date, g_info_weekday);
+        } else {
+            copy_cstr(g_ui_mode, sizeof(g_ui_mode), "face");
+            copy_face_emotion(g_pre_recording_face_emotion, g_pre_recording_face_intensity_pct);
+            draw_face(g_face_emotion, g_face_intensity_pct);
+        }
+        g_pre_recording_info_mode = false;
         publish_event("recording_stopped", previous_source, request_id, reason);
     }
     publish_status();
@@ -5966,7 +6404,7 @@ bool capture_and_send_photo(const char* request_id, const char* prompt)
         return false;
     }
 
-    draw_wrapped_message("KAMERA", "FOTO...", rgb565(0, 220, 230));
+    draw_face(g_face_emotion, g_face_intensity_pct);
     camera_fb_t* fb = nullptr;
     for (int i = 0; i < 2; ++i) {
         if (fb) {
@@ -5980,7 +6418,7 @@ bool capture_and_send_photo(const char* request_id, const char* prompt)
             esp_camera_fb_return(fb);
         }
         publish_error(request_id, "system", "camera capture failed");
-        draw_face("error", 55);
+        draw_face("scared", 55);
         return false;
     }
 
@@ -6318,6 +6756,7 @@ bool play_wav_url(const char* url)
     }
     ESP_LOGI(kTag, "tts playback start: %s", url);
     g_tts_playing = true;
+    g_pre_tts_info_mode = g_info_mode_active && std::strcmp(g_ui_mode, "info") == 0;
     copy_ui_mode("speaking");
     publish_status();
     const esp_err_t err = esp_http_client_perform(client);
@@ -6329,7 +6768,12 @@ bool play_wav_url(const char* url)
     }
     unlock_audio_output();
     g_tts_playing = false;
-    copy_ui_mode("face");
+    if (g_pre_tts_info_mode && g_info_time[0] != '\0') {
+        draw_info_screen(g_info_time, g_info_date, g_info_weekday);
+    } else {
+        copy_ui_mode("face");
+    }
+    g_pre_tts_info_mode = false;
     publish_status();
     ESP_LOGI(kTag, "tts playback done: status=%d err=%s", status, esp_err_to_name(err));
     return err == ESP_OK && status >= 200 && status < 300;
@@ -6449,17 +6893,14 @@ void ui_task(void*)
         }
 
         if (command.type == UiCommandType::Display) {
-            draw_word_sequence("HERMES", command.text, command.duration_ms, command.accent);
-            publish_status();
             draw_face(g_face_emotion, g_face_intensity_pct);
+            publish_status();
         } else if (command.type == UiCommandType::Image) {
-            draw_image_from_url(command.url,
-                                command.image_width > 0 ? command.image_width : kWidth,
-                                command.image_height > 0 ? command.image_height : kHeight,
-                                command.emotion,
-                                command.duration_ms);
-            publish_status();
             draw_face(g_face_emotion, g_face_intensity_pct);
+            publish_status();
+        } else if (command.type == UiCommandType::Info) {
+            draw_info_screen(command.info_time, command.info_date, command.info_weekday);
+            publish_status();
         } else if (command.type == UiCommandType::Face) {
             if (is_transient_face_emotion(command.emotion)) {
                 animate_transient_face(command.emotion, command.intensity_pct);
@@ -6467,16 +6908,16 @@ void ui_task(void*)
                 draw_face(command.emotion, command.intensity_pct);
             }
         } else if (command.type == UiCommandType::Say) {
-            draw_wrapped_message("STACKCHAN", command.text, command.accent);
-            copy_face_emotion(command.emotion, command.intensity_pct);
+            if (accepts_robot_template_face_command(command.emotion)) {
+                copy_face_emotion(command.emotion, command.intensity_pct);
+            }
+            draw_face(g_face_emotion, g_face_intensity_pct);
             if (command.beep && g_audio_output_ready && g_sound_queue) {
                 SoundCommand sound = {.frequency_hz = 660, .duration_ms = 70, .volume_pct = -1, .pattern = {}};
                 copy_cstr(sound.pattern, sizeof(sound.pattern), "notify");
                 xQueueSend(g_sound_queue, &sound, 0);
             }
             publish_status();
-            vTaskDelay(pdMS_TO_TICKS(command.duration_ms));
-            draw_face(g_face_emotion, g_face_intensity_pct);
         }
         publish_status();
     }
@@ -7422,14 +7863,14 @@ extern "C" void app_main()
     if (!init_wifi()) {
         return;
     }
-    draw_wrapped_message("WIFI", "CONNECTING", rgb565(255, 210, 60));
+    draw_face(g_face_emotion, g_face_intensity_pct);
     if (!wait_for_wifi(pdMS_TO_TICKS(15000))) {
         display_error("WIFI TIMEOUT");
         ESP_LOGE(kTag, "wifi timeout");
         return;
     }
 
-    draw_wrapped_message("MQTT", "CONNECTING", rgb565(255, 210, 60));
+    draw_face(g_face_emotion, g_face_intensity_pct);
     if (!init_mqtt()) {
         return;
     }

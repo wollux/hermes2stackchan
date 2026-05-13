@@ -48,6 +48,9 @@ DEFAULT_CONFIG = Path("config/pairs.json")
 EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
+DEFAULT_COMPANION_STATE_STORE = "~/.hermes/hermes2stackchan/companion_state.json"
+DEFAULT_INTERACTION_HISTORY_STORE = "~/.hermes/hermes2stackchan/interaction_history.jsonl"
+DEFAULT_TELEMETRY_STORE = "~/.hermes/hermes2stackchan/telemetry.jsonl"
 DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
 DEFAULT_LIFE_MIN_INTERVAL_S = 0.35
 DEFAULT_LIFE_MAX_INTERVAL_S = 1.35
@@ -75,6 +78,8 @@ SENSOR_SHAKE_SCORE_THRESHOLD = 20
 SENSOR_SHAKE_COOLDOWN_S = 4.0
 SENSOR_REACTION_COOLDOWN_S = 1.0
 SENSOR_WAKE_COOLDOWN_S = 2.0
+SENSOR_UPRIGHT_CLEANUP_DELAY_S = 3.8
+SENSOR_UPRIGHT_LIFE_PAUSE_S = 10.0
 SENSOR_SIDE_HELP_TEXT = "Hilfe! Ich bin umgekippt!"
 SENSOR_SIDE_THANKS_TEXT = "Danke, ich stehe wieder. Rettung erfolgreich!"
 SENSOR_FACE_DOWN_TEXT = "Hey! Nicht aufs Gesicht. Das mag ich gar nicht!"
@@ -83,6 +88,18 @@ LIFE_PAUSE_LOCK = RLock()
 LIFE_PAUSED_UNTIL: dict[str, float] = {}
 SIDE_TOUCH_SOURCES = {"head_touch_left", "head_touch_right"}
 SIDE_TOUCH_GIGGLE_WINDOW_S = 1.0
+COMPANION_MOODS = {"calm", "playful", "curious", "tired", "focused", "annoyed", "help"}
+PRIVACY_MODES = {"normal", "focus", "private", "demo", "debug"}
+PROACTIVITY_LEVELS = {"quiet", "balanced", "playful"}
+
+ACTION_PRIORITY_RANKS = {
+    "safety": 0,
+    "user": 10,
+    "conversation": 20,
+    "notification": 30,
+    "proactive": 40,
+    "idle": 50,
+}
 
 
 class ConfigError(ValueError):
@@ -107,6 +124,11 @@ class PairConfig:
     mqtt_prefix: str
     capabilities_file: str | None = None
     personality_file: str | None = None
+    mood_default: str = "playful"
+    privacy_mode: str = "normal"
+    proactivity: str = "playful"
+    wakeword: str = "Computer"
+    voice: str = "de-DE-KatjaNeural"
 
     @property
     def display_topic(self) -> str:
@@ -207,12 +229,22 @@ class ReminderConfig:
 
 
 @dataclass(frozen=True)
+class CompanionConfig:
+    state_store_path: str = DEFAULT_COMPANION_STATE_STORE
+    history_store_path: str = DEFAULT_INTERACTION_HISTORY_STORE
+    telemetry_store_path: str = DEFAULT_TELEMETRY_STORE
+    history_keep: int = 200
+    telemetry_enabled: bool = True
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     mqtt: MqttConfig
     pairs: dict[str, PairConfig]
     hermes: HermesConfig = field(default_factory=HermesConfig)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
     reminders: ReminderConfig = field(default_factory=ReminderConfig)
+    companion: CompanionConfig = field(default_factory=CompanionConfig)
 
 
 @dataclass
@@ -339,6 +371,24 @@ def load_config(
             "H2S_REMINDER_DISPLAY_MS",
         ),
     )
+    companion_raw = raw.get("companion") or {}
+    if not isinstance(companion_raw, dict):
+        raise ConfigError("companion must be an object when present")
+    companion = CompanionConfig(
+        state_store_path=env.get("H2S_COMPANION_STATE_STORE") or str(companion_raw.get("state_store_path") or DEFAULT_COMPANION_STATE_STORE),
+        history_store_path=env.get("H2S_INTERACTION_HISTORY_STORE") or str(companion_raw.get("history_store_path") or DEFAULT_INTERACTION_HISTORY_STORE),
+        telemetry_store_path=env.get("H2S_TELEMETRY_STORE") or str(companion_raw.get("telemetry_store_path") or DEFAULT_TELEMETRY_STORE),
+        history_keep=parse_int(
+            env.get("H2S_HISTORY_KEEP"),
+            int(companion_raw.get("history_keep", 200)),
+            "H2S_HISTORY_KEEP",
+        ),
+        telemetry_enabled=parse_bool(
+            env.get("H2S_TELEMETRY_ENABLED"),
+            bool(companion_raw.get("telemetry_enabled", True)),
+            "H2S_TELEMETRY_ENABLED",
+        ),
+    )
 
     pairs_raw = raw.get("pairs")
     if not isinstance(pairs_raw, list) or not pairs_raw:
@@ -355,6 +405,10 @@ def load_config(
         if pair_id in pairs:
             raise ConfigError(f"duplicate pair_id: {pair_id}")
 
+        profile_raw = item.get("profile") or {}
+        if not isinstance(profile_raw, dict):
+            raise ConfigError(f"pairs[{index}].profile must be an object when present")
+
         pairs[pair_id] = PairConfig(
             pair_id=pair_id,
             hermes_id=require_string(item, "hermes_id", f"pairs[{index}].hermes_id"),
@@ -362,6 +416,11 @@ def load_config(
             mqtt_prefix=mqtt_prefix,
             capabilities_file=optional_string(item.get("capabilities_file")),
             personality_file=optional_string(item.get("personality_file")),
+            mood_default=normalized_choice(profile_raw.get("mood_default"), COMPANION_MOODS, "playful", f"pairs[{index}].profile.mood_default"),
+            privacy_mode=normalized_choice(profile_raw.get("privacy_mode"), PRIVACY_MODES, "normal", f"pairs[{index}].profile.privacy_mode"),
+            proactivity=normalized_choice(profile_raw.get("proactivity"), PROACTIVITY_LEVELS, "playful", f"pairs[{index}].profile.proactivity"),
+            wakeword=optional_string(profile_raw.get("wakeword")) or "Computer",
+            voice=optional_string(profile_raw.get("voice")) or speech.edge_tts_voice,
         )
 
     if has_pair_env(env):
@@ -377,10 +436,15 @@ def load_config(
                 mqtt_prefix=mqtt_prefix,
                 capabilities_file=env.get("H2S_CAPABILITIES_FILE") or base_pair.capabilities_file,
                 personality_file=env.get("H2S_PERSONALITY_FILE") or base_pair.personality_file,
+                mood_default=normalized_choice(env.get("H2S_PAIR_MOOD"), COMPANION_MOODS, base_pair.mood_default, "H2S_PAIR_MOOD"),
+                privacy_mode=normalized_choice(env.get("H2S_PRIVACY_MODE"), PRIVACY_MODES, base_pair.privacy_mode, "H2S_PRIVACY_MODE"),
+                proactivity=normalized_choice(env.get("H2S_PAIR_PROACTIVITY"), PROACTIVITY_LEVELS, base_pair.proactivity, "H2S_PAIR_PROACTIVITY"),
+                wakeword=env.get("H2S_PAIR_WAKEWORD") or base_pair.wakeword,
+                voice=env.get("H2S_PAIR_VOICE") or env.get("H2S_EDGE_TTS_VOICE") or base_pair.voice,
             )
         }
 
-    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech, reminders=reminders)
+    return BridgeConfig(mqtt=mqtt, pairs=pairs, hermes=hermes, speech=speech, reminders=reminders, companion=companion)
 
 
 def load_env(env_path: Path | None, environ: dict[str, str] | None = None) -> dict[str, str]:
@@ -467,6 +531,11 @@ def has_pair_env(env: dict[str, str]) -> bool:
             "H2S_MQTT_PREFIX",
             "H2S_CAPABILITIES_FILE",
             "H2S_PERSONALITY_FILE",
+            "H2S_PAIR_MOOD",
+            "H2S_PRIVACY_MODE",
+            "H2S_PAIR_PROACTIVITY",
+            "H2S_PAIR_WAKEWORD",
+            "H2S_PAIR_VOICE",
         )
     )
 
@@ -493,6 +562,17 @@ def optional_string(value: Any) -> str | None:
     return value or None
 
 
+def normalized_choice(value: Any, allowed: set[str], default: str, label: str) -> str:
+    raw = optional_string(value)
+    if not raw:
+        return default
+    normalized = raw.strip().lower().replace("-", "_")
+    if normalized not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ConfigError(f"{label} must be one of {allowed_text}; got {raw!r}")
+    return normalized
+
+
 def clamp_int(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, int(value)))
 
@@ -517,6 +597,25 @@ def with_request_id(payload: dict[str, Any], request_id: str | None = None) -> d
     result = {"schema_version": SCHEMA_VERSION, **payload}
     result["request_id"] = request_id or uuid.uuid4().hex
     return result
+
+
+def build_info_payload(
+    now: dt.datetime | None = None,
+    request_id: str | None = None,
+    duration_ms: int = 0,
+) -> dict[str, Any]:
+    if duration_ms < 0:
+        raise ConfigError("duration_ms must be >= 0")
+    current = local_datetime(now)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "mode": "info",
+        "time": current.strftime("%H:%M"),
+        "date": current.strftime("%d.%m.%Y"),
+        "weekday": GERMAN_WEEKDAYS[current.weekday()],
+        "duration_ms": duration_ms,
+        "request_id": request_id or uuid.uuid4().hex,
+    }
 
 
 def create_mqtt_client(mqtt: MqttConfig):
@@ -821,6 +920,60 @@ def read_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_companion_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    status = read_latest_status(config, pair, args.timeout) if args.with_status else None
+    payload = {
+        "state": read_companion_state(config, pair),
+        "context": build_hermes_context_package(config, pair, status),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def set_companion_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    updates: dict[str, Any] = {}
+    if args.mood:
+        updates["mood"] = normalized_choice(args.mood, COMPANION_MOODS, pair.mood_default, "mood")
+    if args.privacy_mode:
+        updates["privacy_mode"] = normalized_choice(args.privacy_mode, PRIVACY_MODES, pair.privacy_mode, "privacy_mode")
+    if args.proactivity:
+        updates["proactivity"] = normalized_choice(args.proactivity, PROACTIVITY_LEVELS, pair.proactivity, "proactivity")
+    if args.mood_intensity_pct is not None:
+        updates["mood_intensity_pct"] = clamp_int(args.mood_intensity_pct, 0, 100)
+    if not updates:
+        raise ConfigError("set-companion needs at least one field")
+    state = write_companion_pair_state(config, pair, updates)
+    print(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def list_history_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    items = read_recent_interactions(config, pair, args.limit)
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for item in items:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(item.get("ts", 0))))
+            text = optional_string(item.get("transcript") or item.get("reply") or item.get("kind")) or ""
+            reply = optional_string(item.get("reply")) or ""
+            print(f"{ts} {item.get('kind', 'event')}: {text[:90]} -> {reply[:90]}")
+    return 0
+
+
+def healthz_cli(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    payload = build_bridge_healthz(config, pair, include_status=not args.no_status, status_timeout_s=args.timeout)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if payload["stackchan"]["online"] or args.no_status else 3
+
+
 REQUIRED_STATUS_PATHS = (
     "schema_version",
     "pair_id",
@@ -957,6 +1110,477 @@ def read_optional_text(path_value: str | None, config_path: Path) -> str:
     if not path.exists():
         raise ConfigError(f"referenced file not found: {path}")
     return path.read_text(encoding="utf-8").strip()
+
+
+def expanded_store_path(path_value: str) -> Path:
+    return Path(path_value).expanduser()
+
+
+def read_json_store(path_value: str, default: dict[str, Any]) -> dict[str, Any]:
+    path = expanded_store_path(path_value)
+    if not path.exists():
+        return dict(default)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"store is invalid JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"store must be a JSON object: {path}")
+    return data
+
+
+def write_json_store(path_value: str, data: dict[str, Any]) -> None:
+    path = expanded_store_path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def companion_state_default(pair: PairConfig) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "pairs": {
+            pair.pair_id: {
+                "pair_id": pair.pair_id,
+                "mood": pair.mood_default,
+                "mood_intensity_pct": 60,
+                "privacy_mode": pair.privacy_mode,
+                "proactivity": pair.proactivity,
+                "updated_at": time.time(),
+            }
+        },
+    }
+
+
+def read_companion_state(config: BridgeConfig, pair: PairConfig) -> dict[str, Any]:
+    store = read_json_store(config.companion.state_store_path, companion_state_default(pair))
+    pairs = store.setdefault("pairs", {})
+    if not isinstance(pairs, dict):
+        pairs = {}
+        store["pairs"] = pairs
+    state = pairs.get(pair.pair_id)
+    if not isinstance(state, dict):
+        state = companion_state_default(pair)["pairs"][pair.pair_id]
+        pairs[pair.pair_id] = state
+    state["mood"] = normalized_choice(state.get("mood"), COMPANION_MOODS, pair.mood_default, "companion_state.mood")
+    state["privacy_mode"] = normalized_choice(state.get("privacy_mode"), PRIVACY_MODES, pair.privacy_mode, "companion_state.privacy_mode")
+    state["proactivity"] = normalized_choice(state.get("proactivity"), PROACTIVITY_LEVELS, pair.proactivity, "companion_state.proactivity")
+    return dict(state)
+
+
+def write_companion_pair_state(config: BridgeConfig, pair: PairConfig, updates: dict[str, Any]) -> dict[str, Any]:
+    store = read_json_store(config.companion.state_store_path, companion_state_default(pair))
+    pairs = store.setdefault("pairs", {})
+    if not isinstance(pairs, dict):
+        pairs = {}
+        store["pairs"] = pairs
+    state = pairs.get(pair.pair_id)
+    if not isinstance(state, dict):
+        state = companion_state_default(pair)["pairs"][pair.pair_id]
+    state.update(updates)
+    state["pair_id"] = pair.pair_id
+    state["mood"] = normalized_choice(state.get("mood"), COMPANION_MOODS, pair.mood_default, "companion_state.mood")
+    state["privacy_mode"] = normalized_choice(state.get("privacy_mode"), PRIVACY_MODES, pair.privacy_mode, "companion_state.privacy_mode")
+    state["proactivity"] = normalized_choice(state.get("proactivity"), PROACTIVITY_LEVELS, pair.proactivity, "companion_state.proactivity")
+    state["updated_at"] = time.time()
+    pairs[pair.pair_id] = state
+    store["schema_version"] = SCHEMA_VERSION
+    write_json_store(config.companion.state_store_path, store)
+    return dict(state)
+
+
+def mood_from_face_emotion(emotion: str) -> str | None:
+    emotion = emotion.strip().lower().replace("-", "_")
+    if emotion in {"help", "panic", "face_down", "error"}:
+        return "help"
+    if emotion in {"thinking", "question", "confused"}:
+        return "curious"
+    if emotion in {"sleepy", "tired", "micro_sleep", "yawn"}:
+        return "tired"
+    if emotion in {"annoyed", "angry", "skeptical", "offended"}:
+        return "annoyed"
+    if emotion in {"friendly", "happy", "super_happy", "mischievous", "smug", "thankful", "speaking"}:
+        return "playful"
+    if emotion in {"neutral", "breathe", "soft_blink"}:
+        return "calm"
+    return None
+
+
+def privacy_policy_for_mode(mode: str) -> dict[str, Any]:
+    mode = normalized_choice(mode, PRIVACY_MODES, "normal", "privacy_mode")
+    policies = {
+        "normal": {
+            "audio_retention": "off",
+            "text_history": True,
+            "telemetry": True,
+            "camera_allowed": True,
+            "hermes_allowed": True,
+            "proactive_speech": True,
+        },
+        "focus": {
+            "audio_retention": "off",
+            "text_history": True,
+            "telemetry": True,
+            "camera_allowed": True,
+            "hermes_allowed": True,
+            "proactive_speech": False,
+        },
+        "private": {
+            "audio_retention": "off",
+            "text_history": False,
+            "telemetry": False,
+            "camera_allowed": False,
+            "hermes_allowed": False,
+            "proactive_speech": False,
+        },
+        "demo": {
+            "audio_retention": "off",
+            "text_history": False,
+            "telemetry": True,
+            "camera_allowed": True,
+            "hermes_allowed": True,
+            "proactive_speech": True,
+        },
+        "debug": {
+            "audio_retention": "debug",
+            "text_history": True,
+            "telemetry": True,
+            "camera_allowed": True,
+            "hermes_allowed": True,
+            "proactive_speech": True,
+        },
+    }
+    return {"mode": mode, **policies[mode]}
+
+
+def append_jsonl(path_value: str, item: dict[str, Any], keep: int | None = None) -> None:
+    path = expanded_store_path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+    if keep is None or keep <= 0 or not path.exists():
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines.append(line.rstrip("\n"))
+    lines = lines[-keep:]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def record_interaction_event(config: BridgeConfig, pair: PairConfig, event: dict[str, Any]) -> None:
+    try:
+        state = read_companion_state(config, pair)
+        policy = privacy_policy_for_mode(state.get("privacy_mode", pair.privacy_mode))
+        if not policy["text_history"]:
+            return
+        item = {
+            "schema_version": SCHEMA_VERSION,
+            "ts": time.time(),
+            "pair_id": pair.pair_id,
+            "stackchan_id": pair.stackchan_id,
+            **event,
+        }
+        append_jsonl(config.companion.history_store_path, item, config.companion.history_keep)
+    except Exception as exc:
+        print(f"[bridge] interaction history skipped: {exc}", file=sys.stderr, flush=True)
+
+
+def record_telemetry_event(config: BridgeConfig, pair: PairConfig, event: dict[str, Any]) -> None:
+    try:
+        state = read_companion_state(config, pair)
+        policy = privacy_policy_for_mode(state.get("privacy_mode", pair.privacy_mode))
+        if not config.companion.telemetry_enabled or not policy["telemetry"]:
+            return
+        item = {
+            "schema_version": SCHEMA_VERSION,
+            "ts": time.time(),
+            "pair_id": pair.pair_id,
+            **event,
+        }
+        append_jsonl(config.companion.telemetry_store_path, item, keep=5000)
+    except Exception as exc:
+        print(f"[bridge] telemetry skipped: {exc}", file=sys.stderr, flush=True)
+
+
+def read_recent_interactions(config: BridgeConfig, pair: PairConfig, limit: int = 5) -> list[dict[str, Any]]:
+    path = expanded_store_path(config.companion.history_store_path)
+    if not path.exists():
+        return []
+    result: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines()[-max(1, limit * 5):]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("pair_id") == pair.pair_id:
+            result.append(item)
+    return result[-limit:]
+
+
+def status_summary_for_context(status: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(status, dict):
+        return {"available": False}
+    return {
+        "available": True,
+        "battery_pct": status.get("battery_pct"),
+        "external_power": status.get("external_power"),
+        "display_sleeping": status.get("display_sleeping"),
+        "ui_mode": nested_status_value(status, "ui.mode"),
+        "recording": status.get("recording"),
+        "speaking": status.get("speaking"),
+        "head": {
+            "pan_pct": nested_status_value(status, "head.pan_pct"),
+            "tilt_pct": nested_status_value(status, "head.tilt_pct"),
+            "motion_active": nested_status_value(status, "head.motion_active"),
+        },
+        "face": {
+            "emotion": nested_status_value(status, "face.emotion"),
+            "intensity_pct": nested_status_value(status, "face.intensity_pct"),
+        },
+        "sensors": {
+            "imu_motion_score_pct": nested_status_value(status, "sensors.imu.motion_score_pct"),
+            "imu_motion_active": nested_status_value(status, "sensors.imu.motion_active"),
+            "proximity_near": nested_status_value(status, "sensors.ltr553.near"),
+            "proximity_delta": nested_status_value(status, "sensors.ltr553.proximity_delta"),
+        },
+    }
+
+
+def local_capabilities_context() -> list[str]:
+    return [
+        "time_date_weekday_calendar_week",
+        "battery_power_temperature_status",
+        "volume_brightness_display_sleep_wake",
+        "leds_sound_test_head_motion",
+        "timer_reminder_when_complete",
+        "simple_math_random_choice",
+        "camera_trigger_without_vision_analysis",
+    ]
+
+
+def build_hermes_context_package(
+    config: BridgeConfig,
+    pair: PairConfig,
+    status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    state = read_companion_state(config, pair)
+    privacy = privacy_policy_for_mode(state.get("privacy_mode", pair.privacy_mode))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "pair": {
+            "pair_id": pair.pair_id,
+            "hermes_id": pair.hermes_id,
+            "stackchan_id": pair.stackchan_id,
+            "mqtt_prefix": pair.mqtt_prefix,
+            "wakeword": pair.wakeword,
+            "voice": pair.voice,
+        },
+        "mood": {
+            "state": state.get("mood", pair.mood_default),
+            "intensity_pct": state.get("mood_intensity_pct", 60),
+            "proactivity": state.get("proactivity", pair.proactivity),
+        },
+        "privacy": privacy,
+        "time": {
+            "timezone": "Europe/Berlin",
+            "local_iso": local_datetime().isoformat(timespec="seconds"),
+            "weekday": GERMAN_WEEKDAYS[local_datetime().weekday()],
+        },
+        "status_summary": status_summary_for_context(status),
+        "local_capabilities": local_capabilities_context(),
+        "recent_interactions": read_recent_interactions(config, pair, limit=5) if privacy["text_history"] else [],
+    }
+
+
+def action_priority_for_topic(pair: PairConfig, topic: str, payload: dict[str, Any]) -> str:
+    request_id = optional_string(payload.get("request_id")) or ""
+    if request_id.startswith(("life-", "idle-")):
+        return "idle"
+    if request_id.startswith(("sensor-", "power-", "power-followup-")):
+        return "safety" if topic in {pair.led_topic, pair.audio_topic, pair.system_topic} else "proactive"
+    if request_id.startswith(("notify-", "reminder-")):
+        return "notification"
+    if request_id.startswith(("speech-", "hermes-", "photo-")):
+        return "conversation"
+    if request_id.startswith(("touch-", "manual-", "cmd-")):
+        return "user"
+    if topic == pair.system_topic and payload.get("action") in {"shutdown", "power_off", "reboot"}:
+        return "user"
+    return "conversation"
+
+
+def action_queue_record(pair: PairConfig, topic: str, payload: dict[str, Any], status: str) -> dict[str, Any]:
+    priority = action_priority_for_topic(pair, topic, payload)
+    return {
+        "queue_status": status,
+        "priority": priority,
+        "priority_rank": ACTION_PRIORITY_RANKS[priority],
+        "topic": topic,
+        "request_id": optional_string(payload.get("request_id")),
+        "action": payload.get("action") or payload.get("mode") or payload.get("emotion") or topic.rsplit("/", 1)[-1],
+    }
+
+
+WAITING_FACE_SEQUENCE: tuple[dict[str, Any], ...] = (
+    {"action": "face", "emotion": "thinking", "intensity_pct": 68},
+    {"action": "face", "emotion": "glance_up", "intensity_pct": 66},
+    {"action": "face", "emotion": "brow_raise", "intensity_pct": 62},
+    {"action": "face", "emotion": "glance_right", "intensity_pct": 61},
+    {"action": "face", "emotion": "mouth_tiny", "intensity_pct": 60},
+    {"action": "face", "emotion": "glance_left", "intensity_pct": 61},
+    {"action": "face", "emotion": "breathe", "intensity_pct": 62},
+    {"action": "face", "emotion": "soft_blink", "intensity_pct": 58},
+    {"action": "face", "emotion": "glance_up", "intensity_pct": 64},
+    {"action": "face", "emotion": "thinking", "intensity_pct": 66},
+)
+
+
+def build_waiting_animation_actions(step: int, include_motion: bool = False) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    if step <= 0:
+        actions.append({"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
+    actions.append(dict(WAITING_FACE_SEQUENCE[step % len(WAITING_FACE_SEQUENCE)]))
+    if include_motion and step > 0 and step % 10 == 0:
+        side = -1 if (step // 10) % 2 else 1
+        actions.append(
+            {
+                "action": "motion",
+                "curve": "spline",
+                "speed_pct": 10,
+                "points": [
+                    {
+                        "yaw_pct": 4 * side,
+                        "pitch_pct": DEFAULT_IDLE_PITCH_PCT + 1,
+                        "speed_pct": 10,
+                        "duration_ms": 650,
+                    },
+                    {
+                        "yaw_pct": DEFAULT_IDLE_YAW_PCT,
+                        "pitch_pct": DEFAULT_IDLE_PITCH_PCT,
+                        "speed_pct": 8,
+                        "duration_ms": 780,
+                    },
+                ],
+            }
+        )
+    return actions
+
+
+def waiting_animation_delay_s(step: int) -> float:
+    if step <= 0:
+        return 0.55
+    if step % 10 == 0:
+        return 0.95
+    return 0.82
+
+
+class SpeechProcessingIndicator:
+    def __init__(
+        self,
+        config: BridgeConfig,
+        pair: PairConfig,
+        client: Any,
+        request_id: str,
+    ) -> None:
+        self.config = config
+        self.pair = pair
+        self.client = client
+        self.request_id = request_id
+        self._stop = Event()
+        self._thread: Thread | None = None
+
+    def start(self) -> None:
+        self._thread = Thread(target=self._run, name=f"h2s-processing-{self.request_id[:8]}", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _publish(self, actions: list[dict[str, Any]], suffix: str) -> None:
+        try:
+            messages = [
+                action_to_topic_payload(self.pair, action, f"processing-{self.request_id}-{suffix}-{index:02d}")
+                for index, action in enumerate(actions)
+            ]
+            publish_action_messages(
+                self.client,
+                messages,
+                self.pair,
+                wait=False,
+                config=self.config,
+                source="speech-processing",
+            )
+        except Exception as exc:
+            print(f"[bridge-http] processing indicator skipped: {exc}", flush=True)
+
+    def _run(self) -> None:
+        index = 0
+        while not self._stop.is_set():
+            self._publish(build_waiting_animation_actions(index), str(index))
+            if self._stop.wait(waiting_animation_delay_s(index)):
+                return
+            index += 1
+
+
+def build_bridge_healthz(
+    config: BridgeConfig,
+    pair: PairConfig,
+    include_status: bool = True,
+    status_timeout_s: float = 0.3,
+) -> dict[str, Any]:
+    state = read_companion_state(config, pair)
+    privacy = privacy_policy_for_mode(state.get("privacy_mode", pair.privacy_mode))
+    age = STACKCHAN_PRESENCE.age_s(pair)
+    status: dict[str, Any] | None = None
+    missing: list[str] = []
+    if include_status:
+        try:
+            status = read_latest_status(config, pair, timeout_s=status_timeout_s)
+            if isinstance(status, dict):
+                missing = missing_status_paths(status)
+        except Exception as exc:
+            missing = [f"status_read_error:{exc}"]
+    return {
+        "ok": True,
+        "service": "hermes2stackchan-bridge",
+        "schema_version": SCHEMA_VERSION,
+        "pair": {
+            "pair_id": pair.pair_id,
+            "hermes_id": pair.hermes_id,
+            "stackchan_id": pair.stackchan_id,
+            "mqtt_prefix": pair.mqtt_prefix,
+        },
+        "stackchan": {
+            "online": stackchan_is_online(pair),
+            "last_seen_age_s": None if age is None else round(age, 3),
+            "status_topic": pair.status_topic,
+            "status_available": isinstance(status, dict),
+            "status_missing": missing,
+        },
+        "bridge": {
+            "mqtt_host": config.mqtt.host,
+            "mqtt_port": config.mqtt.port,
+            "hermes_health_url": hermes_health_url(config.hermes.base_url),
+            "hermes_chat_url": hermes_chat_url(config.hermes.base_url),
+            "stt_provider": config.speech.provider,
+            "stt_model": config.speech.groq_model,
+            "tts_engine": config.speech.tts_engine,
+            "voice": pair.voice,
+        },
+        "companion": {
+            "mood": state.get("mood", pair.mood_default),
+            "mood_intensity_pct": state.get("mood_intensity_pct", 60),
+            "proactivity": state.get("proactivity", pair.proactivity),
+            "privacy": privacy,
+        },
+        "queue": {
+            "priorities": ACTION_PRIORITY_RANKS,
+            "policy": "safety_and_user_interrupt; other actions queued by priority",
+        },
+    }
 
 
 def hermes_chat_url(base_url: str) -> str:
@@ -1120,11 +1744,14 @@ def build_hermes_system_content(
     capabilities: str,
     personality: str,
     status: dict[str, Any] | None,
+    context: dict[str, Any] | None = None,
 ) -> str:
     status_text = json.dumps(status or {}, ensure_ascii=False, sort_keys=True)
+    context_text = json.dumps(context or {}, ensure_ascii=False, sort_keys=True)
     system_parts = [
         f"You are {pair.hermes_id}. You control exactly one StackChan: {pair.stackchan_id}.",
         f"Your MQTT namespace is {pair.mqtt_prefix}. Never address another StackChan.",
+        f"Your configured wakeword is {pair.wakeword!r}; your configured voice is {pair.voice!r}.",
         "Return JSON only. Do not wrap it in Markdown.",
         "Schema: {\"reply\":\"short German text\",\"follow_up_listen\":false,\"actions\":[{\"action\":\"display|face|move|motion|led|device|sound|system|reminder\",...}]}",
         "Answer in German unless the user explicitly asks for another language.",
@@ -1132,12 +1759,16 @@ def build_hermes_system_content(
         "Use display only when you want to show extra visible text beyond reply. The bridge will synthesize reply as audio for StackChan when TTS is enabled.",
         "You may add hardware actions when useful, but never invent unsupported parameters. The bridge and firmware enforce limits.",
         "Keep answers concise for spoken interaction unless the user asks for detail.",
+        "Use the companion context before guessing: mood, privacy mode, local capabilities, recent interactions, sensor summary, and status summary are authoritative.",
+        "Respect privacy_mode: private means no camera, no Hermes-dependent external enrichment, and minimal retention; focus means avoid proactive chatter.",
+        "For normal personality, prefer playful but bounded face/motion choices. Do not stack contradictory actions.",
         "If your reply asks the user a real follow-up question and you expect an immediate answer, set follow_up_listen to true.",
         "If your reply is only a statement, command confirmation, or rhetorical question, set follow_up_listen to false.",
         "For reminders or notifications, use action reminder with text and delay_s or due_at. Example: {\"action\":\"reminder\",\"text\":\"Wasser trinken\",\"delay_s\":120}.",
         "If the user only says 'erinnere mich' without enough time or content, ask what/when and set follow_up_listen to true; do not invent reminder details.",
         "For explicit StackChan sleep commands use {\"action\":\"system\",\"system_action\":\"display_sleep\"}. For wake/display-on commands use display_wake. For explicit power-off/shutdown/runterfahren/abschalten commands use {\"action\":\"system\",\"system_action\":\"shutdown\"}; never use shutdown for ordinary sleep.",
         "For status questions, use the current status JSON and answer directly; do not invent sensor values.",
+        f"Companion context JSON: {context_text}",
         f"Current StackChan status JSON: {status_text}",
     ]
     if capabilities:
@@ -1153,9 +1784,10 @@ def build_hermes_messages(
     personality: str,
     status: dict[str, Any] | None,
     user_text: str,
+    context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status)},
+        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status, context)},
         {"role": "user", "content": user_text},
     ]
 
@@ -1174,9 +1806,10 @@ def build_hermes_vision_messages(
     user_text: str,
     image_bytes: bytes,
     content_type: str,
+    context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     return [
-        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status)},
+        {"role": "system", "content": build_hermes_system_content(pair, capabilities, personality, status, context)},
         {
             "role": "user",
             "content": [
@@ -1195,9 +1828,12 @@ def ask_hermes_http(
     status: dict[str, Any] | None,
     user_text: str,
 ) -> dict[str, Any]:
+    context = build_hermes_context_package(config, pair, status)
+    if privacy_policy_for_mode(context["privacy"]["mode"]).get("hermes_allowed") is False:
+        raise ConfigError("Hermes is disabled by the current privacy mode")
     payload = {
         "model": config.hermes.model,
-        "messages": build_hermes_messages(pair, capabilities, personality, status, user_text),
+        "messages": build_hermes_messages(pair, capabilities, personality, status, user_text, context),
         "temperature": 0.3,
     }
     response = http_post_json(
@@ -1219,6 +1855,10 @@ def ask_hermes_vision_http(
     image_bytes: bytes,
     content_type: str,
 ) -> dict[str, Any]:
+    context = build_hermes_context_package(config, pair, status)
+    privacy = privacy_policy_for_mode(context["privacy"]["mode"])
+    if privacy.get("hermes_allowed") is False or privacy.get("camera_allowed") is False:
+        raise ConfigError("Hermes vision is disabled by the current privacy mode")
     payload = {
         "model": config.hermes.model,
         "messages": build_hermes_vision_messages(
@@ -1229,6 +1869,7 @@ def ask_hermes_vision_http(
             user_text,
             image_bytes,
             content_type,
+            context,
         ),
         "temperature": 0.2,
     }
@@ -1325,6 +1966,14 @@ def action_to_topic_payload(pair: PairConfig, action: dict[str, Any], request_id
     if not name:
         raise ConfigError("Hermes action needs an action name")
     action_request_id = optional_string(action.get("request_id")) or request_id
+
+    display_mode = (optional_string(action.get("mode")) or "").lower()
+    if name in {"info", "show_info", "info_mode"} or (name == "display" and display_mode == "info"):
+        payload = build_info_payload(
+            request_id=action_request_id,
+            duration_ms=parse_int_value(action.get("duration_ms"), 0, "info.duration_ms"),
+        )
+        return pair.display_topic, payload
 
     if name == "display":
         text = optional_string(action.get("text"))
@@ -1732,6 +2381,29 @@ def format_minutes_duration(minutes: int) -> str:
     return f"{rest} Minuten"
 
 
+def local_info_reply_from_command(command: str, now: dt.datetime | None = None) -> tuple[str, list[dict[str, Any]], str] | None:
+    padded = f" {command} "
+    compact = command.replace(" ", "")
+    explicit_info = command in {
+        "info",
+        "info modus",
+        "info mode",
+        "infomodus",
+        "zeige info",
+        "zeig info",
+        "zeige den info modus",
+        "zeig den info modus",
+    }
+    date_time_request = (
+        "datum" in command
+        and ("uhrzeit" in command or "uhr" in padded or "zeit" in padded)
+        and any(verb in padded for verb in (" zeige ", " zeig ", " anzeigen ", " anzeige ", " mach ", " modus "))
+    )
+    if explicit_info or compact in {"datumunduhrzeit", "uhrzeitunddatum"} or date_time_request:
+        return "Info Modus.", [{"action": "info"}], ""
+    return None
+
+
 def local_time_reply_from_command(command: str, now: dt.datetime | None = None) -> tuple[str, list[dict[str, Any]], str] | None:
     current = local_datetime(now)
     padded = f" {command} "
@@ -1932,6 +2604,40 @@ def local_identity_reply_from_command(command: str) -> tuple[str, list[dict[str,
     return None
 
 
+def local_history_reply_from_transcript(
+    text: str,
+    config: BridgeConfig,
+    pair: PairConfig,
+) -> tuple[str, list[dict[str, Any]], str] | None:
+    command = strip_spoken_command_prefixes(normalize_spoken_command_text(text))
+    if not any(
+        phrase in command
+        for phrase in (
+            "was hast du heute gemacht",
+            "was hast du gemacht",
+            "was hast du gesagt",
+            "was war gerade",
+            "letzte interaktionen",
+            "zeig verlauf",
+        )
+    ):
+        return None
+    items = read_recent_interactions(config, pair, limit=3)
+    if not items:
+        return "Ich habe noch keinen Verlauf fuer heute.", [{"action": "face", "emotion": "thinking", "intensity_pct": 62}], ""
+    parts: list[str] = []
+    for item in items:
+        transcript = optional_string(item.get("transcript"))
+        reply = optional_string(item.get("reply"))
+        if transcript and reply:
+            parts.append(f"Du sagtest: {transcript}. Ich antwortete: {reply}.")
+        elif reply:
+            parts.append(f"Ich sagte: {reply}.")
+    if not parts:
+        return "Im Verlauf steht gerade nichts Lesbares.", [{"action": "face", "emotion": "thinking", "intensity_pct": 62}], ""
+    return " ".join(parts)[:450], [{"action": "face", "emotion": "thinking", "intensity_pct": 62}], ""
+
+
 def parse_spoken_percent(command: str) -> int | None:
     match = re.search(r"(?<!\d)(\d{1,3})(?:\s*(?:prozent|percent|%))?", command)
     if match:
@@ -2119,6 +2825,9 @@ def direct_local_command_from_transcript(
     command = strip_spoken_command_prefixes(normalized)
     if spoken_command_is_negated(normalized):
         return None
+    info_reply = local_info_reply_from_command(command, now)
+    if info_reply:
+        return info_reply
     if spoken_command_is_combined(command):
         return None
 
@@ -2715,6 +3424,13 @@ def sensor_face_down_tantrum_actions() -> list[dict[str, Any]]:
     ]
 
 
+def sensor_upright_cleanup_actions() -> list[dict[str, Any]]:
+    return [
+        {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
+        {"action": "face", "emotion": "neutral", "intensity_pct": 68},
+    ]
+
+
 def sensor_shake_motion_action() -> dict[str, Any]:
     return {
         "action": "motion",
@@ -2975,6 +3691,12 @@ TRANSIENT_FACE_EMOTIONS = {
     "look_right",
     "look_up",
     "look_down",
+    "brow_raise",
+    "brow_soft",
+    "brow_skeptic",
+    "brow_skeptic_left",
+    "brow_skeptic_right",
+    "brow_wiggle",
     "breathe",
     "deep_breathe",
     "micro_sleep",
@@ -3641,13 +4363,62 @@ def build_life_sequence(
     restore = current_face_action(status)
     mood = restore["emotion"]
     base_intensity = int(restore["intensity_pct"])
-    variant = choose_life_variant(rng)
-    sequence = variant.builder(rng, base_intensity, mood)
-    sequence = densify_life_sequence(sequence, rng, base_intensity, variant.name)
+
+    roll = rng.random()
+    variant_name = "template_idle"
+    if roll < 0.34:
+        variant_name = "template_blink"
+        sequence = [(0, life_face("soft_blink", base_intensity, variant_name))]
+    elif roll < 0.55:
+        variant_name = "template_glance"
+        glance = rng.choice(["glance_left", "glance_right", "glance_up", "glance_down"])
+        sequence = [
+            (0, life_face(glance, base_intensity, variant_name)),
+            (rng.choice([760, 920, 1080]), life_face("soft_blink", base_intensity, variant_name)),
+        ]
+    elif roll < 0.68:
+        variant_name = "template_brow"
+        sequence = [(0, life_face(
+            rng.choice(["brow_raise", "brow_soft", "brow_skeptic", "brow_skeptic_right", "brow_wiggle"]),
+            base_intensity,
+            variant_name,
+        ))]
+    elif roll < 0.81:
+        variant_name = "template_breathe"
+        sequence = [(0, life_face(rng.choice(["breathe", "deep_breathe"]), base_intensity, variant_name))]
+    elif roll < 0.91:
+        variant_name = "template_mouth"
+        sequence = [(0, life_face(rng.choice(["mouth_smile", "mouth_tiny", "mouth_wiggle"]), base_intensity, variant_name))]
+    elif roll < 0.98:
+        variant_name = "template_small_motion"
+        glance, motion = build_subtle_life_motion(rng)
+        motion["variant"] = variant_name
+        sequence = [
+            (0, life_face(glance, base_intensity, variant_name)),
+            (760, motion),
+            (900, life_face("soft_blink", base_intensity, variant_name)),
+        ]
+    else:
+        variant_name = "template_big_scan"
+        side = rng.choice([-1, 1])
+        first_glance = "glance_right" if side > 0 else "glance_left"
+        second_glance = "glance_left" if side > 0 else "glance_right"
+        sequence = [
+            (0, life_face(first_glance, base_intensity, variant_name)),
+            (180, life_motion([
+                motion_point(65 * side, DEFAULT_IDLE_PITCH_PCT + 4, 900, 28, 250),
+                motion_point(-45 * side, DEFAULT_IDLE_PITCH_PCT + 2, 1300, 24, 180),
+                motion_point(DEFAULT_IDLE_YAW_PCT, DEFAULT_IDLE_PITCH_PCT, 1100, 20),
+            ], 28, variant=variant_name)),
+            (900, life_face(second_glance, base_intensity, variant_name)),
+            (900, life_face("soft_blink", base_intensity, variant_name)),
+        ]
+
+    sequence = densify_life_sequence(sequence, rng, base_intensity, variant_name)
     if not include_motion:
         sequence = strip_motion_from_life_sequence(sequence)
     for _delay, action in sequence:
-        action.setdefault("variant", variant.name)
+        action.setdefault("variant", variant_name)
     return sequence
 
 
@@ -3691,6 +4462,25 @@ def notify_actions_from_payload(payload: dict[str, Any], display_text: str, tts_
         actions = []
     actions = [action for action in actions if isinstance(action, dict)]
     return external_reply_actions(actions, display_text, tts_enabled)
+
+
+def transcript_mentions_led_control(transcript: str) -> bool:
+    command = normalize_spoken_command_text(transcript)
+    return any(word in f" {command} " for word in (" led ", " leds ", " lampe ", " lampen ", " licht ", " lichter ", " neon "))
+
+
+def speech_cleanup_actions(transcript: str, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if transcript_mentions_led_control(transcript):
+        return []
+    has_alarm_led = any(
+        action_name(action) == "led"
+        and optional_string(action.get("mode")) in {"alarm", "blink", "party"}
+        for action in actions
+        if isinstance(action, dict)
+    )
+    if has_alarm_led:
+        return []
+    return [{"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0}]
 
 
 def mqtt_settle_delay_after_publish_s(topic: str, payload: dict[str, Any], pair: PairConfig | None = None) -> float:
@@ -3743,11 +4533,26 @@ def dispatch_mqtt_actions(
             client.subscribe([(pair.ack_topic, 1), (pair.error_topic, 1)])
         for topic, payload in action_messages:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "queued"), "source": "cli-dispatch"})
             result = client.publish(topic, body, qos=1, retain=False)
             result.wait_for_publish(timeout=5)
+            record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "done"), "source": "cli-dispatch"})
             print(f"[bridge] sent {topic}: {body}")
             if topic == pair.device_topic:
                 publish_device_settings_snapshot(client, pair, payload, "dispatch")
+            if topic == pair.face_topic:
+                emotion = optional_string(payload.get("emotion"))
+                mood = mood_from_face_emotion(emotion or "")
+                if mood is not None:
+                    write_companion_pair_state(
+                        config,
+                        pair,
+                        {
+                            "mood": mood,
+                            "mood_intensity_pct": clamp_int(parse_int_value(payload.get("intensity_pct"), 60, "face.intensity_pct"), 0, 100),
+                            "last_face_emotion": emotion,
+                        },
+                    )
             settle_delay = mqtt_settle_delay_after_publish_s(topic, payload, pair)
             if settle_delay > 0:
                 time.sleep(settle_delay)
@@ -3844,18 +4649,40 @@ def publish_action_messages(
     action_messages: list[tuple[str, dict[str, Any]]],
     pair: PairConfig | None = None,
     wait: bool = True,
+    config: BridgeConfig | None = None,
+    source: str = "bridge",
 ) -> None:
     if pair is not None and action_messages and not stackchan_is_online(pair):
         STACKCHAN_PRESENCE.note_skip(pair, f"{len(action_messages)} action(s)")
+        if config is not None:
+            for topic, payload in action_messages:
+                record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "skipped_offline"), "source": source})
         return
     for topic, payload in action_messages:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if pair is not None and config is not None:
+            record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "queued"), "source": source})
         result = client.publish(topic, body, qos=1, retain=False)
         if wait:
             result.wait_for_publish(timeout=5)
+        if pair is not None and config is not None:
+            record_telemetry_event(config, pair, {**action_queue_record(pair, topic, payload, "done"), "source": source})
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] sent {topic}: {body}", flush=True)
         if pair is not None and topic == pair.device_topic:
             publish_device_settings_snapshot(client, pair, payload, "action")
+        if pair is not None and config is not None and topic == pair.face_topic and source not in {"idle-life", "moment"}:
+            emotion = optional_string(payload.get("emotion"))
+            mood = None if (emotion or "") in TRANSIENT_FACE_EMOTIONS else mood_from_face_emotion(emotion or "")
+            if mood is not None:
+                write_companion_pair_state(
+                    config,
+                    pair,
+                    {
+                        "mood": mood,
+                        "mood_intensity_pct": clamp_int(parse_int_value(payload.get("intensity_pct"), 60, "face.intensity_pct"), 0, 100),
+                        "last_face_emotion": emotion,
+                    },
+                )
         settle_delay = mqtt_settle_delay_after_publish_s(topic, payload, pair)
         if settle_delay > 0:
             time.sleep(settle_delay)
@@ -3913,7 +4740,7 @@ def watch_power(args: argparse.Namespace) -> int:
             action_to_topic_payload(pair, action, f"power-{uuid.uuid4().hex[:12]}")
             for action in actions + immediate_followup_actions
         ]
-        publish_action_messages(client, action_messages, pair)
+        publish_action_messages(client, action_messages, pair, config=config, source="power")
         if delayed_followup_actions and not args.no_restore_face:
             delay_ms = max(
                 (int(action.get("duration_ms", 0)) for action in actions if action.get("action") == "display"),
@@ -3930,6 +4757,8 @@ def watch_power(args: argparse.Namespace) -> int:
                         for action in delayed_followup_actions
                     ],
                     pair,
+                    config=config,
+                    source="power-followup",
                 )
                 if args.once:
                     done.set()
@@ -4016,6 +4845,8 @@ def animate_life(args: argparse.Namespace) -> int:
                         client,
                         [action_to_topic_payload(pair, action, f"life-{uuid.uuid4().hex[:10]}")],
                         pair,
+                        config=config,
+                        source="idle-life",
                     )
                     settle_delay_s = life_action_settle_delay_s(action)
                     if settle_delay_s > 0:
@@ -4040,6 +4871,62 @@ def send_display(args: argparse.Namespace) -> int:
     pair = get_pair(config, args.pair)
     payload = build_display_payload(args.text, args.duration_ms, args.request_id)
     return send_payload(args, pair.display_topic, payload)
+
+
+def send_info(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    payload = build_info_payload(request_id=args.request_id, duration_ms=args.duration_ms)
+    return send_payload(args, pair.display_topic, payload)
+
+
+def watch_info_mode(args: argparse.Namespace) -> int:
+    config = load_config(Path(args.config), Path(args.env))
+    pair = get_pair(config, args.pair)
+    client = create_mqtt_client(config.mqtt)
+    done = Event()
+    state = {"active": False, "seen": False, "last_minute": ""}
+
+    def publish_current_info(reason: str) -> None:
+        now = local_datetime()
+        minute_key = now.strftime("%Y%m%d%H%M")
+        if state["last_minute"] == minute_key:
+            return
+        state["last_minute"] = minute_key
+        payload = build_info_payload(now=now, request_id=f"info-{uuid.uuid4().hex[:12]}", duration_ms=0)
+        publish_action_messages(client, [(pair.display_topic, payload)], pair, wait=False, config=config, source="info-mode")
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] info mode refresh ({reason}) {payload['time']} {payload['date']}", flush=True)
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(status, dict):
+            return
+        note_stackchan_status(pair, status, retained=message_is_retained(message))
+        active = nested_status_value(status, "ui.mode") == "info"
+        state["active"] = active
+        state["seen"] = True
+        if not active:
+            state["last_minute"] = ""
+        if args.once:
+            done.set()
+
+    client.on_message = on_message
+    try:
+        connect_and_start(client, config.mqtt)
+        client.subscribe(pair.status_topic, qos=0)
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] watching info mode on {pair.status_topic}", flush=True)
+        while not done.wait(max(0.2, float(args.interval_s))):
+            if state["active"]:
+                publish_current_info("minute")
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        client.loop_stop()
+        client.disconnect()
+    return 0
 
 
 def send_face(args: argparse.Namespace) -> int:
@@ -4636,7 +5523,7 @@ def watch_touch_emotions(args: argparse.Namespace) -> int:
         messages, errors = actions_to_topic_payloads(pair, actions, f"touch-{uuid.uuid4().hex[:10]}")
         if errors:
             print(f"[bridge] touch-emotion ignored invalid actions: {errors}", file=sys.stderr, flush=True)
-        publish_action_messages(client, messages, pair, wait=False)
+        publish_action_messages(client, messages, pair, wait=False, config=config, source="touch-emotion")
         if args.verbose:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] touch emotion {reasons}: {len(messages)} action(s)", flush=True)
         if args.once:
@@ -4681,7 +5568,8 @@ def watch_sensors(args: argparse.Namespace) -> int:
                 return
         if fresh_status:
             latest_status = fresh_status
-        pause_life_animation(pair.pair_id, args.life_pause_s, f"sensor reaction {','.join(reasons)}")
+        life_pause_s = max(float(args.life_pause_s), SENSOR_UPRIGHT_LIFE_PAUSE_S) if "upright" in reasons else float(args.life_pause_s)
+        pause_life_animation(pair.pair_id, life_pause_s, f"sensor reaction {','.join(reasons)}")
         immediate_actions = [
             action for action in actions
             if action_name(action) not in {"local_tts", "tts", "speak"}
@@ -4702,7 +5590,7 @@ def watch_sensors(args: argparse.Namespace) -> int:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {actions}", flush=True)
         else:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction {reasons}: {len(actions)} action(s)", flush=True)
-        publish_action_messages(client, messages, pair, wait=False)
+        publish_action_messages(client, messages, pair, wait=False, config=config, source="sensor")
         if delayed_tts_actions:
             tts_messages, tts_errors = actions_to_topic_payloads(
                 pair,
@@ -4712,7 +5600,23 @@ def watch_sensors(args: argparse.Namespace) -> int:
             )
             for error in tts_errors:
                 print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor reaction ignored tts: {error}", file=sys.stderr, flush=True)
-            publish_action_messages(client, tts_messages, pair, wait=False)
+            publish_action_messages(client, tts_messages, pair, wait=False, config=config, source="sensor-tts")
+        if "upright" in reasons:
+            def cleanup_upright() -> None:
+                cleanup_messages, cleanup_errors = actions_to_topic_payloads(
+                    pair,
+                    sensor_upright_cleanup_actions(),
+                    f"sensor-cleanup-{uuid.uuid4().hex[:10]}",
+                    config=config,
+                )
+                for error in cleanup_errors:
+                    print(f"[{time.strftime('%H:%M:%S')}] [bridge] sensor cleanup ignored action: {error}", file=sys.stderr, flush=True)
+                pause_life_animation(pair.pair_id, 2.0, "sensor upright cleanup")
+                publish_action_messages(client, cleanup_messages, pair, wait=False, config=config, source="sensor-cleanup")
+
+            cleanup_timer = Timer(SENSOR_UPRIGHT_CLEANUP_DELAY_S, cleanup_upright)
+            cleanup_timer.daemon = True
+            cleanup_timer.start()
         if args.once:
             done.set()
 
@@ -4968,8 +5872,15 @@ def transcribe_audio_bytes(audio: bytes, speech: SpeechConfig) -> tuple[str, str
     return transcribe_wav_groq_bytes(audio, speech), "groq"
 
 
-def archive_audio_if_requested(audio: bytes, speech: SpeechConfig, request_id: str) -> Path | None:
+def archive_audio_if_requested(
+    audio: bytes,
+    speech: SpeechConfig,
+    request_id: str,
+    privacy: dict[str, Any] | None = None,
+) -> Path | None:
     if not speech.archive_dir:
+        return None
+    if privacy is not None and privacy.get("audio_retention") != "debug":
         return None
     archive_dir = Path(speech.archive_dir).expanduser()
     archive_dir.mkdir(parents=True, exist_ok=True)
@@ -5482,6 +6393,8 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             self.server.mqtt_client,
             [action_to_topic_payload(self.server.pair, action, request_id)],
             self.server.pair,
+            config=self.server.config,
+            source="display-image",
         )
 
     def handle_display_image_post(self, request_id: str) -> None:
@@ -5602,6 +6515,16 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if not content_type.startswith("image/"):
             self.send_json(415, {"ok": False, "error": "expected image content type or X-H2S-Image-Format", "request_id": request_id})
             return
+        state = read_companion_state(self.server.config, self.server.pair)
+        privacy = privacy_policy_for_mode(state.get("privacy_mode", self.server.pair.privacy_mode))
+        if not privacy.get("camera_allowed", True):
+            record_telemetry_event(
+                self.server.config,
+                self.server.pair,
+                {"kind": "photo_suppressed", "request_id": request_id, "privacy_mode": privacy["mode"]},
+            )
+            self.send_json(423, {"ok": False, "error": f"camera suppressed by {privacy['mode']} mode", "request_id": request_id})
+            return
 
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         prompt = (
@@ -5670,7 +6593,13 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     f"photo-tts-{request_id}",
                 ))
             publish_started = time.monotonic()
-            publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+            publish_action_messages(
+                self.server.mqtt_client,
+                action_messages,
+                self.server.pair,
+                config=self.server.config,
+                source="photo",
+            )
             mqtt_ms = round((time.monotonic() - publish_started) * 1000)
             for reminder in scheduled_reminders:
                 print(f"[bridge-http] scheduled reminder from photo {reminder['id']}: {reminder['text']}", flush=True)
@@ -5682,6 +6611,32 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             if action_errors:
                 print(f"[bridge-http] photo ignored invalid actions request_id={request_id}: {action_errors}", flush=True)
+            record_interaction_event(
+                self.server.config,
+                self.server.pair,
+                {
+                    "kind": "photo",
+                    "request_id": request_id,
+                    "prompt": prompt,
+                    "reply": display_text,
+                    "actions_published": len(action_messages),
+                },
+            )
+            record_telemetry_event(
+                self.server.config,
+                self.server.pair,
+                {
+                    "kind": "photo_timing",
+                    "request_id": request_id,
+                    "image_bytes": len(image_bytes),
+                    "status_ms": status_ms,
+                    "hermes_ms": hermes_ms,
+                    "tts_ms": tts_ms,
+                    "mqtt_ms": mqtt_ms,
+                    "total_ms": total_ms,
+                    "action_errors": action_errors,
+                },
+            )
             self.send_json(
                 200,
                 {
@@ -5720,6 +6675,16 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if not spoken_text:
             self.send_json(400, {"ok": False, "error": "notify needs text, reply, or message", "request_id": request_id})
             return
+        state = read_companion_state(self.server.config, self.server.pair)
+        privacy = privacy_policy_for_mode(state.get("privacy_mode", self.server.pair.privacy_mode))
+        if not privacy.get("proactive_speech", True):
+            record_telemetry_event(
+                self.server.config,
+                self.server.pair,
+                {"kind": "notify_suppressed", "request_id": request_id, "privacy_mode": privacy["mode"]},
+            )
+            self.send_json(423, {"ok": False, "error": f"notify suppressed by {privacy['mode']} mode", "request_id": request_id})
+            return
 
         pause_life_animation(self.server.pair.pair_id, 45.0, f"external notify {request_id}")
         time.sleep(0.45)
@@ -5744,7 +6709,13 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 )
             )
             publish_started = time.monotonic()
-            publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+            publish_action_messages(
+                self.server.mqtt_client,
+                action_messages,
+                self.server.pair,
+                config=self.server.config,
+                source="notify",
+            )
             mqtt_ms = round((time.monotonic() - publish_started) * 1000)
             total_ms = round((time.monotonic() - started) * 1000)
             print(
@@ -5754,6 +6725,29 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             if action_errors:
                 print(f"[bridge-http] notify ignored invalid actions request_id={request_id}: {action_errors}", flush=True)
+            record_interaction_event(
+                self.server.config,
+                self.server.pair,
+                {
+                    "kind": "notify",
+                    "request_id": request_id,
+                    "reply": spoken_text,
+                    "actions_published": len(action_messages),
+                },
+            )
+            record_telemetry_event(
+                self.server.config,
+                self.server.pair,
+                {
+                    "kind": "notify_timing",
+                    "request_id": request_id,
+                    "chars": len(spoken_text),
+                    "mqtt_ms": mqtt_ms,
+                    "tts_ms": tts_ms,
+                    "total_ms": total_ms,
+                    "action_errors": action_errors,
+                },
+            )
             self.send_json(
                 200,
                 {
@@ -5777,6 +6771,13 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/health":
             self.send_json(200, {"ok": True, "service": "hermes2stackchan-bridge", "pair_id": self.server.pair.pair_id})
+            return
+        if path == "/healthz":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            include_status = query.get("status", ["1"])[0].strip().lower() not in {"0", "false", "no"}
+            payload = build_bridge_healthz(self.server.config, self.server.pair, include_status=include_status)
+            status_code = 200 if payload["stackchan"]["online"] or not include_status else 503
+            self.send_json(status_code, payload)
             return
         if path.startswith("/stackchan/tts/") and path.endswith(".wav"):
             filename = Path(path).name
@@ -5874,11 +6875,20 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
 
         audio = self.rfile.read(length)
         read_ms = round((time.monotonic() - started) * 1000)
-        archive_path = archive_audio_if_requested(audio, self.server.config.speech, request_id)
+        state = read_companion_state(self.server.config, self.server.pair)
+        privacy = privacy_policy_for_mode(state.get("privacy_mode", self.server.pair.privacy_mode))
+        archive_path = archive_audio_if_requested(audio, self.server.config.speech, request_id, privacy)
         if archive_path:
             print(f"[bridge-http] archived wav: {archive_path}", flush=True)
         print(f"[bridge-http] received {len(audio)} bytes in {read_ms}ms request_id={request_id}", flush=True)
         pause_life_animation(self.server.pair.pair_id, 75.0, f"speech request {request_id}")
+        processing_indicator = SpeechProcessingIndicator(
+            self.server.config,
+            self.server.pair,
+            self.server.mqtt_client,
+            request_id,
+        )
+        processing_indicator.start()
 
         try:
             stt_started = time.monotonic()
@@ -5896,7 +6906,11 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             else:
                 status: dict[str, Any] | None = None
                 status_ms = 0
-                direct_command = direct_local_command_from_transcript(transcript)
+                direct_command = local_history_reply_from_transcript(transcript, self.server.config, self.server.pair)
+                if direct_command:
+                    print(f"[bridge-http] local intent=history request_id={request_id}: hermes=0ms", flush=True)
+                if direct_command is None:
+                    direct_command = direct_local_command_from_transcript(transcript)
                 if direct_command is None and local_command_may_need_status(transcript):
                     status_started = time.monotonic()
                     status = read_latest_status(self.server.config, self.server.pair, timeout_s=0.8)
@@ -5930,16 +6944,55 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                         self.server.pair.personality_file,
                         self.server.config_path,
                     )
-                    hermes_started = time.monotonic()
-                    hermes_response = ask_hermes_http(
-                        self.server.config,
+                    publish_action_messages(
+                        self.server.mqtt_client,
+                        [
+                            action_to_topic_payload(
+                                self.server.pair,
+                                {"action": "face", "emotion": "thinking", "intensity_pct": 66},
+                                f"moment-{request_id}",
+                            )
+                        ],
                         self.server.pair,
-                        capabilities,
-                        personality,
-                        status,
-                        transcript,
+                        wait=False,
+                        config=self.server.config,
+                        source="moment",
                     )
-                    hermes_ms = round((time.monotonic() - hermes_started) * 1000)
+                    state = read_companion_state(self.server.config, self.server.pair)
+                    privacy = privacy_policy_for_mode(state.get("privacy_mode", self.server.pair.privacy_mode))
+                    if not privacy.get("hermes_allowed", True):
+                        hermes_response = {
+                            "reply": "Privatmodus. Ich kann gerade nur lokale Befehle.",
+                            "actions": [{"action": "face", "emotion": "friendly", "intensity_pct": 62}],
+                        }
+                        hermes_ms = 0
+                    else:
+                        hermes_started = time.monotonic()
+                        try:
+                            hermes_response = ask_hermes_http(
+                                self.server.config,
+                                self.server.pair,
+                                capabilities,
+                                personality,
+                                status,
+                                transcript,
+                            )
+                        except Exception as exc:
+                            hermes_response = {
+                                "reply": "Hermes braucht gerade zu lange. Ich bin aber noch da.",
+                                "actions": [{"action": "face", "emotion": "error", "intensity_pct": 62}],
+                            }
+                            record_telemetry_event(
+                                self.server.config,
+                                self.server.pair,
+                                {
+                                    "kind": "hermes_error",
+                                    "request_id": request_id,
+                                    "error": str(exc)[:400],
+                                },
+                            )
+                            print(f"[bridge-http] Hermes fallback request_id={request_id}: {exc}", flush=True)
+                        hermes_ms = round((time.monotonic() - hermes_started) * 1000)
                     actions = ensure_reply_action(hermes_response)
                     actions, post_tts_system_action = split_post_tts_system_actions(actions)
                     actions, scheduled_reminders, reminder_errors = schedule_reminders_from_actions(
@@ -5948,17 +7001,24 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                         actions,
                         f"speech-reminder-{request_id}",
                     )
-                action_messages, action_errors = actions_to_topic_payloads(
+                actions_for_cleanup = list(actions) + speech_cleanup_actions(transcript, actions)
+                action_messages, cleanup_errors = actions_to_topic_payloads(
                     self.server.pair,
-                    actions,
+                    actions_for_cleanup,
                     f"speech-{request_id}",
                     skip_actions={"say"},
                     config=self.server.config,
                     handler=self,
                 )
-                action_errors.extend(reminder_errors)
+                action_errors = list(reminder_errors) + cleanup_errors
                 publish_started = time.monotonic()
-                publish_action_messages(self.server.mqtt_client, action_messages, self.server.pair)
+                publish_action_messages(
+                    self.server.mqtt_client,
+                    action_messages,
+                    self.server.pair,
+                    config=self.server.config,
+                    source="speech",
+                )
                 mqtt_ms = round((time.monotonic() - publish_started) * 1000)
                 action_count = len(action_messages)
                 for reminder in scheduled_reminders:
@@ -5971,11 +7031,25 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             follow_up_listen = should_listen_for_followup(hermes_response, display_text)
 
             tts_started = time.monotonic()
-            tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if display_text else ""
-            tts_ms = round((time.monotonic() - tts_started) * 1000) if tts_path else 0
+            try:
+                tts_path = make_tts_wav(display_text, self.server.config.speech, request_id) if display_text else ""
+            except Exception as exc:
+                tts_path = ""
+                action_errors.append(f"TTS failed: {exc}")
+                print(f"[bridge-http] TTS fallback request_id={request_id}: {exc}", flush=True)
+                if display_text:
+                    publish_action_messages(
+                        self.server.mqtt_client,
+                        [(self.server.pair.display_topic, build_display_payload(display_text, 9000, f"speech-display-{request_id}"))],
+                        self.server.pair,
+                        config=self.server.config,
+                        source="speech-tts-fallback",
+                    )
+            tts_ms = round((time.monotonic() - tts_started) * 1000) if display_text else 0
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             tts_url = f"http://{host}{tts_path}" if tts_path else ""
             total_ms = round((time.monotonic() - started) * 1000)
+            processing_indicator.stop()
             print(
                 f"[bridge-http] transcript after {stt_ms}ms via {backend}: {transcript!r}; "
                 f"hermes={hermes_ms}ms status={status_ms}ms actions={action_count} mqtt={mqtt_ms}ms tts={tts_ms}ms "
@@ -5987,6 +7061,36 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     f"[bridge-http] ignored invalid Hermes actions request_id={request_id}: {action_errors}",
                     flush=True,
                 )
+            record_interaction_event(
+                self.server.config,
+                self.server.pair,
+                {
+                    "kind": "speech",
+                    "request_id": request_id,
+                    "transcript": transcript,
+                    "reply": display_text,
+                    "local": hermes_ms == 0,
+                    "follow_up_listen": follow_up_listen,
+                    "actions_published": action_count,
+                },
+            )
+            record_telemetry_event(
+                self.server.config,
+                self.server.pair,
+                {
+                    "kind": "speech_timing",
+                    "request_id": request_id,
+                    "audio_bytes": len(audio),
+                    "stt_ms": stt_ms,
+                    "hermes_ms": hermes_ms,
+                    "status_ms": status_ms,
+                    "mqtt_ms": mqtt_ms,
+                    "tts_ms": tts_ms,
+                    "total_ms": total_ms,
+                    "actions_published": action_count,
+                    "action_errors": action_errors,
+                },
+            )
             response_payload = {
                 "ok": bool(display_text),
                 "request_id": request_id,
@@ -6005,6 +7109,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                 response_payload["post_tts_system_action"] = post_tts_system_action
             self.send_json(200, response_payload)
         except Exception as exc:
+            processing_indicator.stop()
             error_text = f"SPRACHBRIDGE FEHLER: {exc}"
             print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
             try:
@@ -6012,6 +7117,8 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.server.mqtt_client,
                     [(self.server.pair.display_topic, build_display_payload("BRIDGE FEHLER", 5000, request_id))],
                     self.server.pair,
+                    config=self.server.config,
+                    source="speech-error",
                 )
             except Exception:
                 pass
@@ -6105,7 +7212,7 @@ def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder:
         f"[{time.strftime('%H:%M:%S')}] [bridge] firing reminder {reminder.get('id')}: {reminder.get('text')}",
         flush=True,
     )
-    publish_action_messages(client, messages, pair)
+    publish_action_messages(client, messages, pair, config=config, source="reminder")
 
 
 def watch_reminders(args: argparse.Namespace) -> int:
@@ -6258,6 +7365,18 @@ def run_bridge(args: argparse.Namespace) -> int:
                 once=False,
             ),
         ))
+    if not args.no_info:
+        workers.append((
+            "info-mode",
+            watch_info_mode,
+            argparse.Namespace(
+                config=args.config,
+                env=args.env,
+                pair=args.pair,
+                interval_s=args.info_interval_s,
+                once=False,
+            ),
+        ))
     if not args.no_idle_sleep:
         workers.append((
             "idle-sleep",
@@ -6355,6 +7474,11 @@ def build_parser() -> argparse.ArgumentParser:
     display.add_argument("--text", default="Hello from Hermes2StackChan", help="Text to show.")
     display.add_argument("--duration-ms", type=int, default=5000, help="Display duration hint.")
     display.set_defaults(func=send_display)
+
+    info = subcommands.add_parser("send-info", help="Show the sticky time/date info mode.")
+    add_common_send_options(info)
+    info.add_argument("--duration-ms", type=int, default=0, help="Info duration hint; 0 keeps info mode active.")
+    info.set_defaults(func=send_info)
 
     face = subcommands.add_parser("send-face", help="Set the StackChan face.")
     add_common_send_options(face)
@@ -6469,11 +7593,37 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--timeout", type=float, default=2.0, help="Status wait timeout in seconds.")
     status_parser.set_defaults(func=read_status)
 
+    companion_parser = subcommands.add_parser("read-companion", help="Read persistent mood/privacy state and the Hermes context package.")
+    companion_parser.add_argument("--pair", default="desk", help="Pair id to read.")
+    companion_parser.add_argument("--with-status", action="store_true", help="Include retained StackChan status summary.")
+    companion_parser.add_argument("--timeout", type=float, default=1.0, help="Status wait timeout in seconds.")
+    companion_parser.set_defaults(func=read_companion_cli)
+
+    set_companion = subcommands.add_parser("set-companion", help="Set persistent mood, privacy mode, or proactivity for one pair.")
+    set_companion.add_argument("--pair", default="desk", help="Pair id to update.")
+    set_companion.add_argument("--mood", choices=sorted(COMPANION_MOODS), default=None)
+    set_companion.add_argument("--mood-intensity-pct", type=int, default=None)
+    set_companion.add_argument("--privacy-mode", choices=sorted(PRIVACY_MODES), default=None)
+    set_companion.add_argument("--proactivity", choices=sorted(PROACTIVITY_LEVELS), default=None)
+    set_companion.set_defaults(func=set_companion_cli)
+
+    history_parser = subcommands.add_parser("list-history", help="Show the user-readable recent interaction history.")
+    history_parser.add_argument("--pair", default="desk", help="Pair id to read.")
+    history_parser.add_argument("--limit", type=int, default=10, help="Number of recent entries.")
+    history_parser.add_argument("--json", action="store_true", help="Print JSON.")
+    history_parser.set_defaults(func=list_history_cli)
+
     status_health_parser = subcommands.add_parser("status-health", help="Validate the retained StackChan status shape.")
     status_health_parser.add_argument("--pair", default="desk", help="Pair id to read.")
     status_health_parser.add_argument("--timeout", type=float, default=2.0, help="Status wait timeout in seconds.")
     status_health_parser.add_argument("--show-status", action="store_true", help="Print the retained status after validation.")
     status_health_parser.set_defaults(func=status_health)
+
+    healthz_parser = subcommands.add_parser("healthz", help="Print the extended V1.0 bridge health payload.")
+    healthz_parser.add_argument("--pair", default="desk", help="Pair id to read.")
+    healthz_parser.add_argument("--timeout", type=float, default=0.3, help="Retained status wait timeout in seconds.")
+    healthz_parser.add_argument("--no-status", action="store_true", help="Do not read retained StackChan status.")
+    healthz_parser.set_defaults(func=healthz_cli)
 
     hermes_health_parser = subcommands.add_parser("hermes-health", help="Check the configured Hermes HTTP health endpoint.")
     hermes_health_parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds.")
@@ -6555,6 +7705,12 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--once", action="store_true", help="Process retained status briefly and exit.")
     settings.set_defaults(func=watch_device_settings)
 
+    info_mode = subcommands.add_parser("watch-info-mode", help="Refresh sticky info mode once per minute while it is active.")
+    info_mode.add_argument("--pair", default="desk", help="Pair id to watch.")
+    info_mode.add_argument("--interval-s", type=float, default=2.0, help="Status polling/check interval.")
+    info_mode.add_argument("--once", action="store_true", help="Exit after the first status message.")
+    info_mode.set_defaults(func=watch_info_mode)
+
     idle_sleep = subcommands.add_parser("watch-idle-sleep", help="Turn the display off after a quiet idle timeout.")
     idle_sleep.add_argument("--pair", default="desk", help="Pair id to watch.")
     idle_sleep.add_argument("--timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
@@ -6587,6 +7743,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-sensors", action="store_true", help="Disable IMU/LTR553 sensor reactions.")
     run.add_argument("--no-reminders", action="store_true", help="Disable persistent reminder worker.")
     run.add_argument("--no-settings", action="store_true", help="Disable retained device settings restore worker.")
+    run.add_argument("--no-info", action="store_true", help="Disable sticky info-mode minute refresh worker.")
     run.add_argument("--no-idle-sleep", action="store_true", help="Disable automatic display sleep after quiet idle timeout.")
     run.add_argument("--no-life", action="store_true", help="Disable the idle life-animation worker.")
     run.add_argument("--touch-verbose", action="store_true", help="Log per-event touch-to-publish timing.")
@@ -6602,6 +7759,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--settings-timeout", type=float, default=1.5, help="Retained settings read timeout in seconds.")
     run.add_argument("--settings-display-wake", action="store_true", help="Also wake display when restoring retained settings.")
     run.add_argument("--settings-reboot-drop-ms", type=int, default=10_000, help="Treat uptime drops larger than this as reboot.")
+    run.add_argument("--info-interval-s", type=float, default=2.0, help="Info-mode refresh check interval.")
     run.add_argument("--idle-sleep-timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
     run.add_argument("--idle-sleep-poll-s", type=float, default=1.0, help="Idle sleep check interval.")
     run.add_argument("--idle-sleep-retry-s", type=float, default=30.0, help="Retry sleep command if status does not switch to sleeping.")

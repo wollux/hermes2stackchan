@@ -39,6 +39,7 @@ Known Pi paths:
 - Service command: `/home/wollux/hermes2stackchan/.venv/bin/python -u -m bridge.hermes2stackchan_bridge --env .env run --pair desk --host 0.0.0.0 --port 8788 --touch-verbose`
 - Bridge log: `/home/wollux/.hermes/logs/hermes2stackchan.log`
 - Bridge health: `http://127.0.0.1:8788/health`
+- Extended health: `http://127.0.0.1:8788/healthz`
 - StackChan IP normally seen in logs: `192.168.99.131`
 - MQTT namespace: `hermes-stackchan/desk/#`
 - Hermes Gateway service: `hermes-gateway.service`
@@ -69,6 +70,7 @@ Run these before claiming that StackChan did or did not do something:
 
 ```bash
 curl -fsS http://127.0.0.1:8788/health
+curl -fsS http://127.0.0.1:8788/healthz
 tail -n 80 /home/wollux/.hermes/logs/hermes2stackchan.log
 systemctl --user status hermes2stackchan.service --no-pager
 ```
@@ -234,9 +236,9 @@ When StackChan itself records audio:
 9. StackChan receives or fetches the TTS WAV and plays it.
 
 Local shortcuts include volume, brightness, display sleep/wake, battery,
-temperature, and basic sensor questions. They log `hermes=0ms` and still return
-display/TTS to StackChan. Combined tasks and anything requiring reasoning still
-goes to Hermes.
+temperature, info mode with date/time/weekday, and basic sensor questions. They
+log `hermes=0ms` and still return display/TTS to StackChan. Combined tasks and
+anything requiring reasoning still goes to Hermes.
 
 For this flow Hermes should return JSON:
 
@@ -284,14 +286,15 @@ HTTP.
 
 Use these through Hermes JSON actions or through bridge helper commands:
 
-- `display`: show short text or UI state
-- `display_image`: show an image via bridge-hosted JPEG URL
-- `face`: set emotion/face, for example `neutral`, `friendly`, `happy`,
-  `super_happy`, `thinking`, `listening`, `speaking`, `mischievous`, `smug`,
-  `evil_grin`, `help`, `panic`, `face_down`, `thankful`, `error`, `battery`,
-  `charging`, `battery_low`, plus transients like `blink`, `wink_left`,
-  `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`,
-  `breathe`, `deep_breathe`, `mouth_smile`, `mouth_tiny`, `mouth_wiggle`
+- `display`: accepted for compatibility; `mode:"info"` shows a sticky local
+  info screen with time, weekday, date, and a small face
+- `display_image`: accepted for compatibility, but current firmware does not replace the face with images
+- `face`: set a template emotion such as `neutral`, `happy`, `sad`,
+  `angry`, `surprised`, `tired`, `annoyed`, `confused`, `scared`, `love`,
+  `dead`, `glitch`, or a calm transient such as `soft_blink`, `breathe`,
+  `glance_left`, `glance_right`, `glance_up`, `glance_down`, `mouth_smile`,
+  `mouth_tiny`, `mouth_wiggle`, `brow_raise`, `brow_soft`, `brow_skeptic`,
+  `brow_skeptic_left`, `brow_skeptic_right`, `brow_wiggle`
 - `move`: safe directional or target movement
 - `motion`: computed motion path with waypoints
 - `led`: LED modes/colors
@@ -304,6 +307,38 @@ Use these through Hermes JSON actions or through bridge helper commands:
 
 The bridge and firmware are authoritative. They validate actions, clamp servo
 limits, and may ignore unsafe commands.
+
+## Companion Context, Privacy, And History
+
+The bridge now sends Hermes a V1.0 companion context package with:
+
+- pair profile: pair ID, wakeword, voice, personality/capability files
+- persistent mood and mood intensity
+- privacy mode: `normal`, `focus`, `private`, `demo`, `debug`
+- proactivity level: `quiet`, `balanced`, `playful`
+- status summary and local capabilities
+- recent interactions when privacy allows it
+
+Use this context instead of guessing. In `private` mode, do not ask for camera,
+web/Hermes-dependent enrichment, or proactive speech. In `focus` mode, avoid
+unrequested chatter. Debug mode may keep audio if the bridge is configured to do
+so; normal mode should not depend on archived audio.
+
+Useful diagnostics:
+
+```bash
+cd /home/wollux/hermes2stackchan
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env healthz --pair desk
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env read-companion --pair desk --with-status
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env set-companion --pair desk --privacy-mode focus
+/home/wollux/hermes2stackchan/.venv/bin/python -m bridge.hermes2stackchan_bridge --env .env list-history --pair desk
+```
+
+The bridge shows an animated thinking heartbeat while Hermes is processing:
+glances, brows, breathing, blinks, and a small mouth impulse. It intentionally
+does not move servos, use LEDs, or add spoken filler unless Wollux explicitly
+asks for that. Normal non-LED speech requests clean LEDs back to off at the end,
+so do not rely on a weather/status answer leaving a decorative lamp active.
 
 ## Face And Motion Behavior
 

@@ -19,6 +19,7 @@ from bridge.hermes2stackchan_bridge import (
     battery_snapshot,
     bridge_base_url_from_audio_url,
     build_display_payload,
+    build_info_payload,
     build_idle_sleep_payload,
     build_life_sequence,
     build_multipart_form_data,
@@ -29,6 +30,7 @@ from bridge.hermes2stackchan_bridge import (
     build_power_followup_actions,
     build_reminder,
     build_sensor_reaction_actions,
+    sensor_upright_cleanup_actions,
     build_touch_emotion_actions,
     build_touch_lamp_payload,
     command_requests_display_sleep,
@@ -41,7 +43,6 @@ from bridge.hermes2stackchan_bridge import (
     external_reply_actions,
     face_snapshot,
     add_reminder,
-    LIFE_VARIANT_NAMES,
     load_config,
     local_command_may_need_status,
     missing_status_paths,
@@ -62,6 +63,8 @@ from bridge.hermes2stackchan_bridge import (
     STACKCHAN_PRESENCE,
     build_hermes_messages,
     build_hermes_vision_messages,
+    build_bridge_healthz,
+    build_hermes_context_package,
     image_data_url,
     image_result_aspect_score,
     image_search_queries,
@@ -74,6 +77,14 @@ from bridge.hermes2stackchan_bridge import (
     sensor_status_is_face_down,
     sensor_status_is_sideways,
     status_allows_life_animation,
+    action_queue_record,
+    build_waiting_animation_actions,
+    waiting_animation_delay_s,
+    privacy_policy_for_mode,
+    record_interaction_event,
+    local_history_reply_from_transcript,
+    speech_cleanup_actions,
+    transcript_mentions_led_control,
 )
 
 
@@ -83,6 +94,7 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(config.mqtt.host, "localhost")
         self.assertEqual(config.hermes.base_url, "http://127.0.0.1:8642")
+        self.assertEqual(config.companion.history_keep, 200)
         self.assertIn("desk", config.pairs)
         self.assertEqual(config.pairs["desk"].display_topic, "hermes-stackchan/desk/cmd/display")
         self.assertEqual(config.pairs["desk"].move_topic, "hermes-stackchan/desk/cmd/move")
@@ -90,6 +102,127 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(config.pairs["desk"].device_topic, "hermes-stackchan/desk/cmd/device")
         self.assertEqual(config.pairs["desk"].audio_topic, "hermes-stackchan/desk/cmd/audio")
         self.assertEqual(config.pairs["desk"].events_topic, "hermes-stackchan/desk/events")
+        self.assertEqual(config.pairs["desk"].mood_default, "playful")
+        self.assertEqual(config.pairs["desk"].privacy_mode, "normal")
+        self.assertEqual(config.pairs["desk"].proactivity, "playful")
+        self.assertEqual(config.pairs["desk"].wakeword, "Computer")
+
+    def test_pair_profile_env_overrides(self) -> None:
+        config = load_config(
+            Path("config/pairs.example.json"),
+            env_path=None,
+            environ={
+                "H2S_PRIVACY_MODE": "private",
+                "H2S_PAIR_MOOD": "focused",
+                "H2S_PAIR_PROACTIVITY": "quiet",
+                "H2S_PAIR_WAKEWORD": "Hermes",
+                "H2S_PAIR_VOICE": "de-DE-ConradNeural",
+            },
+        )
+        pair = config.pairs["desk"]
+
+        self.assertEqual(pair.privacy_mode, "private")
+        self.assertEqual(pair.mood_default, "focused")
+        self.assertEqual(pair.proactivity, "quiet")
+        self.assertEqual(pair.wakeword, "Hermes")
+        self.assertEqual(pair.voice, "de-DE-ConradNeural")
+
+    def test_privacy_modes_define_retention_and_permissions(self) -> None:
+        normal = privacy_policy_for_mode("normal")
+        private = privacy_policy_for_mode("private")
+        debug = privacy_policy_for_mode("debug")
+
+        self.assertEqual(normal["audio_retention"], "off")
+        self.assertTrue(normal["hermes_allowed"])
+        self.assertFalse(private["text_history"])
+        self.assertFalse(private["camera_allowed"])
+        self.assertFalse(private["hermes_allowed"])
+        self.assertEqual(debug["audio_retention"], "debug")
+
+    def test_hermes_context_package_contains_profile_privacy_and_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json")},
+            )
+            pair = config.pairs["desk"]
+            status = {"battery_pct": 82, "external_power": True, "ui": {"mode": "face"}, "face": {"emotion": "friendly"}}
+            context = build_hermes_context_package(config, pair, status)
+
+        self.assertEqual(context["pair"]["pair_id"], "desk")
+        self.assertEqual(context["pair"]["wakeword"], "Computer")
+        self.assertEqual(context["mood"]["state"], "playful")
+        self.assertEqual(context["privacy"]["mode"], "normal")
+        self.assertIn("time_date_weekday_calendar_week", context["local_capabilities"])
+        self.assertEqual(context["status_summary"]["battery_pct"], 82)
+
+    def test_hermes_prompt_includes_companion_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json")},
+            )
+            pair = config.pairs["desk"]
+            context = build_hermes_context_package(config, pair, {"battery_pct": 88})
+
+            messages = build_hermes_messages(pair, "", "", {"battery_pct": 88}, "Hallo", context)
+        system_text = messages[0]["content"]
+
+        self.assertIn("Companion context JSON", system_text)
+        self.assertIn("privacy_mode", system_text)
+        self.assertIn("local_capabilities", system_text)
+        self.assertIn("configured wakeword", system_text)
+
+    def test_action_queue_priority_classifies_sources(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+
+        safety = action_queue_record(pair, pair.system_topic, {"action": "shutdown", "request_id": "cmd-1"}, "queued")
+        idle = action_queue_record(pair, pair.face_topic, {"emotion": "soft_blink", "request_id": "life-1"}, "queued")
+        notify = action_queue_record(pair, pair.audio_topic, {"action": "play_tts_url", "request_id": "notify-1"}, "queued")
+
+        self.assertEqual(safety["priority"], "user")
+        self.assertEqual(idle["priority"], "idle")
+        self.assertEqual(notify["priority"], "notification")
+
+    def test_healthz_payload_has_v1_sections_without_status_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json")},
+            )
+            pair = config.pairs["desk"]
+            payload = build_bridge_healthz(config, pair, include_status=False)
+
+        self.assertEqual(payload["service"], "hermes2stackchan-bridge")
+        self.assertIn("companion", payload)
+        self.assertIn("queue", payload)
+        self.assertEqual(payload["stackchan"]["status_available"], False)
+
+    def test_local_history_reply_uses_user_readable_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={
+                    "H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json"),
+                    "H2S_INTERACTION_HISTORY_STORE": str(Path(tmp) / "history.jsonl"),
+                },
+            )
+            pair = config.pairs["desk"]
+            record_interaction_event(
+                config,
+                pair,
+                {"kind": "speech", "transcript": "Wie spaet ist es?", "reply": "Es ist 14 Uhr 30."},
+            )
+            reply = local_history_reply_from_transcript("Was hast du gesagt?", config, pair)
+
+        self.assertIsNotNone(reply)
+        self.assertIn("Wie spaet ist es", reply[0])
+        self.assertIn("Es ist 14 Uhr 30", reply[0])
 
     def test_rejects_wrong_namespace(self) -> None:
         raw = {
@@ -193,6 +326,30 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "text")
         self.assertEqual(payload["text"], "Hallo StackChan")
         self.assertEqual(payload["request_id"], "test-001")
+
+    def test_info_payload_uses_german_date_fields(self) -> None:
+        now = dt.datetime(2026, 5, 13, 14, 37)
+        payload = build_info_payload(now, "info-001")
+
+        self.assertEqual(payload["schema_version"], "1.0")
+        self.assertEqual(payload["mode"], "info")
+        self.assertEqual(payload["time"], "14:37")
+        self.assertEqual(payload["date"], "13.05.2026")
+        self.assertEqual(payload["weekday"], "Mittwoch")
+        self.assertEqual(payload["duration_ms"], 0)
+        self.assertEqual(payload["request_id"], "info-001")
+
+    def test_info_action_targets_display_topic(self) -> None:
+        pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
+
+        topic, payload = action_to_topic_payload(pair, {"action": "info"}, "info-002")
+
+        self.assertEqual(topic, pair.display_topic)
+        self.assertEqual(payload["mode"], "info")
+        self.assertIn("time", payload)
+        self.assertIn("date", payload)
+        self.assertIn("weekday", payload)
+        self.assertEqual(payload["request_id"], "info-002")
 
     def test_display_image_action_targets_display_topic(self) -> None:
         config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
@@ -424,6 +581,28 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("face", {action["action"] for action in actions})
         self.assertNotIn("say", {action["action"] for action in actions})
 
+    def test_speech_cleanup_turns_led_off_unless_user_controls_leds(self) -> None:
+        self.assertFalse(transcript_mentions_led_control("Wie ist das Wetter?"))
+        self.assertTrue(transcript_mentions_led_control("Mach die Lampe blau."))
+
+        cleanup = speech_cleanup_actions("Wie ist das Wetter?", [{"action": "face", "emotion": "thinking"}])
+        self.assertEqual(cleanup, [{"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0}])
+        self.assertEqual(speech_cleanup_actions("Mach die LED blau.", [{"action": "led", "mode": "solid"}]), [])
+        self.assertEqual(speech_cleanup_actions("Hilfe.", [{"action": "led", "mode": "blink"}]), [])
+
+    def test_waiting_animation_is_visible_and_safe(self) -> None:
+        first = build_waiting_animation_actions(0)
+        self.assertEqual(first[0], {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0})
+        self.assertEqual(first[1]["emotion"], "thinking")
+
+        steps = [action for step in range(1, 13) for action in build_waiting_animation_actions(step)]
+        emotions = {action.get("emotion") for action in steps if action.get("action") == "face"}
+        self.assertGreaterEqual(len(emotions), 6)
+        self.assertNotIn("motion", {action.get("action") for action in build_waiting_animation_actions(10)})
+        self.assertIn("motion", {action.get("action") for action in build_waiting_animation_actions(10, include_motion=True)})
+        self.assertTrue(all(action.get("action") not in {"audio", "sound", "display"} for action in steps))
+        self.assertLess(waiting_animation_delay_s(1), 1.0)
+
     def test_mqtt_settle_delay_spaces_text_before_followup_actions(self) -> None:
         pair = load_config(Path("config/pairs.example.json"), env_path=None, environ={}).pairs["desk"]
 
@@ -553,6 +732,9 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(direct_local_command_from_transcript("Ist heute Dienstag?", now=now)[0], "Ja, heute ist Dienstag.")
         self.assertIn("Kalenderwoche 20", direct_local_command_from_transcript("Welche Kalenderwoche?", now=now)[0])
         self.assertIn("9 Stunden und 30 Minuten", direct_local_command_from_transcript("Wie lange bis Mitternacht?", now=now)[0])
+        info = direct_local_command_from_transcript("Zeige Datum und Uhrzeit.", now=now)
+        self.assertEqual(info[0], "Info Modus.")
+        self.assertEqual(info[1][0]["action"], "info")
 
     def test_direct_local_reminder_timer_math_and_random_skip_hermes(self) -> None:
         now = dt.datetime(2026, 5, 12, 14, 30)
@@ -921,6 +1103,13 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(reasons, ["upright"])
         self.assertEqual(actions, [{"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0}])
+        self.assertEqual(
+            sensor_upright_cleanup_actions(),
+            [
+                {"action": "led", "mode": "off", "r": 0, "g": 0, "b": 0},
+                {"action": "face", "emotion": "neutral", "intensity_pct": 68},
+            ],
+        )
 
     def test_sensor_reaction_face_down_repeats_until_upright(self) -> None:
         state = SensorReactionState()
@@ -1190,32 +1379,7 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertNotIn("led", action_names)
             self.assertNotIn("sound", action_names)
 
-    def test_life_variant_pool_has_100_named_variants(self) -> None:
-        self.assertGreaterEqual(len(LIFE_VARIANT_NAMES), 100)
-        self.assertEqual(len(set(LIFE_VARIANT_NAMES)), len(LIFE_VARIANT_NAMES))
-        for name in [
-            "double_blink",
-            "wink_left",
-            "wink_right",
-            "surprise_pop",
-            "happy_squint",
-            "look_behind",
-            "desk_spin",
-            "reset_grin",
-            "cross_eyes",
-            "eye_swap",
-            "derp",
-            "boing_eyes",
-            "suspicious_squint",
-            "confused_dots",
-            "mouth_pop",
-            "smirk_slide",
-            "silent_giggle",
-            "sleepy_snapback",
-        ]:
-            self.assertIn(name, LIFE_VARIANT_NAMES)
-
-    def test_life_sequence_reaches_at_least_90_variants_over_500_seeds(self) -> None:
+    def test_life_sequence_uses_only_template_idle_variants(self) -> None:
         status = {
             "display_sleeping": False,
             "recording": False,
@@ -1226,12 +1390,13 @@ class BridgeConfigTests(unittest.TestCase):
 
         seen = {
             action["variant"]
-            for seed in range(500)
+            for seed in range(200)
             for _delay, action in build_life_sequence(status, random.Random(seed))
             if "variant" in action
         }
 
-        self.assertGreaterEqual(len(seen), 90)
+        self.assertGreaterEqual(len(seen), 5)
+        self.assertTrue(all(variant.startswith("template_") for variant in seen))
 
     def test_life_sequence_blinks_often(self) -> None:
         status = {
@@ -1284,6 +1449,24 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertTrue(any(emotion.startswith("glance_") for emotion in emotions))
 
+    def test_life_sequence_uses_brow_impulses(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        emotions = {
+            action["emotion"]
+            for seed in range(120)
+            for _delay, action in build_life_sequence(status, random.Random(seed), include_motion=False)
+            if action["action"] == "face"
+        }
+
+        self.assertTrue(any(emotion.startswith("brow_") for emotion in emotions))
+
     def test_life_sequence_uses_mouth_impulses_and_breathing(self) -> None:
         status = {
             "display_sleeping": False,
@@ -1304,7 +1487,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("breathe", emotions)
         self.assertIn("deep_breathe", emotions)
 
-    def test_life_sequence_uses_micro_sleep_rarely(self) -> None:
+    def test_life_sequence_does_not_use_old_gag_faces(self) -> None:
         status = {
             "display_sleeping": False,
             "recording": False,
@@ -1312,45 +1495,20 @@ class BridgeConfigTests(unittest.TestCase):
             "ui": {"mode": "face"},
             "face": {"emotion": "neutral", "intensity_pct": 60},
         }
-
-        emotions = [
-            action["emotion"]
-            for seed in range(120)
-            for _delay, action in build_life_sequence(status, random.Random(seed), include_motion=False)
-            if action["action"] == "face"
-        ]
-
-        self.assertIn("micro_sleep", emotions)
-
-    def test_life_sequence_uses_funny_gags_but_not_constantly(self) -> None:
-        status = {
-            "display_sleeping": False,
-            "recording": False,
-            "speaking": False,
-            "ui": {"mode": "face"},
-            "face": {"emotion": "neutral", "intensity_pct": 60},
-        }
-        funny = {
+        forbidden = {
             "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint",
             "confused_dots", "mouth_pop", "smirk_slide", "silent_giggle", "sleepy_snapback",
+            "happy_squint", "surprise_pop", "micro_sleep", "glitch", "dead",
         }
 
-        sequences = [build_life_sequence(status, random.Random(seed), include_motion=False) for seed in range(300)]
-        funny_sequences = [
-            sequence
-            for sequence in sequences
-            if any(action["action"] == "face" and action["emotion"] in funny for _delay, action in sequence)
-        ]
-        seen = {
+        emotions = {
             action["emotion"]
-            for sequence in sequences
-            for _delay, action in sequence
-            if action["action"] == "face" and action["emotion"] in funny
+            for seed in range(300)
+            for _delay, action in build_life_sequence(status, random.Random(seed), include_motion=False)
+            if action["action"] == "face"
         }
 
-        self.assertGreaterEqual(len(seen), 8)
-        self.assertGreaterEqual(len(funny_sequences), 18)
-        self.assertLessEqual(len(funny_sequences), 45)
+        self.assertFalse(emotions.intersection(forbidden))
 
     def test_life_motion_is_mostly_small_and_slow(self) -> None:
         status = {
@@ -1386,7 +1544,7 @@ class BridgeConfigTests(unittest.TestCase):
                 self.assertLessEqual(abs(point["pitch_pct"] - DEFAULT_IDLE_PITCH_PCT), 4)
                 self.assertGreaterEqual(point["duration_ms"], 1400)
 
-    def test_life_sequence_has_rare_big_desk_sweep_motion(self) -> None:
+    def test_life_sequence_has_rare_big_template_scan_motion(self) -> None:
         status = {
             "display_sleeping": False,
             "recording": False,
@@ -1406,10 +1564,10 @@ class BridgeConfigTests(unittest.TestCase):
             for delay, motion in motions
             if any(abs(point["yaw_pct"]) >= 60 for point in motion["points"])
         ]
-        desk_spins = [
+        template_scans = [
             motion
             for _delay, motion in motions
-            if motion.get("variant") == "desk_spin"
+            if motion.get("variant") == "template_big_scan"
         ]
         vertical_motion = [
             (delay, motion)
@@ -1424,7 +1582,7 @@ class BridgeConfigTests(unittest.TestCase):
         ]
 
         self.assertTrue(big_horizontal)
-        self.assertTrue(desk_spins)
+        self.assertTrue(template_scans)
         self.assertTrue(vertical_motion)
         self.assertGreaterEqual(len(big_faces), (len(big_horizontal) + len(vertical_motion)))
         self.assertLess(len(big_horizontal), len(motions))
@@ -1486,7 +1644,7 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertFalse(limiter.allow(big, now_s=249.0))
         self.assertTrue(limiter.allow(big, now_s=250.0))
 
-    def test_life_sequence_pairs_vertical_faces_with_vertical_motion(self) -> None:
+    def test_life_sequence_pairs_motion_with_directional_faces(self) -> None:
         status = {
             "display_sleeping": False,
             "recording": False,
@@ -1495,22 +1653,21 @@ class BridgeConfigTests(unittest.TestCase):
             "face": {"emotion": "neutral", "intensity_pct": 60},
         }
 
-        vertical_sequences = []
+        paired_sequences = []
         for seed in range(400):
             sequence = build_life_sequence(status, random.Random(seed))
-            has_vertical_face = any(
-                action["action"] == "face" and action["emotion"] in {"glance_up", "glance_down"}
+            has_directional_face = any(
+                action["action"] == "face" and action["emotion"] in {"glance_left", "glance_right", "glance_up", "glance_down"}
                 for _delay, action in sequence
             )
-            has_vertical_motion = any(
+            has_motion = any(
                 action["action"] == "motion"
-                and any(abs(point["pitch_pct"] - DEFAULT_IDLE_PITCH_PCT) >= 18 for point in action["points"])
                 for _delay, action in sequence
             )
-            if has_vertical_face and has_vertical_motion:
-                vertical_sequences.append(sequence)
+            if has_directional_face and has_motion:
+                paired_sequences.append(sequence)
 
-        self.assertTrue(vertical_sequences)
+        self.assertTrue(paired_sequences)
 
     def test_life_sequence_can_disable_motion(self) -> None:
         status = {
