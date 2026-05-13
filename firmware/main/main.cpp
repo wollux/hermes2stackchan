@@ -192,7 +192,7 @@ bool g_face_pose_initialized = false;
 volatile int g_motion_gaze_dx = 0;
 volatile int g_motion_gaze_dy = 0;
 volatile bool g_motion_gaze_active = false;
-volatile int64_t g_last_motion_gaze_draw_ms = 0;
+volatile uint32_t g_motion_gaze_revision = 0;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -4172,7 +4172,7 @@ int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
 
 void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
 {
-    constexpr int kDeadbandPct = 0;
+    constexpr int kDeadbandPct = 1;
     int dx = 0;
     int dy = 0;
     if (std::abs(yaw_delta_pct) > kDeadbandPct) {
@@ -4186,9 +4186,15 @@ void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
         return;
     }
 
+    if (g_motion_gaze_active &&
+        g_motion_gaze_dx == dx &&
+        g_motion_gaze_dy == dy) {
+        return;
+    }
     g_motion_gaze_dx = dx;
     g_motion_gaze_dy = dy;
     g_motion_gaze_active = true;
+    g_motion_gaze_revision = g_motion_gaze_revision + 1;
 }
 
 void clear_motion_gaze()
@@ -4199,28 +4205,30 @@ void clear_motion_gaze()
     g_motion_gaze_dx = 0;
     g_motion_gaze_dy = 0;
     g_motion_gaze_active = false;
-    g_last_motion_gaze_draw_ms = 0;
+    g_motion_gaze_revision = g_motion_gaze_revision + 1;
 }
 
 void motion_gaze_task(void*)
 {
     bool drew_active_gaze = false;
+    uint32_t last_revision = g_motion_gaze_revision;
     while (true) {
         const bool can_draw = !g_display_sleeping &&
                               std::strcmp(g_ui_mode, "display") != 0 &&
                               std::strcmp(g_ui_mode, "image") != 0;
         if (g_motion_gaze_active && can_draw) {
-            const int64_t now_ms = esp_timer_get_time() / 1000;
-            if ((now_ms - g_last_motion_gaze_draw_ms) >= 120) {
-                g_last_motion_gaze_draw_ms = now_ms;
+            const uint32_t revision = g_motion_gaze_revision;
+            if (revision != last_revision || !drew_active_gaze) {
+                last_revision = revision;
                 render_current_face_pose_no_transition();
                 drew_active_gaze = true;
             }
         } else if (drew_active_gaze && can_draw) {
+            last_revision = g_motion_gaze_revision;
             render_current_face_pose_no_transition();
             drew_active_gaze = false;
         }
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -4248,6 +4256,8 @@ void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
                             bool spline)
 {
     const int steps = safe_motion_steps(yaw1, pitch1, yaw2, pitch2, duration_ms);
+    update_motion_gaze_from_pct_delta(raw_position_to_target_pct(yaw, yaw2) - raw_position_to_target_pct(yaw, yaw1),
+                                      raw_position_to_target_pct(pitch, pitch2) - raw_position_to_target_pct(pitch, pitch1));
     for (int step = 1; step <= steps; ++step) {
         const float t = smoothstep_value(static_cast<float>(step) / static_cast<float>(steps));
         int yaw_next = 0;
