@@ -189,6 +189,10 @@ int g_face_blush_alpha_pct = 0;
 int g_face_hearts_alpha_pct = 0;
 bool g_face_fx_alpha_initialized = false;
 bool g_face_pose_initialized = false;
+volatile int g_motion_gaze_dx = 0;
+volatile int g_motion_gaze_dy = 0;
+volatile bool g_motion_gaze_active = false;
+volatile int64_t g_last_motion_gaze_draw_ms = 0;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -2372,6 +2376,8 @@ struct FacePose {
     uint16_t brow_color = 0;
 };
 
+void render_face_pose(const FacePose& pose);
+
 FacePose lerp_face_pose(const FacePose& from, const FacePose& to, float t)
 {
     t = std::max(0.0f, std::min(1.0f, t));
@@ -2415,6 +2421,38 @@ FacePose lerp_face_pose(const FacePose& from, const FacePose& to, float t)
     out.anger = use_target_symbols ? to.anger : from.anger;
     out.glitch = use_target_symbols ? to.glitch : from.glitch;
     return out;
+}
+
+void apply_motion_gaze(FacePose& pose)
+{
+    if (!g_motion_gaze_active || pose.heart_eyes || pose.x_eyes) {
+        return;
+    }
+
+    const int dx = clamp_int(static_cast<int>(g_motion_gaze_dx), -12, 12);
+    const int dy = clamp_int(static_cast<int>(g_motion_gaze_dy), -10, 10);
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+
+    if (pose.left_line) {
+        pose.left_line = false;
+        pose.left_rx = std::max(pose.left_rx, 18);
+        pose.left_ry = std::max(pose.left_ry, 22);
+    }
+    if (pose.right_line) {
+        pose.right_line = false;
+        pose.right_rx = std::max(pose.right_rx, 18);
+        pose.right_ry = std::max(pose.right_ry, 22);
+    }
+    if (!pose.left_line) {
+        pose.left_pupil_dx = clamp_int(pose.left_pupil_dx + dx, -18, 18);
+        pose.left_pupil_dy = clamp_int(pose.left_pupil_dy + dy, -14, 14);
+    }
+    if (!pose.right_line) {
+        pose.right_pupil_dx = clamp_int(pose.right_pupil_dx + dx, -18, 18);
+        pose.right_pupil_dy = clamp_int(pose.right_pupil_dy + dy, -14, 14);
+    }
 }
 
 bool build_face_pose(const char* emotion, int intensity_pct, FacePose& pose)
@@ -2542,7 +2580,20 @@ bool build_face_pose(const char* emotion, int intensity_pct, FacePose& pose)
     } else {
         return str_eq(emotion, "neutral");
     }
+    apply_motion_gaze(pose);
     return true;
+}
+
+void render_current_face_pose_no_transition()
+{
+    FacePose pose = {};
+    if (build_face_pose(normalize_face_emotion(g_face_emotion),
+                        clamp_int(g_face_intensity_pct, 0, 100),
+                        pose)) {
+        g_face_blush_alpha_pct = pose.blush_alpha;
+        g_face_hearts_alpha_pct = pose.hearts_alpha;
+        render_face_pose(pose);
+    }
 }
 
 void render_face_pose(const FacePose& pose)
@@ -4119,14 +4170,66 @@ int safe_motion_steps(int yaw_start_raw, int pitch_start_raw,
     return std::max(min_safe_steps, requested_steps);
 }
 
+void update_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct)
+{
+    constexpr int kDeadbandPct = 0;
+    int dx = 0;
+    int dy = 0;
+    if (std::abs(yaw_delta_pct) > kDeadbandPct) {
+        dx = yaw_delta_pct < 0 ? -11 : 11;
+    }
+    if (std::abs(pitch_delta_pct) > kDeadbandPct) {
+        dy = pitch_delta_pct > 0 ? -9 : 9;
+    }
+
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+
+    g_motion_gaze_dx = dx;
+    g_motion_gaze_dy = dy;
+    g_motion_gaze_active = true;
+
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (g_display_sleeping ||
+        std::strcmp(g_ui_mode, "display") == 0 ||
+        std::strcmp(g_ui_mode, "image") == 0 ||
+        (now_ms - g_last_motion_gaze_draw_ms) < 80) {
+        return;
+    }
+
+    g_last_motion_gaze_draw_ms = now_ms;
+    render_current_face_pose_no_transition();
+}
+
+void clear_motion_gaze()
+{
+    if (!g_motion_gaze_active) {
+        return;
+    }
+    g_motion_gaze_dx = 0;
+    g_motion_gaze_dy = 0;
+    g_motion_gaze_active = false;
+    g_last_motion_gaze_draw_ms = esp_timer_get_time() / 1000;
+    if (!g_display_sleeping &&
+        std::strcmp(g_ui_mode, "display") != 0 &&
+        std::strcmp(g_ui_mode, "image") != 0) {
+        render_current_face_pose_no_transition();
+    }
+}
+
 void write_motion_sample(const ServoAxis& yaw, const ServoAxis& pitch,
                          int& yaw_pos, int& pitch_pos,
                          int yaw_raw, int pitch_raw)
 {
+    const int previous_yaw_pct = raw_position_to_target_pct(yaw, yaw_pos);
+    const int previous_pitch_pct = raw_position_to_target_pct(pitch, pitch_pos);
     yaw_pos = clamp_int(yaw_raw, effective_raw_min(yaw), effective_raw_max(yaw));
     pitch_pos = clamp_int(pitch_raw, effective_raw_min(pitch), effective_raw_max(pitch));
     write_safe_servo_positions(yaw, pitch, yaw_pos, pitch_pos);
     update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
+    update_motion_gaze_from_pct_delta(static_cast<int>(g_servo_yaw_pct) - previous_yaw_pct,
+                                      static_cast<int>(g_servo_pitch_pct) - previous_pitch_pct);
 }
 
 void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
@@ -7052,6 +7155,7 @@ void hardware_servo_task(void*)
         g_servo_bus.EnableTorque(pitch.id, 1);
         if (has_motion) {
             execute_motion_command(yaw, pitch, yaw_pos, pitch_pos, motion);
+            clear_motion_gaze();
             end_head_motion_ignore();
             update_servo_temperatures(yaw, pitch);
             g_servo_bus.EnableTorque(yaw.id, 0);
@@ -7064,6 +7168,7 @@ void hardware_servo_task(void*)
         const int pitch_target = has_pitch_target ? target_pct_to_raw_position(pitch, pitch_target_pct) : pitch_pos + pitch_delta;
         ESP_LOGI(kTag, "servo target raw yaw=%d pitch=%d", yaw_target, pitch_target);
         move_axes_smooth_target(yaw, pitch, yaw_pos, pitch_pos, yaw_target, pitch_target, 32);
+        clear_motion_gaze();
         end_head_motion_ignore();
         update_servo_state_pct(yaw, pitch, yaw_pos, pitch_pos);
         update_servo_temperatures(yaw, pitch);
