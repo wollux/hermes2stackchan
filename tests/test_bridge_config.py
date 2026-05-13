@@ -220,6 +220,49 @@ class BridgeConfigTests(unittest.TestCase):
             self.assertEqual(state["mood"], "concerned")
             self.assertEqual(state["mood_intensity_pct"], 68)
 
+    def test_privacy_and_proactivity_actions_update_state_without_mqtt_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json")},
+            )
+            pair = config.pairs["desk"]
+
+            messages, errors = actions_to_topic_payloads(
+                pair,
+                [
+                    {"action": "privacy", "privacy_mode": "focus"},
+                    {"action": "proactivity", "proactivity": "quiet"},
+                ],
+                "test-companion-mode",
+                config=config,
+            )
+
+            self.assertEqual(messages, [])
+            self.assertEqual(errors, [])
+            state = read_companion_state(config, pair)
+            self.assertEqual(state["privacy_mode"], "focus")
+            self.assertEqual(state["proactivity"], "quiet")
+
+    def test_local_companion_mode_commands_are_handled_without_hermes(self) -> None:
+        result = direct_local_command_from_transcript("Nicht stoeren.")
+        self.assertIsNotNone(result)
+        assert result is not None
+        reply, actions, post_tts = result
+
+        self.assertEqual(reply, "Nicht stoeren ist aktiv.")
+        self.assertEqual(post_tts, "")
+        self.assertIn({"action": "privacy", "privacy_mode": "focus"}, actions)
+        self.assertIn({"action": "proactivity", "proactivity": "quiet"}, actions)
+
+        normal_result = direct_local_command_from_transcript("Nicht stoeren aus.")
+        self.assertIsNotNone(normal_result)
+        assert normal_result is not None
+        normal_reply, normal_actions, _ = normal_result
+        self.assertEqual(normal_reply, "Normalmodus ist aktiv.")
+        self.assertIn({"action": "privacy", "privacy_mode": "normal"}, normal_actions)
+
     def test_normalize_companion_mood_unknown_falls_back_to_playful(self) -> None:
         self.assertEqual(normalize_companion_mood("wat"), "playful")
         self.assertEqual(normalize_companion_mood("question"), "curious")

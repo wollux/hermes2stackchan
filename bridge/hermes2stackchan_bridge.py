@@ -2387,6 +2387,20 @@ def actions_to_topic_payloads(
                 if applied is None:
                     raise ConfigError("mood action needs mood")
                 continue
+            if name in {"privacy", "set_privacy", "privacy_mode"}:
+                if config is None:
+                    raise ConfigError("privacy action needs bridge config")
+                privacy_value = action.get("privacy_mode") or action.get("mode") or action.get("state")
+                mode = normalized_choice(privacy_value, PRIVACY_MODES, pair.privacy_mode, "privacy_mode")
+                write_companion_pair_state(config, pair, {"privacy_mode": mode})
+                continue
+            if name in {"proactivity", "set_proactivity"}:
+                if config is None:
+                    raise ConfigError("proactivity action needs bridge config")
+                proactivity_value = action.get("proactivity") or action.get("level") or action.get("state")
+                level = normalized_choice(proactivity_value, PROACTIVITY_LEVELS, pair.proactivity, "proactivity")
+                write_companion_pair_state(config, pair, {"proactivity": level})
+                continue
             if name in {"search_image", "image_search", "web_image", "internet_image", "net_image"}:
                 if config is None:
                     raise ConfigError("image_search action needs bridge config")
@@ -3538,6 +3552,113 @@ def local_face_reply_from_command(command: str) -> tuple[str, list[dict[str, Any
     return None
 
 
+def local_companion_mode_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    padded = f" {command} "
+
+    normal_phrases = (
+        "normalmodus",
+        "normal modus",
+        "normaler modus",
+        "zurueck zu normal",
+        "wieder normal",
+        "nicht stoeren aus",
+        "nichtstoeren aus",
+        "fokus aus",
+        "fokusmodus aus",
+        "privatmodus aus",
+        "privat modus aus",
+        "debug aus",
+        "debugmodus aus",
+        "demo aus",
+        "demomodus aus",
+    )
+    if any(phrase in command for phrase in normal_phrases):
+        return (
+            "Normalmodus ist aktiv.",
+            [
+                {"action": "privacy", "privacy_mode": "normal"},
+                {"action": "proactivity", "proactivity": "playful"},
+                {"action": "mood", "mood": "playful", "intensity_pct": 66},
+                {"action": "face", "emotion": "friendly", "intensity_pct": 68},
+            ],
+            "",
+        )
+
+    focus_phrases = (
+        "nicht stoeren",
+        "nichtstoeren",
+        "fokus modus",
+        "fokusmodus",
+        "fokus an",
+        "ruhemodus",
+        "sei ruhig",
+        "stoer mich nicht",
+    )
+    if any(phrase in command for phrase in focus_phrases):
+        return (
+            "Nicht stoeren ist aktiv.",
+            [
+                {"action": "privacy", "privacy_mode": "focus"},
+                {"action": "proactivity", "proactivity": "quiet"},
+                {"action": "mood", "mood": "focused", "intensity_pct": 66},
+                {"action": "face", "emotion": "focused", "intensity_pct": 64},
+            ],
+            "",
+        )
+
+    private_phrases = (
+        "privatmodus",
+        "privat modus",
+        "privacy modus",
+        "privat an",
+        "alles privat",
+    )
+    if any(phrase in command for phrase in private_phrases):
+        return (
+            "Privatmodus ist aktiv.",
+            [
+                {"action": "privacy", "privacy_mode": "private"},
+                {"action": "proactivity", "proactivity": "quiet"},
+                {"action": "mood", "mood": "focused", "intensity_pct": 62},
+                {"action": "face", "emotion": "focused", "intensity_pct": 62},
+            ],
+            "",
+        )
+
+    if any(phrase in command for phrase in ("debugmodus", "debug modus", "debug an")):
+        return (
+            "Debugmodus ist aktiv.",
+            [
+                {"action": "privacy", "privacy_mode": "debug"},
+                {"action": "proactivity", "proactivity": "balanced"},
+                {"action": "face", "emotion": "thinking", "intensity_pct": 62},
+            ],
+            "",
+        )
+
+    if any(phrase in command for phrase in ("demomodus", "demo modus", "demo an", "vorfuehrmodus")):
+        return (
+            "Demomodus ist aktiv.",
+            [
+                {"action": "privacy", "privacy_mode": "demo"},
+                {"action": "proactivity", "proactivity": "playful"},
+                {"action": "mood", "mood": "playful", "intensity_pct": 72},
+                {"action": "face", "emotion": "friendly", "intensity_pct": 72},
+            ],
+            "",
+        )
+
+    if "proaktiv" in padded or "proaktivitaet" in padded:
+        if any(word in padded for word in (" leise ", " ruhig ", " wenig ", " aus ")):
+            return "Proaktivitaet leise.", [{"action": "proactivity", "proactivity": "quiet"}], ""
+        if any(word in padded for word in (" normal ", " mittel ", " balanciert ")):
+            return "Proaktivitaet normal.", [{"action": "proactivity", "proactivity": "balanced"}], ""
+        if any(word in padded for word in (" verspielt ", " lebendig ", " viel ")):
+            return "Proaktivitaet verspielt.", [{"action": "proactivity", "proactivity": "playful"}], ""
+
+    return None
+
+
 def direct_local_command_from_transcript(
     text: str,
     status: Any = STATUS_NOT_PROVIDED,
@@ -3547,6 +3668,9 @@ def direct_local_command_from_transcript(
     if not normalized:
         return None
     command = strip_spoken_command_prefixes(normalized)
+    companion_mode_reply = local_companion_mode_reply_from_command(command)
+    if companion_mode_reply:
+        return companion_mode_reply
     if spoken_command_is_negated(normalized):
         return None
     info_reply = local_info_reply_from_command(command, now)
