@@ -13,6 +13,13 @@
     "api_key": null,
     "timeout_s": 30
   },
+  "companion": {
+    "state_store_path": "~/.hermes/hermes2stackchan/companion_state.json",
+    "history_store_path": "~/.hermes/hermes2stackchan/interaction_history.jsonl",
+    "telemetry_store_path": "~/.hermes/hermes2stackchan/telemetry.jsonl",
+    "history_keep": 200,
+    "telemetry_enabled": true
+  },
   "pairs": [
     {
       "pair_id": "desk",
@@ -20,7 +27,14 @@
       "stackchan_id": "stackchan-desk",
       "mqtt_prefix": "hermes-stackchan/desk",
       "capabilities_file": "capabilities/bridge-capabilities-desk.md",
-      "personality_file": "personalities/hermes-desk.md"
+      "personality_file": "personalities/hermes-desk.md",
+      "profile": {
+        "mood_default": "playful",
+        "privacy_mode": "normal",
+        "proactivity": "playful",
+        "wakeword": "Computer",
+        "voice": "de-DE-KatjaNeural"
+      }
     }
   ]
 }

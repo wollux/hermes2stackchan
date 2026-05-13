@@ -18,9 +18,9 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Default pair: `desk`.
 - Retained status on `hermes-stackchan/desk/status`.
 - Structured ACK, error, and event topics.
-- Display text commands.
-- Face rendering with eyes, pupils, mouth, blink, breathing, gaze directions, sleep hints, battery states, and simple emotions.
-- Idle life animation from the bridge while StackChan is idle.
+- Display text/image commands are accepted for compatibility, and `send-info` shows a sticky time/date info mode with a small face.
+- Firmware-rendered Robot Face template moods from `robot-face.html`: dark panel, white eyes/mouth/brows, subtle emotions, calm blink/breathe/glance/mouth transients.
+- Idle life animation from the bridge while StackChan is idle, limited to calm template-compatible face impulses and occasional safe head motion.
 - Automatic idle sleep: after five quiet minutes without human interaction or non-life actions, the bridge turns the display off and stops motion impulses.
 - Wake on interaction: head touch, display touch, commanded movement, IMU movement, and LTR553 proximity wake the display through the CRT wake animation.
 - Head movement with soft limits and smooth waypoint paths.
@@ -30,7 +30,7 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Display brightness, display sleep, display wake, shutdown, reboot, ping, and status commands.
 - Battery and power status in retained MQTT state.
 - Interaction sensor status for BMI270 IMU motion and LTR553 proximity/ambient light.
-- Filtered bridge reactions for real sensor interaction: shake face, sideways surprise, proximity head dip, and sensor wake from sleep.
+- Filtered bridge reactions for real sensor interaction: shake face, sideways help/panic face, face-down tantrum, proximity head dip, and sensor wake from sleep.
 - Power watcher reactions for plug/unplug without taking over LEDs.
 - Temperature fields for SoC and servos where available.
 - ES7210 microphone recording.
@@ -41,6 +41,14 @@ This repository is already beyond the first MQTT smoke test. The current feature
 - Groq Whisper STT through the bridge.
 - Local spoken shortcuts before Hermes for simple one-step hardware/status commands like volume, brightness, display on/off, battery, temperature, and sensor questions.
 - Hermes chat call with current StackChan status, capabilities, and personality.
+- V1.0 companion context package for Hermes: pair profile, wakeword, voice, persistent mood, privacy mode, proactivity, status summary, local capabilities, and recent interaction history.
+- Persistent per-pair companion state: mood, mood intensity, privacy mode, and proactivity survive bridge restarts.
+- Mode-based privacy policy: normal/focus/private/demo/debug control text history, audio retention, proactive speech, Hermes access, and camera access.
+- User-readable interaction history and local telemetry JSONL stores outside git.
+- Extended bridge health endpoint `/healthz` plus CLI `healthz`.
+- Action priority telemetry for safety, user, conversation, notification, proactive, and idle actions.
+- Visual "Moment..." bridge response: non-local speech requests get a thinking face/heartbeat while Hermes works, without spoken filler.
+- Speech-session cleanup turns LEDs off after normal non-LED voice requests, so a Hermes/weather/action mistake cannot leave a blue lamp stuck.
 - Validated Hermes hardware actions dispatched over MQTT.
 - Edge/Katja German TTS generation.
 - TTS WAV returned to StackChan and played through the speaker.
@@ -207,6 +215,11 @@ H2S_HERMES_ID=hermes-desk
 H2S_STACKCHAN_ID=stackchan-desk
 H2S_CAPABILITIES_FILE=capabilities/bridge-capabilities-desk.md
 H2S_PERSONALITY_FILE=personalities/hermes-desk.md
+H2S_PAIR_MOOD=playful
+H2S_PRIVACY_MODE=normal
+H2S_PAIR_PROACTIVITY=playful
+H2S_PAIR_WAKEWORD=Computer
+H2S_PAIR_VOICE=de-DE-KatjaNeural
 
 H2S_MQTT_HOST=127.0.0.1
 H2S_MQTT_PORT=1883
@@ -240,6 +253,12 @@ H2S_HERMES_TIMEOUT_S=30
 H2S_REMINDER_STORE=~/.hermes/hermes2stackchan/reminders.json
 H2S_REMINDER_POLL_S=1
 H2S_REMINDER_DISPLAY_MS=9000
+
+H2S_COMPANION_STATE_STORE=~/.hermes/hermes2stackchan/companion_state.json
+H2S_INTERACTION_HISTORY_STORE=~/.hermes/hermes2stackchan/interaction_history.jsonl
+H2S_TELEMETRY_STORE=~/.hermes/hermes2stackchan/telemetry.jsonl
+H2S_HISTORY_KEEP=200
+H2S_TELEMETRY_ENABLED=true
 ```
 
 Install Python package:
@@ -364,6 +383,17 @@ Read status:
 ```bash
 scripts/h2s_bridge.sh read-status --pair desk
 scripts/h2s_bridge.sh status-health --pair desk
+scripts/h2s_bridge.sh healthz --pair desk
+scripts/h2s_bridge.sh read-companion --pair desk --with-status
+scripts/h2s_bridge.sh list-history --pair desk
+```
+
+Set the persistent companion mode:
+
+```bash
+scripts/h2s_bridge.sh set-companion --pair desk --mood playful --privacy-mode normal --proactivity playful
+scripts/h2s_bridge.sh set-companion --pair desk --privacy-mode private
+scripts/h2s_bridge.sh set-companion --pair desk --privacy-mode debug
 ```
 
 Show display text:
@@ -373,6 +403,12 @@ scripts/h2s_bridge.sh send-display \
   --pair desk \
   --text "Hello from Hermes2StackChan" \
   --wait-ack
+```
+
+Show the sticky info mode with time, weekday, date, and a small face:
+
+```bash
+scripts/h2s_bridge.sh send-info --pair desk --wait-ack
 ```
 
 Set a face:
@@ -436,7 +472,7 @@ scripts/h2s_bridge.sh watch-sensors --pair desk --verbose
 The unified bridge service runs this by default. It watches retained status plus
 `events`, filters sensor noise with hysteresis, and only reacts to stable
 signals: a real shake makes a short surprise face, lying on the side makes a
-surprised face, and a hand/finger approaching the LTR553 proximity sensor lowers
+help/panic face, face-down triggers a tantrum face, and a hand/finger approaching the LTR553 proximity sensor lowers
 the head slightly until the object moves away. If the display is sleeping, a
 confirmed sensor interaction wakes StackChan first. It does not use LEDs or
 sound.

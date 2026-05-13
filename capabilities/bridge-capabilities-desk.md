@@ -10,6 +10,34 @@ This public slice supports direct MQTT hardware control. Hermes may request acti
 - StackChan ID: `stackchan-desk`
 - Pair ID: `desk`
 - MQTT prefix: `hermes-stackchan/desk`
+- Wakeword: `Computer` unless the pair profile overrides it
+- Voice: `de-DE-KatjaNeural` unless the pair profile overrides it
+
+## Companion Context And Privacy
+
+For every StackChan-originated Hermes request, the bridge includes a companion
+context package. Treat it as authoritative.
+
+It contains:
+
+- pair profile: pair ID, Hermes ID, StackChan ID, MQTT prefix, wakeword, voice
+- persistent mood: `calm`, `playful`, `curious`, `tired`, `focused`, `annoyed`, `help`
+- proactivity level: `quiet`, `balanced`, `playful`
+- privacy mode: `normal`, `focus`, `private`, `demo`, `debug`
+- status summary: battery, display, UI, face, head, sensors, recording/speaking
+- local capabilities that the bridge already handles before Hermes
+- recent interactions when the active privacy mode allows history
+
+Privacy rules:
+
+- `normal`: no durable audio retention; text history and telemetry are allowed.
+- `focus`: no proactive chatter; text history and telemetry are allowed.
+- `private`: no camera, no Hermes-dependent enrichment, no text history, minimal telemetry.
+- `demo`: no private history, but public/demo interactions may be shown.
+- `debug`: audio archive is allowed when configured for troubleshooting.
+
+If the context says a capability is local, do not route it back to Hermes as a
+complex task. The bridge will answer locally with `hermes=0ms`.
 
 ## Actions
 
@@ -164,11 +192,32 @@ Image display payload:
 }
 ```
 
+Info display payload:
+
+```json
+{
+  "schema_version": "1.0",
+  "mode": "info",
+  "time": "14:37",
+  "date": "13.05.2026",
+  "weekday": "Mittwoch",
+  "duration_ms": 0,
+  "request_id": "info-001"
+}
+```
+
+Use the `info` action for the clock/date overview. It is generated locally by
+the bridge and stays active until another face/UI command replaces it.
+
 ### face
 
 Publishes to `hermes-stackchan/desk/cmd/face`.
 
-Supported emotions include: `neutral`, `happy`, `sad`, `angry`, `surprised`, `question`, `blink`, `wink`, `wink_left`, `wink_right`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `breathe`, `deep_breathe`, `micro_sleep`, `surprise_pop`, `happy_squint`, `sleep`, `speaking`, `error`, `battery`, `charging`, `battery_low`.
+Supported robot-face base emotions: `neutral`, `happy`, `sad`, `angry`, `surprised`, `tired`, `annoyed`, `confused`, `scared`, `love`, `dead`, `glitch`.
+
+Supported calm template transients: `soft_blink`, `blink`, `breathe`, `deep_breathe`, `glance_left`, `glance_right`, `glance_up`, `glance_down`, `look_left`, `look_right`, `look_up`, `look_down`, `mouth_smile`, `mouth_tiny`, `mouth_wiggle`.
+
+Do not use old gag faces such as `happy_squint`, `derp`, `cross_eyes`, `surprise_pop`, or `micro_sleep`. Movement direction is shown by the firmware automatically through pupil gaze while motors move.
 
 ```json
 {
@@ -339,10 +388,11 @@ Bridge processing:
 
 1. Transcribe the WAV with the configured STT provider.
 2. Read retained StackChan status from MQTT.
-3. Send the transcript, status, this capabilities file, and personality notes to Hermes.
-4. Validate Hermes JSON actions.
-5. Publish valid actions to `hermes-stackchan/desk/cmd/*`.
-6. Generate TTS for the final reply and return `tts_url` to StackChan.
+3. Add companion context: mood, privacy, pair profile, status summary, local capabilities, and recent interactions.
+4. Send the transcript, context, status, this capabilities file, and personality notes to Hermes.
+5. Validate Hermes JSON actions.
+6. Publish valid actions to `hermes-stackchan/desk/cmd/*`.
+7. Generate TTS for the final reply and return `tts_url` to StackChan.
 
 Hermes must return JSON only. Put the answer in `reply`; do not use `say` for
 the spoken answer:
@@ -359,6 +409,13 @@ the spoken answer:
 ```
 
 Use `follow_up_listen: true` only when the reply is a real question and Hermes expects the user to answer immediately. StackChan will play the TTS answer first and then start a short follow-up recording.
+
+While Hermes is working, the bridge shows an animated thinking heartbeat: eyes
+think, glance, breathe, blink, and move the mouth slightly without using LEDs or
+spoken filler.
+Do not send spoken filler like "Moment" unless the user explicitly asks for that
+behavior. After normal speech requests that were not explicit LED commands, the
+bridge turns LEDs off so weather/status answers do not leave stale lamps active.
 
 ### reminder / notify
 
@@ -403,6 +460,22 @@ AXP2101 PMIC to turn StackChan off after any voice reply has finished.
 
 StackChan publishes retained status to `hermes-stackchan/desk/status`, including battery, charge direction, volume, brightness, display sleep state, head position, LED mode, speaker readiness, UI mode, face emotion, audio-control state, interaction state, BMI270 IMU motion, LTR553 proximity/ambient light, temperatures, `firmware`, and `firmware_version`.
 
+Bridge health:
+
+- `GET /health` is the small liveness check.
+- `GET /healthz` returns the V1.0 health payload with StackChan presence, status
+  completeness, MQTT/Hermes/STT/TTS configuration, companion state, privacy, and
+  action-priority policy.
+- CLI equivalents: `healthz`, `read-companion`, `set-companion`, and `list-history`.
+
+Action priority policy:
+
+1. Safety and direct user interruptions.
+2. Active conversation.
+3. Reminder/notification.
+4. Proactive companion behavior.
+5. Idle-life behavior.
+
 Battery fields:
 
 ```json
@@ -424,7 +497,7 @@ The bridge command `watch-power` watches `external_power`/`usb_power` in these r
 The bridge command `watch-sensors` watches BMI270 and LTR553 fields in retained
 status plus `interaction` events. It is noise-filtered and only reacts to stable
 signals: shake triggers a short surprise face, lying on the side triggers a
-surprised face, and proximity lowers the head slightly until the object moves
+help/panic face, face-down triggers a tantrum face, and proximity lowers the head slightly until the object moves
 away. Confirmed sensor interaction wakes a sleeping display. It must not change
 LEDs or sound.
 
