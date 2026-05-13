@@ -80,6 +80,7 @@ from bridge.hermes2stackchan_bridge import (
     image_search_queries,
     idle_activity_reasons_from_busy_reasons,
     command_counts_as_idle_activity,
+    event_counts_as_idle_activity,
     current_face_action,
     request_id_counts_as_idle_activity,
     rgb565_to_jpeg,
@@ -683,13 +684,19 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertFalse(request_id_counts_as_idle_activity("life-123"))
         self.assertFalse(request_id_counts_as_idle_activity("idle-sleep-123"))
+        self.assertFalse(request_id_counts_as_idle_activity("sensor-123"))
         self.assertFalse(command_counts_as_idle_activity(pair, pair.face_topic, {"request_id": "life-123"}))
+        self.assertFalse(command_counts_as_idle_activity(pair, pair.face_topic, {"request_id": "sensor-123"}))
         self.assertFalse(command_counts_as_idle_activity(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
         self.assertTrue(command_requests_display_sleep(pair, pair.device_topic, {"display_sleep": True, "request_id": "manual"}))
         self.assertTrue(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_sleep"}))
         self.assertFalse(command_requests_display_sleep(pair, pair.system_topic, {"action": "display_wake"}))
         self.assertTrue(command_counts_as_idle_activity(pair, pair.display_topic, {"text": "Hallo", "request_id": "notify-123"}))
         self.assertTrue(command_counts_as_idle_activity(pair, pair.system_topic, {"action": "display_wake", "request_id": "reminder-123"}))
+        self.assertFalse(event_counts_as_idle_activity("interaction", "imu"))
+        self.assertFalse(event_counts_as_idle_activity("interaction", "proximity"))
+        self.assertTrue(event_counts_as_idle_activity("interaction", "display_touch"))
+        self.assertTrue(event_counts_as_idle_activity("touch_down", "display_touch"))
 
     def test_idle_sleep_does_not_count_motion_as_activity(self) -> None:
         self.assertEqual(idle_activity_reasons_from_busy_reasons({"motion"}), set())

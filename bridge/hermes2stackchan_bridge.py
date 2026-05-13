@@ -4207,13 +4207,31 @@ IDLE_SLEEP_IGNORED_REQUEST_PREFIXES = (
     "life-",
     "idle-sleep-",
     "settings-",
+    "sensor-",
 )
+IDLE_SLEEP_IGNORED_EVENT_SOURCES = {
+    "imu",
+    "orientation",
+    "proximity",
+    "sensor",
+    "ltr553",
+}
 
 
 def request_id_counts_as_idle_activity(request_id: str | None) -> bool:
     if not request_id:
         return True
     return not request_id.startswith(IDLE_SLEEP_IGNORED_REQUEST_PREFIXES)
+
+
+def event_counts_as_idle_activity(event: str, source: str | None = None) -> bool:
+    event = optional_string(event)
+    source = optional_string(source)
+    if event not in HUMAN_ACTIVITY_EVENTS:
+        return False
+    if event == "interaction" and source in IDLE_SLEEP_IGNORED_EVENT_SOURCES:
+        return False
+    return True
 
 
 def command_requests_display_sleep(pair: PairConfig, topic: str, payload: dict[str, Any]) -> bool:
@@ -6861,7 +6879,7 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
             if message.topic == pair.events_topic:
                 note_stackchan_status(pair, payload)
                 event = optional_string(payload.get("event"))
-                if event in HUMAN_ACTIVITY_EVENTS:
+                if event_counts_as_idle_activity(event, optional_string(payload.get("source"))):
                     display_sleeping = False
                     mark_activity(event)
                 return
