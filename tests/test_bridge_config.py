@@ -1244,7 +1244,7 @@ class BridgeConfigTests(unittest.TestCase):
         blink_sequences = [
             sequence
             for sequence in sequences
-            if any(action["action"] == "face" and action["emotion"] == "blink" for _delay, action in sequence)
+            if any(action["action"] == "face" and action["emotion"] == "soft_blink" for _delay, action in sequence)
         ]
 
         self.assertGreaterEqual(len(blink_sequences), 48)

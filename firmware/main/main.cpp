@@ -1923,6 +1923,9 @@ const char* normalize_face_emotion(const char* emotion)
     if (str_eq(emotion, "look_down_table") || str_eq(emotion, "bored_sigh")) {
         return "bored";
     }
+    if (str_eq(emotion, "blink")) {
+        return "soft_blink";
+    }
 
     static const char* known[] = {
         "neutral", "happy", "sad", "angry", "surprised", "tired", "annoyed", "confused",
@@ -1930,7 +1933,7 @@ const char* normalize_face_emotion(const char* emotion)
         "smug", "proud", "shy", "skeptical", "offended", "panic", "dramatic",
         "evil_grin", "sleepy", "bored", "thinking", "listening", "speaking",
         "charging", "battery", "battery_low", "error", "face_down", "help", "thankful",
-        "blink", "wink", "wink_left", "wink_right", "glance_left", "glance_right",
+        "soft_blink", "wink", "wink_left", "wink_right", "glance_left", "glance_right",
         "glance_up", "glance_down", "look_left", "look_right", "look_up", "look_down",
         "breathe", "deep_breathe", "micro_sleep", "surprise_pop", "happy_squint",
         "cross_eyes", "eye_swap", "derp", "boing_eyes", "suspicious_squint",
@@ -1956,6 +1959,7 @@ void copy_face_emotion(const char* emotion, int intensity_pct)
 bool is_transient_face_emotion(const char* emotion)
 {
     return std::strcmp(emotion, "blink") == 0 ||
+           std::strcmp(emotion, "soft_blink") == 0 ||
            std::strcmp(emotion, "glance_left") == 0 ||
            std::strcmp(emotion, "glance_right") == 0 ||
            std::strcmp(emotion, "glance_up") == 0 ||
@@ -2345,7 +2349,13 @@ bool draw_mood_preset(const char* emotion, int intensity_pct)
     int lb[4] = {70, 38, 130, 38};
     int rb[4] = {190, 38, 250, 38};
 
-    if (str_eq(emotion, "neutral")) {
+    if (str_eq(emotion, "soft_blink")) {
+        left_ry = right_ry = 18;
+        mouth_mode = 0;
+        mouth_width = 58;
+        mouth_height = 14;
+        draw_brows = false;
+    } else if (str_eq(emotion, "neutral")) {
         draw_brows = false;
     } else if (str_eq(emotion, "friendly")) {
         left_ry = right_ry = 34 + pulse;
@@ -2576,8 +2586,9 @@ void animate_transient_face(const char* emotion, int intensity_pct)
     }
     const int base_intensity = clamp_int(g_face_intensity_pct > 0 ? g_face_intensity_pct : intensity_pct, 0, 100);
 
-    if (std::strcmp(emotion, "blink") == 0) {
-        const int eye_heights[] = {28, 18, 8, 3, 8, 18, 28};
+    if (std::strcmp(emotion, "blink") == 0 ||
+        std::strcmp(emotion, "soft_blink") == 0) {
+        const int eye_heights[] = {30, 25, 20, 16, 20, 25, 30};
         for (int eye_height : eye_heights) {
             draw_life_face_frame(base_emotion, base_intensity, 0, 0, eye_height);
             vTaskDelay(pdMS_TO_TICKS(42));
@@ -2947,10 +2958,10 @@ void draw_face(const char* emotion, int intensity_pct)
         return;
     }
 
-		if (std::strcmp(g_face_emotion, "blink") == 0) {
-			draw_flat_eye(left_x, eye_y, 58, 0, face_color);
-			draw_flat_eye(right_x, eye_y, 58, 0, face_color);
-			draw_simple_mouth(160, mouth_y, 68, 18, 0, white);
+		if (std::strcmp(g_face_emotion, "blink") == 0 ||
+		    std::strcmp(g_face_emotion, "soft_blink") == 0) {
+			draw_designed_eyes(left_x, right_x, eye_y, 18 + pulse, 18 + pulse / 2, 0, 0, face_color);
+			draw_simple_mouth(160, mouth_y, 58, 14, 0, white);
 			return;
 		}
 

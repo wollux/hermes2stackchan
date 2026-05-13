@@ -2958,6 +2958,7 @@ def life_animation_paused(pair_id: str) -> bool:
 
 TRANSIENT_FACE_EMOTIONS = {
     "blink",
+    "soft_blink",
     "glance_left",
     "glance_right",
     "glance_up",
@@ -3189,9 +3190,9 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
     high = clamp_int(base_intensity + 12, 35, 95)
 
     if name == "double_blink":
-        return [(0, life_face("blink", low, name)), (360, life_face("blink", low, name))]
+        return [(0, life_face("soft_blink", low, name)), (360, life_face("soft_blink", low, name))]
     if name == "lazy_blink":
-        return [(0, life_face("breathe", low, name)), (360, life_face("blink", low, name))]
+        return [(0, life_face("breathe", low, name)), (360, life_face("soft_blink", low, name))]
     if name == "suspicious_left":
         return [(0, life_face("glance_left", base_intensity, name)), (900, life_face("mouth_tiny", base_intensity, name))]
     if name == "suspicious_right":
@@ -3222,7 +3223,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
     if name == "micro_sleep":
         return [(0, life_face("micro_sleep", low, name))]
     if name == "surprise_pop":
-        return [(0, life_face("surprise_pop", high, name)), (720, life_face("blink", base_intensity, name))]
+        return [(0, life_face("surprise_pop", high, name)), (720, life_face("soft_blink", base_intensity, name))]
     if name == "cheeky_grin":
         side = rng.choice(["glance_left", "glance_right"])
         return [(0, life_face("mischievous", high, name)), (520, life_face("wink_right" if side == "glance_left" else "wink_left", high, name))]
@@ -3233,7 +3234,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
             (820, life_face(mood, base_intensity, name)),
         ]
     if name == "nervous_flick":
-        return [(0, life_face("glance_left", base_intensity, name)), (180, life_face("glance_right", base_intensity, name)), (180, life_face("blink", low, name))]
+        return [(0, life_face("glance_left", base_intensity, name)), (180, life_face("glance_right", base_intensity, name)), (180, life_face("soft_blink", low, name))]
     if name == "happy_squint":
         return [(0, life_face("super_happy", high, name))]
     if name == "grumble_mouth":
@@ -3287,7 +3288,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
             (1600, life_face(mood, base_intensity, name)),
         ]
     if name == "drama_blink":
-        return [(0, life_face("blink", low, name)), (520, life_face("surprise_pop", high, name))]
+        return [(0, life_face("soft_blink", low, name)), (520, life_face("surprise_pop", high, name))]
     if name == "shy_lookaway":
         side = rng.choice(["left", "right"])
         yaw = -18 if side == "left" else 18
@@ -3307,7 +3308,7 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
         side = rng.choice(["glance_left", "glance_right"])
         return [(0, life_face(side, low, name)), (900, life_face("smug", high, name)), (500, life_face(side, low, name))]
     if name == "tiny_laugh":
-        return [(0, life_face("friendly", high, name)), (360, life_face("mouth_smile", high, name)), (360, life_face("blink", base_intensity, name))]
+        return [(0, life_face("friendly", high, name)), (360, life_face("mouth_smile", high, name)), (360, life_face("soft_blink", base_intensity, name))]
     if name == "confused_scan":
         return [
             (0, life_face("glance_up", base_intensity, name)),
@@ -3317,18 +3318,18 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
             (820, life_face(mood, base_intensity, name)),
         ]
     if name == "sleepy_recover":
-        return [(0, life_face("micro_sleep", low, name)), (900, life_face("surprise_pop", high, name)), (620, life_face("blink", base_intensity, name))]
+        return [(0, life_face("micro_sleep", low, name)), (900, life_face("surprise_pop", high, name)), (620, life_face("soft_blink", base_intensity, name))]
     if name == "reset_grin":
         return [(0, life_face(rng.choice(["glance_left", "glance_right"]), base_intensity, name)), (520, life_face("mouth_smile", high, name)), (620, life_face(mood, base_intensity, name))]
     if name == "cross_eyes":
-        return [(0, life_face("cross_eyes", high, name)), (760, life_face("blink", base_intensity, name))]
+        return [(0, life_face("cross_eyes", high, name)), (760, life_face("soft_blink", base_intensity, name))]
     if name == "eye_swap":
         return [(0, life_face("eye_swap", high, name)), (720, life_face(mood, base_intensity, name))]
     if name == "derp":
         return [
             (0, life_face("derp", high, name)),
             (180, life_motion([idle_motion_point(rng.choice([-4, 4]), rng.choice([-2, 2]), 900, 10), idle_motion_point(0, 0, 1200, 10)], 10, variant=name)),
-            (860, life_face("blink", base_intensity, name)),
+            (860, life_face("soft_blink", base_intensity, name)),
         ]
     if name == "boing_eyes":
         return [(0, life_face("boing_eyes", high, name)), (680, life_face("mouth_tiny", base_intensity, name))]
@@ -3348,9 +3349,9 @@ def build_named_life_sequence(name: str, rng: random.Random, base_intensity: int
     if name == "silent_giggle":
         return [(0, life_face("silent_giggle", high, name)), (680, life_face("happy_squint", high, name))]
     if name == "sleepy_snapback":
-        return [(0, life_face("sleepy_snapback", low, name)), (780, life_face("blink", base_intensity, name))]
+        return [(0, life_face("sleepy_snapback", low, name)), (780, life_face("soft_blink", base_intensity, name))]
 
-    return [(0, life_face("blink", base_intensity, name))]
+    return [(0, life_face("soft_blink", base_intensity, name))]
 
 
 def build_generated_life_sequence(name: str, rng: random.Random, base_intensity: int, mood: str) -> LifeSequence:
@@ -3363,7 +3364,7 @@ def build_generated_life_sequence(name: str, rng: random.Random, base_intensity:
         glance = gaze_for_direction(direction)
         return [
             (0, life_face(glance, base_intensity, name)),
-            (hold_ms, life_face(rng.choice(["mouth_tiny", "blink", mood]), base_intensity, name)),
+            (hold_ms, life_face(rng.choice(["mouth_tiny", "soft_blink", mood]), base_intensity, name)),
         ]
 
     if family == "mouth":
@@ -3381,14 +3382,14 @@ def build_generated_life_sequence(name: str, rng: random.Random, base_intensity:
     if family == "blink":
         style = parts[2]
         if style == "single":
-            return [(0, life_face("blink", base_intensity, name))]
+            return [(0, life_face("soft_blink", base_intensity, name))]
         if style == "double":
-            return [(0, life_face("blink", base_intensity, name)), (int(parts[3]), life_face("blink", base_intensity, name))]
+            return [(0, life_face("soft_blink", base_intensity, name)), (int(parts[3]), life_face("soft_blink", base_intensity, name))]
         if style == "slow":
-            return [(0, life_face("breathe", base_intensity - 4, name)), (500, life_face("blink", base_intensity - 4, name))]
+            return [(0, life_face("breathe", base_intensity - 4, name)), (500, life_face("soft_blink", base_intensity - 4, name))]
         if style == "asym":
             return [(0, life_face(rng.choice(["wink_left", "wink_right"]), base_intensity + 8, name))]
-        return [(0, life_face("blink", base_intensity - 4, name)), (540, life_face("surprise_pop", base_intensity + 10, name))]
+        return [(0, life_face("soft_blink", base_intensity - 4, name)), (540, life_face("surprise_pop", base_intensity + 10, name))]
 
     if family == "breath":
         style = parts[2]
@@ -3415,7 +3416,7 @@ def build_generated_life_sequence(name: str, rng: random.Random, base_intensity:
             (1800, life_face(mood, base_intensity, name)),
         ]
 
-    return [(0, life_face("blink", base_intensity, name))]
+    return [(0, life_face("soft_blink", base_intensity, name))]
 
 
 CURATED_LIFE_VARIANT_NAMES = [
