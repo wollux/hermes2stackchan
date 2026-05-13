@@ -55,7 +55,9 @@ from bridge.hermes2stackchan_bridge import (
     split_post_tts_system_actions,
     parse_hermes_action_response,
     parse_env_file,
+    publish_action_messages,
     should_listen_for_followup,
+    STACKCHAN_PRESENCE,
     build_hermes_messages,
     build_hermes_vision_messages,
     image_data_url,
@@ -590,6 +592,25 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertEqual(post_tts, "shutdown")
         self.assertEqual([action["action"] for action in actions], ["face", "led"])
+
+    def test_publish_action_messages_skips_when_stackchan_offline(self) -> None:
+        config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
+        pair = config.pairs["desk"]
+        published: list[tuple[str, str]] = []
+
+        class FakeClient:
+            def publish(self, topic: str, body: str, qos: int, retain: bool) -> SimpleNamespace:
+                published.append((topic, body))
+                return SimpleNamespace(wait_for_publish=lambda timeout=None: None)
+
+        STACKCHAN_PRESENCE.clear()
+        publish_action_messages(FakeClient(), [(pair.face_topic, {"emotion": "happy"})], pair)
+        self.assertEqual(published, [])
+
+        STACKCHAN_PRESENCE.mark_seen(pair)
+        publish_action_messages(FakeClient(), [(pair.face_topic, {"emotion": "happy"})], pair)
+        self.assertEqual(len(published), 1)
+        STACKCHAN_PRESENCE.clear()
 
     def test_battery_snapshot_accepts_status_aliases(self) -> None:
         snapshot = battery_snapshot(

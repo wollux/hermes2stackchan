@@ -50,6 +50,7 @@ DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
 LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
+STACKCHAN_PRESENCE_TIMEOUT_S = 15.0
 SENSOR_PROXIMITY_ON_DELTA = 55
 SENSOR_PROXIMITY_OFF_DELTA = 28
 SENSOR_PROXIMITY_ON_RAW = 120
@@ -1506,6 +1507,79 @@ def parse_bool_value(value: Any, default: bool) -> bool:
 REMINDER_ACTIONS = {"reminder", "notify", "notification", "remind"}
 POST_TTS_SYSTEM_ACTIONS = {"display_sleep", "shutdown", "power_off"}
 STATUS_NOT_PROVIDED = object()
+
+
+class StackChanPresence:
+    def __init__(self, timeout_s: float = STACKCHAN_PRESENCE_TIMEOUT_S) -> None:
+        self.timeout_s = timeout_s
+        self._lock = RLock()
+        self._last_seen: dict[str, float] = {}
+        self._last_log: dict[str, str] = {}
+
+    def mark_status(self, pair: PairConfig, status: dict[str, Any], *, retained: bool = False) -> None:
+        if retained:
+            return
+        if not isinstance(status, dict):
+            return
+        pair_id = optional_string(status.get("pair_id"))
+        if pair_id and pair_id != pair.pair_id:
+            return
+        if status.get("uptime_ms") is None:
+            return
+        with self._lock:
+            self._last_seen[pair.pair_id] = time.monotonic()
+
+    def mark_seen(self, pair: PairConfig) -> None:
+        with self._lock:
+            self._last_seen[pair.pair_id] = time.monotonic()
+
+    def is_online(self, pair: PairConfig, now_s: float | None = None) -> bool:
+        now = time.monotonic() if now_s is None else now_s
+        with self._lock:
+            seen = self._last_seen.get(pair.pair_id)
+        return seen is not None and now - seen <= self.timeout_s
+
+    def age_s(self, pair: PairConfig, now_s: float | None = None) -> float | None:
+        now = time.monotonic() if now_s is None else now_s
+        with self._lock:
+            seen = self._last_seen.get(pair.pair_id)
+        if seen is None:
+            return None
+        return max(0.0, now - seen)
+
+    def note_skip(self, pair: PairConfig, reason: str) -> None:
+        age = self.age_s(pair)
+        age_text = "never" if age is None else f"{age:.1f}s"
+        message = f"StackChan offline/stale for {age_text}; skipped {reason}"
+        with self._lock:
+            if self._last_log.get(pair.pair_id) == message:
+                return
+            self._last_log[pair.pair_id] = message
+        print(f"[{time.strftime('%H:%M:%S')}] [bridge] {message}", flush=True)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._last_seen.clear()
+            self._last_log.clear()
+
+
+STACKCHAN_PRESENCE = StackChanPresence()
+
+
+def note_stackchan_status(pair: PairConfig, status: dict[str, Any], *, retained: bool = False) -> None:
+    STACKCHAN_PRESENCE.mark_status(pair, status, retained=retained)
+
+
+def note_stackchan_seen(pair: PairConfig) -> None:
+    STACKCHAN_PRESENCE.mark_seen(pair)
+
+
+def stackchan_is_online(pair: PairConfig) -> bool:
+    return STACKCHAN_PRESENCE.is_online(pair)
+
+
+def message_is_retained(message: Any) -> bool:
+    return bool(getattr(message, "retain", False))
 
 
 def action_name(action: dict[str, Any]) -> str:
@@ -3701,6 +3775,9 @@ def publish_action_messages(
     pair: PairConfig | None = None,
     wait: bool = True,
 ) -> None:
+    if pair is not None and action_messages and not stackchan_is_online(pair):
+        STACKCHAN_PRESENCE.note_skip(pair, f"{len(action_messages)} action(s)")
+        return
     for topic, payload in action_messages:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         result = client.publish(topic, body, qos=1, retain=False)
@@ -3731,6 +3808,9 @@ def watch_power(args: argparse.Namespace) -> int:
             return
         if not isinstance(status, dict):
             return
+        if message_is_retained(message):
+            return
+        note_stackchan_status(pair, status)
         current = battery_snapshot(status)
         if previous is None:
             print(f"[{time.strftime('%H:%M:%S')}] [bridge] power state initial: {json.dumps(current, ensure_ascii=False)}", flush=True)
@@ -3814,10 +3894,28 @@ def animate_life(args: argparse.Namespace) -> int:
     client = create_mqtt_client(config.mqtt)
     emitted = 0
 
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        if message.topic != pair.status_topic:
+            return
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(status, dict):
+            if message_is_retained(message):
+                return
+            note_stackchan_status(pair, status)
+
     try:
+        client.on_message = on_message
         connect_and_start(client, config.mqtt)
+        client.subscribe(pair.status_topic, qos=0)
         print(f"[{time.strftime('%H:%M:%S')}] [bridge] life animation active for {pair.pair_id}", flush=True)
         while True:
+            if not stackchan_is_online(pair):
+                STACKCHAN_PRESENCE.note_skip(pair, "life animation")
+                time.sleep(min(1.0, max(0.1, args.min_interval_s)))
+                continue
             if life_animation_paused(pair.pair_id):
                 if args.once:
                     print("[bridge] life animation skipped: paused by speech or reminder", file=sys.stderr)
@@ -4148,6 +4246,9 @@ def watch_device_settings(args: argparse.Namespace) -> int:
         payload = build_restore_device_payload(settings, args.display_wake)
         if not payload:
             return
+        if not stackchan_is_online(pair):
+            STACKCHAN_PRESENCE.note_skip(pair, f"device settings restore after {reason}")
+            return
         command = with_request_id(payload, f"settings-{uuid.uuid4().hex[:10]}")
         body = json.dumps(command, ensure_ascii=False, separators=(",", ":"))
         result = client.publish(pair.device_topic, body, qos=1, retain=False)
@@ -4162,6 +4263,9 @@ def watch_device_settings(args: argparse.Namespace) -> int:
             return
         if not isinstance(status, dict):
             return
+        if message_is_retained(message):
+            return
+        note_stackchan_status(pair, status)
 
         uptime_ms = parse_int_value(status.get("uptime_ms"), 0, "status.uptime_ms")
         reboot_or_reconnect = (
@@ -4303,6 +4407,9 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
     pending_off: Timer | None = None
 
     def publish_led(body: bytes, event_received_ms: float, event: str) -> None:
+        if not stackchan_is_online(pair):
+            STACKCHAN_PRESENCE.note_skip(pair, f"fast-touch led {event}")
+            return
         client.publish(pair.led_topic, body, qos=0, retain=False)
         elapsed_ms = (time.monotonic() * 1000) - event_received_ms
         if args.verbose:
@@ -4344,6 +4451,8 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
         nonlocal last_event, recording_active, recording_seen
         event_received_ms = time.monotonic() * 1000
         raw_payload = message.payload
+        if message.topic == pair.events_topic:
+            note_stackchan_seen(pair)
         if b'"event":"touch_down"' in raw_payload:
             event = "touch_down"
         elif b'"event":"touch_up"' in raw_payload:
@@ -4357,10 +4466,14 @@ def watch_touch_lamp(args: argparse.Namespace) -> int:
                 data = json.loads(raw_payload.decode("utf-8"))
             except json.JSONDecodeError:
                 return
+            if message_is_retained(message):
+                return
             recording = data.get("recording")
             if recording is True:
+                note_stackchan_status(pair, data)
                 event = "status_recording_true"
             elif recording is False:
+                note_stackchan_status(pair, data)
                 event = "status_recording_false"
             else:
                 return
@@ -4436,6 +4549,9 @@ def watch_touch_emotions(args: argparse.Namespace) -> int:
             return
         if not isinstance(payload, dict):
             return
+        if message.topic == pair.status_topic and message_is_retained(message):
+            return
+        note_stackchan_status(pair, payload)
         actions, reasons = build_touch_emotion_actions(payload, state)
         if not actions:
             return
@@ -4451,7 +4567,7 @@ def watch_touch_emotions(args: argparse.Namespace) -> int:
 
     client.on_message = on_message
     connect_and_start(client, config.mqtt)
-    client.subscribe([(pair.events_topic, 0)])
+    client.subscribe([(pair.events_topic, 0), (pair.status_topic, 0)])
     print(f"[{time.strftime('%H:%M:%S')}] [bridge] touch emotions active on {pair.events_topic}", flush=True)
     try:
         while not done.wait(0.25):
@@ -4533,6 +4649,7 @@ def watch_sensors(args: argparse.Namespace) -> int:
             return
 
         if message.topic == pair.events_topic:
+            note_stackchan_status(pair, payload)
             if payload.get("event") != "interaction":
                 return
             source_value = payload.get("source")
@@ -4562,8 +4679,11 @@ def watch_sensors(args: argparse.Namespace) -> int:
 
         if message.topic != pair.status_topic:
             return
+        if message_is_retained(message):
+            return
 
         latest_status = payload
+        note_stackchan_status(pair, payload)
         actions, reasons = build_sensor_reaction_actions(payload, state)
         publish_reactions(actions, reasons)
 
@@ -4619,6 +4739,9 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
 
         with state_lock:
             if message.topic == pair.status_topic:
+                if message_is_retained(message):
+                    return
+                note_stackchan_status(pair, payload)
                 sleeping_value = status_bool(payload.get("display_sleeping"))
                 if sleeping_value is True:
                     display_sleeping = True
@@ -4636,6 +4759,7 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
                 return
 
             if message.topic == pair.events_topic:
+                note_stackchan_status(pair, payload)
                 event = optional_string(payload.get("event"))
                 if event in HUMAN_ACTIVITY_EVENTS:
                     display_sleeping = False
@@ -4679,6 +4803,9 @@ def watch_idle_sleep(args: argparse.Namespace) -> int:
                 sleep_sent = True
 
             pause_life_animation(pair.pair_id, 20.0, "idle sleep")
+            if not stackchan_is_online(pair):
+                STACKCHAN_PRESENCE.note_skip(pair, "idle sleep command")
+                continue
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             result = client.publish(pair.device_topic, body, qos=1, retain=False)
             result.wait_for_publish(timeout=5)
@@ -5290,6 +5417,10 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if pair_id != self.server.pair.pair_id:
             self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
             return
+        if not stackchan_is_online(self.server.pair):
+            STACKCHAN_PRESENCE.note_skip(self.server.pair, "display-image request")
+            self.send_json(503, {"ok": False, "error": "stackchan offline", "request_id": request_id})
+            return
 
         try:
             image_bytes, content_type, source = image_bytes_from_payload(payload, self.server.config.speech)
@@ -5318,6 +5449,10 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
         if pair_id != self.server.pair.pair_id:
             self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+        if not stackchan_is_online(self.server.pair):
+            STACKCHAN_PRESENCE.note_skip(self.server.pair, "search-image request")
+            self.send_json(503, {"ok": False, "error": "stackchan offline", "request_id": request_id})
             return
         query = optional_string(payload.get("query") or payload.get("q") or payload.get("text") or payload.get("prompt"))
         if not query:
@@ -5355,6 +5490,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if pair_id != self.server.pair.pair_id:
             self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
             return
+        note_stackchan_seen(self.server.pair)
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
@@ -5495,6 +5631,10 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         pair_id = optional_string(payload.get("pair_id")) or (self.headers.get("X-H2S-Pair-Id") or self.server.pair.pair_id).strip()
         if pair_id != self.server.pair.pair_id:
             self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
+            return
+        if not stackchan_is_online(self.server.pair):
+            STACKCHAN_PRESENCE.note_skip(self.server.pair, "notify request")
+            self.send_json(503, {"ok": False, "error": "stackchan offline", "request_id": request_id})
             return
 
         started = time.monotonic()
@@ -5641,6 +5781,7 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
         if pair_id != self.server.pair.pair_id:
             self.send_json(403, {"ok": False, "error": f"wrong pair_id {pair_id!r}", "request_id": request_id})
             return
+        note_stackchan_seen(self.server.pair)
 
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -5790,12 +5931,10 @@ class SpeechRequestHandler(http.server.BaseHTTPRequestHandler):
             error_text = f"SPRACHBRIDGE FEHLER: {exc}"
             print(f"[bridge-http] error request_id={request_id}: {exc}", flush=True)
             try:
-                payload = build_display_payload("BRIDGE FEHLER", 5000, request_id)
-                self.server.mqtt_client.publish(
-                    self.server.pair.display_topic,
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                    qos=1,
-                    retain=False,
+                publish_action_messages(
+                    self.server.mqtt_client,
+                    [(self.server.pair.display_topic, build_display_payload("BRIDGE FEHLER", 5000, request_id))],
+                    self.server.pair,
                 )
             except Exception:
                 pass
@@ -5807,7 +5946,22 @@ def serve_audio(args: argparse.Namespace) -> int:
     config = load_config(config_path, Path(args.env))
     pair = get_pair(config, args.pair)
     client = create_mqtt_client(config.mqtt)
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        if message.topic != pair.status_topic:
+            return
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(status, dict):
+            if message_is_retained(message):
+                return
+            note_stackchan_status(pair, status)
+
+    client.on_message = on_message
     connect_and_start(client, config.mqtt)
+    client.subscribe(pair.status_topic, qos=0)
     server = SpeechHttpServer((args.host, args.port), SpeechRequestHandler)
     server.config = config
     server.config_path = config_path
@@ -5861,6 +6015,9 @@ def list_reminders_cli(args: argparse.Namespace) -> int:
 
 
 def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder: dict[str, Any]) -> None:
+    if not stackchan_is_online(pair):
+        STACKCHAN_PRESENCE.note_skip(pair, f"reminder {reminder.get('id')}")
+        return
     duration_s = config.reminders.display_duration_ms / 1000.0
     pause_life_animation(pair.pair_id, max(12.0, duration_s + 8.0), f"reminder {reminder.get('id')}")
     messages = [
@@ -5871,7 +6028,7 @@ def fire_reminder(client: Any, pair: PairConfig, config: BridgeConfig, reminder:
         f"[{time.strftime('%H:%M:%S')}] [bridge] firing reminder {reminder.get('id')}: {reminder.get('text')}",
         flush=True,
     )
-    publish_action_messages(client, messages)
+    publish_action_messages(client, messages, pair)
 
 
 def watch_reminders(args: argparse.Namespace) -> int:
@@ -5879,8 +6036,23 @@ def watch_reminders(args: argparse.Namespace) -> int:
     pair = get_pair(config, args.pair)
     client = create_mqtt_client(config.mqtt)
     poll_s = max(0.2, float(args.poll_s if args.poll_s is not None else config.reminders.poll_interval_s))
+
+    def on_message(_client: Any, _userdata: Any, message: Any) -> None:
+        if message.topic != pair.status_topic:
+            return
+        try:
+            status = json.loads(message.payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            return
+        if isinstance(status, dict):
+            if message_is_retained(message):
+                return
+            note_stackchan_status(pair, status)
+
+    client.on_message = on_message
     try:
         connect_and_start(client, config.mqtt)
+        client.subscribe(pair.status_topic, qos=0)
         print(
             f"[{time.strftime('%H:%M:%S')}] [bridge] watching reminders "
             f"store={reminder_store_path(config)} pair={pair.pair_id} poll={poll_s:.1f}s",
