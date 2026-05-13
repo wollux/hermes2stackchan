@@ -949,6 +949,9 @@ class BridgeConfigTests(unittest.TestCase):
             "brightness_pct": 66,
             "speaker": {"volume_pct": 44},
             "temperature": {"soc_c": 41, "servo_yaw_c": 30, "servo_pitch_c": 31},
+            "display_sleeping": False,
+            "camera_available": True,
+            "audio": {"input_ready": True},
             "sensors": {
                 "imu": {
                     "ready": True,
@@ -968,6 +971,12 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("SoC 41 Grad", direct_local_command_from_transcript("Temperatur?", status)[0])
         self.assertEqual(direct_local_command_from_transcript("Wie ist die Helligkeit?", status)[0], "Helligkeit 66 Prozent.")
         self.assertEqual(direct_local_command_from_transcript("Wie ist die Lautstaerke?", status)[0], "Lautstaerke 44 Prozent.")
+        wellness = direct_local_command_from_transcript("Wie geht es dir?", status)
+        self.assertIn("Mir geht es gut", wellness[0])
+        self.assertIn("Akku 82 Prozent", wellness[0])
+        self.assertIn("IMU ok", wellness[0])
+        self.assertEqual(wellness[1][0]["emotion"], "friendly")
+        self.assertIn("Bridge und MQTT", direct_local_command_from_transcript("MQTT Status?", status)[0])
         self.assertIn("Naehe erkannt", direct_local_command_from_transcript("Ist mein Finger am Sensor?", status)[0])
         self.assertEqual(direct_local_command_from_transcript("Liegst du auf der Seite?", status)[0], "Ich liege auf der Seite.")
         self.assertIn("Bewegung erkannt", direct_local_command_from_transcript("Wirst du geschuettelt?", status)[0])
@@ -1011,6 +1020,8 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(direct_local_command_from_transcript("Schau nach oben.")[1][0]["pitch_target_pct"], 65)
         self.assertEqual(direct_local_command_from_transcript("Mach ein Foto.")[1][0]["system_action"], "take_photo")
         self.assertEqual(direct_local_command_from_transcript("Piep.")[1][0]["action"], "sound")
+        self.assertEqual(direct_local_command_from_transcript("Sei stumm.")[1][0], {"action": "device", "volume_pct": 0})
+        self.assertEqual(direct_local_command_from_transcript("Ton an.")[1][0], {"action": "device", "volume_pct": 70})
 
     def test_direct_local_face_commands_skip_hermes(self) -> None:
         happy = direct_local_command_from_transcript("Gluecklich gucken.")

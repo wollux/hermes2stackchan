@@ -3273,6 +3273,14 @@ def local_command_may_need_status(text: str) -> bool:
             " bildschirm ",
             " schlaeft ",
             " schlafen ",
+            " status ",
+            " zustand ",
+            " geht es dir ",
+            " gehts dir ",
+            " alles okay ",
+            " alles ok ",
+            " bridge ",
+            " mqtt ",
         )
     )
 
@@ -3304,10 +3312,55 @@ def direct_status_reply_from_transcript(
                 "kamera",
                 "display",
                 "bildschirm",
+                "status",
+                "zustand",
+                "geht es dir",
+                "gehts dir",
+                "alles okay",
+                "alles ok",
+                "bridge",
+                "mqtt",
             )
         ):
             return "Status ist gerade nicht verfuegbar.", [{"action": "face", "emotion": "error", "intensity_pct": 55}], ""
         return None
+
+    if any(phrase in command for phrase in ("wie geht es dir", "gehts dir", "alles okay", "alles ok", "dein status", "statusbericht", "zustand")):
+        battery = status_percent(status, "battery_pct", 0)
+        external = status_bool(status.get("external_power")) is True
+        charging = status_bool(status.get("battery_charging")) is True
+        sleeping = status_bool(status.get("display_sleeping")) is True
+        soc = status_int_at(status, "temperature.soc_c", -1)
+        imu_ready = status_bool(nested_status_value(status, "sensors.imu.ready")) is True
+        ltr_ready = status_bool(nested_status_value(status, "sensors.ltr553.ready")) is True
+        audio_ready = status_bool(nested_status_value(status, "audio.input_ready")) is True
+        camera_ready = status_bool(status.get("camera_available")) is True
+        if battery <= 15 and not external:
+            mood = "concerned"
+            opener = "Ich bin etwas knapp auf Akku."
+        else:
+            mood = "friendly"
+            opener = "Mir geht es gut."
+        power = "am Strom" if external else "auf Akku"
+        if charging:
+            power = "am Laden"
+        parts = [
+            opener,
+            f"Akku {battery} Prozent, {power}.",
+            "Display schlaeft." if sleeping else "Display ist wach.",
+        ]
+        if soc >= 0:
+            parts.append(f"SoC {soc} Grad.")
+        ready_bits = []
+        ready_bits.append("IMU ok" if imu_ready else "IMU fehlt")
+        ready_bits.append("Naehe ok" if ltr_ready else "Naehe fehlt")
+        ready_bits.append("Mikro ok" if audio_ready else "Mikro unklar")
+        ready_bits.append("Kamera ok" if camera_ready else "Kamera unklar")
+        parts.append(", ".join(ready_bits) + ".")
+        return " ".join(parts), [{"action": "face", "emotion": mood, "intensity_pct": 70}], ""
+
+    if "mqtt" in command or "bridge" in command:
+        return "Bridge und MQTT erreichen mich, sonst koennte ich diesen Status nicht lesen.", [{"action": "face", "emotion": "friendly", "intensity_pct": 62}], ""
 
     if any(token in f" {command} " for token in ("akku", "akkustand", "batterie")):
         pct = status_percent(status, "battery_pct", 0)
@@ -3607,6 +3660,15 @@ def direct_local_command_from_transcript(
         else:
             target = current
         return f"Lautstaerke {target} Prozent.", [{"action": "device", "volume_pct": target}], ""
+
+    if command in {"stumm", "mute", "ton aus"} or command.startswith(("mach stumm", "sei stumm", "schalte ton aus", "mute an")):
+        return "Stumm.", [{"action": "device", "volume_pct": 0}], ""
+
+    if command in {"ton an", "mute aus", "stumm aus"} or command.startswith(("mach ton an", "schalte ton an", "nicht mehr stumm")):
+        target = 70
+        if isinstance(status, dict):
+            target = max(30, status_percent(status, "speaker.volume_pct", status_int_at(status, "volume_pct", 70)))
+        return f"Ton an, {target} Prozent.", [{"action": "device", "volume_pct": target}], ""
 
     if any(token in f" {command} " for token in ("led aus", "leds aus", "lampe aus", "lampen aus")):
         return "LEDs aus.", [{"action": "led", "mode": "off"}], ""
