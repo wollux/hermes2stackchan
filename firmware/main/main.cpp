@@ -192,6 +192,7 @@ bool g_face_pose_initialized = false;
 volatile int g_motion_gaze_dx = 0;
 volatile int g_motion_gaze_dy = 0;
 volatile bool g_motion_gaze_active = false;
+volatile uint32_t g_motion_gaze_revision = 0;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -2428,12 +2429,13 @@ void apply_motion_gaze(FacePose& pose)
         return;
     }
 
-    const int dx = clamp_int(static_cast<int>(g_motion_gaze_dx), -12, 12);
-    const int dy = clamp_int(static_cast<int>(g_motion_gaze_dy), -10, 10);
+    const int dx = clamp_int(static_cast<int>(g_motion_gaze_dx), -18, 18);
+    const int dy = clamp_int(static_cast<int>(g_motion_gaze_dy), -14, 14);
     if (dx == 0 && dy == 0) {
         return;
     }
 
+    pose.pupil_scale = clamp_int(std::min(pose.pupil_scale, 76), 35, 130);
     if (pose.left_line) {
         pose.left_line = false;
         pose.left_rx = std::max(pose.left_rx, 18);
@@ -4178,14 +4180,15 @@ bool can_draw_motion_gaze()
 
 void set_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct, bool draw_now)
 {
-    constexpr int kDeadbandPct = 4;
+    (void)draw_now;
+    constexpr int kDeadbandPct = 3;
     int dx = 0;
     int dy = 0;
     if (std::abs(yaw_delta_pct) > kDeadbandPct) {
-        dx = yaw_delta_pct < 0 ? 11 : -11;
+        dx = yaw_delta_pct < 0 ? 16 : -16;
     }
     if (std::abs(pitch_delta_pct) > kDeadbandPct) {
-        dy = pitch_delta_pct > 0 ? -9 : 9;
+        dy = pitch_delta_pct > 0 ? -12 : 12;
     }
 
     if (dx == 0 && dy == 0) {
@@ -4200,10 +4203,7 @@ void set_motion_gaze_from_pct_delta(int yaw_delta_pct, int pitch_delta_pct, bool
     g_motion_gaze_dx = dx;
     g_motion_gaze_dy = dy;
     g_motion_gaze_active = true;
-
-    if (draw_now && can_draw_motion_gaze()) {
-        render_current_face_pose_no_transition();
-    }
+    g_motion_gaze_revision = g_motion_gaze_revision + 1;
 }
 
 void set_motion_gaze_from_raw_delta(const ServoAxis& yaw, const ServoAxis& pitch,
@@ -4225,8 +4225,36 @@ void clear_motion_gaze()
     g_motion_gaze_dx = 0;
     g_motion_gaze_dy = 0;
     g_motion_gaze_active = false;
-    if (can_draw_motion_gaze()) {
-        render_current_face_pose_no_transition();
+    g_motion_gaze_revision = g_motion_gaze_revision + 1;
+}
+
+void motion_gaze_task(void*)
+{
+    uint32_t last_revision = g_motion_gaze_revision;
+    bool drew_active_gaze = false;
+    int64_t last_draw_ms = 0;
+    while (true) {
+        const bool can_draw = can_draw_motion_gaze();
+        const bool active = g_motion_gaze_active;
+        const uint32_t revision = g_motion_gaze_revision;
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+
+        if (active && can_draw) {
+            const bool changed = revision != last_revision;
+            const bool enough_time = (now_ms - last_draw_ms) >= 260;
+            if (!drew_active_gaze || (changed && enough_time)) {
+                last_revision = revision;
+                last_draw_ms = now_ms;
+                render_current_face_pose_no_transition();
+                drew_active_gaze = true;
+            }
+        } else if (!active && drew_active_gaze && can_draw) {
+            last_revision = revision;
+            last_draw_ms = now_ms;
+            render_current_face_pose_no_transition();
+            drew_active_gaze = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 }
 
@@ -4250,6 +4278,7 @@ void move_axes_path_segment(const ServoAxis& yaw, const ServoAxis& pitch,
                             bool spline)
 {
     const int steps = safe_motion_steps(yaw1, pitch1, yaw2, pitch2, duration_ms);
+    set_motion_gaze_from_raw_delta(yaw, pitch, yaw1, pitch1, yaw2, pitch2, false);
     for (int step = 1; step <= steps; ++step) {
         const float t = smoothstep_value(static_cast<float>(step) / static_cast<float>(steps));
         int yaw_next = 0;
@@ -7383,6 +7412,7 @@ extern "C" void app_main()
         xTaskCreate(ui_task, "ui", kUiTaskStackBytes, nullptr, 3, nullptr);
     }
     xTaskCreate(hardware_servo_task, "servo_hw", 8192, nullptr, 3, nullptr);
+    xTaskCreate(motion_gaze_task, "motion_gaze", 4096, nullptr, 2, nullptr);
     xTaskCreate(led_effect_task, "led_fx", 2048, nullptr, 2, nullptr);
     xTaskCreate(audio_state_task, "audio_state", 8192, nullptr, 2, nullptr);
     xTaskCreate(touch_event_task, "touch_event", 8192, nullptr, 2, nullptr);
