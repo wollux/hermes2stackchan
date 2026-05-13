@@ -1249,6 +1249,21 @@ class BridgeConfigTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(blink_sequences), 48)
 
+    def test_life_sequence_has_no_long_idle_face_gap(self) -> None:
+        status = {
+            "display_sleeping": False,
+            "recording": False,
+            "speaking": False,
+            "ui": {"mode": "face"},
+            "face": {"emotion": "neutral", "intensity_pct": 60},
+        }
+
+        for seed in range(500):
+            sequence = build_life_sequence(status, random.Random(seed), include_motion=False)
+            for delay_ms, action in sequence:
+                if action["action"] == "face":
+                    self.assertLessEqual(delay_ms, 1200)
+
     def test_life_sequence_uses_pupil_glances(self) -> None:
         status = {
             "display_sleeping": False,

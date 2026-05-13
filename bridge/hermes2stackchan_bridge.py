@@ -49,6 +49,9 @@ EXAMPLE_CONFIG = Path("config/pairs.example.json")
 DEFAULT_ENV = Path(".env")
 DEFAULT_REMINDER_STORE = "~/.hermes/hermes2stackchan/reminders.json"
 DEFAULT_IDLE_SLEEP_TIMEOUT_S = 300.0
+DEFAULT_LIFE_MIN_INTERVAL_S = 0.35
+DEFAULT_LIFE_MAX_INTERVAL_S = 1.35
+MAX_LIFE_FACE_GAP_MS = 1200
 LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 STACKCHAN_PRESENCE_TIMEOUT_S = 15.0
 SENSOR_PROXIMITY_ON_DELTA = 55
@@ -3562,6 +3565,25 @@ def strip_motion_from_life_sequence(sequence: LifeSequence) -> LifeSequence:
     return stripped or [(0, {"action": "face", "emotion": "breathe", "intensity_pct": 60, "variant": "motion_stripped_breathe"})]
 
 
+def life_eye_heartbeat(rng: random.Random, base_intensity: int, variant: str) -> dict[str, Any]:
+    return life_face(
+        rng.choice(["glance_left", "glance_right", "glance_up", "glance_down", "soft_blink"]),
+        clamp_int(base_intensity, 45, 88),
+        f"{variant}_heartbeat",
+    )
+
+
+def densify_life_sequence(sequence: LifeSequence, rng: random.Random, base_intensity: int, variant: str) -> LifeSequence:
+    dense: LifeSequence = []
+    for delay_ms, action in sequence:
+        remaining = int(delay_ms)
+        while remaining > MAX_LIFE_FACE_GAP_MS:
+            dense.append((MAX_LIFE_FACE_GAP_MS, life_eye_heartbeat(rng, base_intensity, variant)))
+            remaining -= MAX_LIFE_FACE_GAP_MS
+        dense.append((remaining, action))
+    return dense
+
+
 def build_life_sequence(
     status: dict[str, Any] | None,
     rng: random.Random,
@@ -3575,6 +3597,7 @@ def build_life_sequence(
     base_intensity = int(restore["intensity_pct"])
     variant = choose_life_variant(rng)
     sequence = variant.builder(rng, base_intensity, mood)
+    sequence = densify_life_sequence(sequence, rng, base_intensity, variant.name)
     if not include_motion:
         sequence = strip_motion_from_life_sequence(sequence)
     for _delay, action in sequence:
@@ -6487,8 +6510,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     life = subcommands.add_parser("animate-life", help="Send small idle face and motion impulses so StackChan feels alive.")
     life.add_argument("--pair", default="desk", help="Pair id to animate.")
-    life.add_argument("--min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
-    life.add_argument("--max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
+    life.add_argument("--min-interval-s", type=float, default=DEFAULT_LIFE_MIN_INTERVAL_S, help="Minimum seconds between idle impulses.")
+    life.add_argument("--max-interval-s", type=float, default=DEFAULT_LIFE_MAX_INTERVAL_S, help="Maximum seconds between idle impulses.")
     life.add_argument("--status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
     life.add_argument("--seed", type=int, default=None, help="Optional random seed for repeatable tests.")
     life.add_argument("--once", action="store_true", help="Emit one life sequence and exit.")
@@ -6525,8 +6548,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--idle-sleep-timeout-s", type=float, default=DEFAULT_IDLE_SLEEP_TIMEOUT_S, help="Seconds without human/action before display sleep.")
     run.add_argument("--idle-sleep-poll-s", type=float, default=1.0, help="Idle sleep check interval.")
     run.add_argument("--idle-sleep-retry-s", type=float, default=30.0, help="Retry sleep command if status does not switch to sleeping.")
-    run.add_argument("--life-min-interval-s", type=float, default=4.0, help="Minimum seconds between idle impulses.")
-    run.add_argument("--life-max-interval-s", type=float, default=11.0, help="Maximum seconds between idle impulses.")
+    run.add_argument("--life-min-interval-s", type=float, default=DEFAULT_LIFE_MIN_INTERVAL_S, help="Minimum seconds between idle impulses.")
+    run.add_argument("--life-max-interval-s", type=float, default=DEFAULT_LIFE_MAX_INTERVAL_S, help="Maximum seconds between idle impulses.")
     run.add_argument("--life-status-timeout", type=float, default=1.5, help="Retained status wait timeout in seconds.")
     run.add_argument("--life-seed", type=int, default=None, help="Optional random seed for repeatable tests.")
     run.add_argument("--life-no-motion", action="store_true", help="Only animate the face, without servo head motion.")
