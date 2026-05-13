@@ -298,6 +298,34 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertIn("last_status_ts", payload["stackchan"])
         self.assertIn("last_skip_ts", payload["stackchan"])
 
+    def test_healthz_marks_presence_when_status_read_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                Path("config/pairs.example.json"),
+                env_path=None,
+                environ={"H2S_COMPANION_STATE_STORE": str(Path(tmp) / "state.json")},
+            )
+            pair = config.pairs["desk"]
+            STACKCHAN_PRESENCE.clear()
+
+            original = sys.modules["bridge.hermes2stackchan_bridge"].read_latest_status
+            try:
+                sys.modules["bridge.hermes2stackchan_bridge"].read_latest_status = lambda *_args, **_kwargs: {
+                    "schema_version": "1.0",
+                    "uptime_ms": 123,
+                    "battery_pct": 90,
+                    "sensors": {},
+                    "audio": {},
+                }
+                payload = build_bridge_healthz(config, pair, include_status=True)
+            finally:
+                sys.modules["bridge.hermes2stackchan_bridge"].read_latest_status = original
+
+        self.assertTrue(payload["stackchan"]["status_available"])
+        self.assertTrue(payload["stackchan"]["online"])
+        self.assertFalse(payload["watchdog"]["stale"])
+        STACKCHAN_PRESENCE.clear()
+
     def test_replay_memory_and_audio_action(self) -> None:
         config = load_config(Path("config/pairs.example.json"), env_path=None, environ={})
         pair = config.pairs["desk"]

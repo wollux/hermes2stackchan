@@ -1926,6 +1926,8 @@ def build_bridge_healthz(
         try:
             status = read_latest_status(config, pair, timeout_s=status_timeout_s)
             if isinstance(status, dict):
+                note_stackchan_status(pair, status)
+                presence = STACKCHAN_PRESENCE.snapshot(pair)
                 missing = missing_status_paths(status)
         except Exception as exc:
             missing = [f"status_read_error:{exc}"]
