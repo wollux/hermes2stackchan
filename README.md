@@ -601,7 +601,8 @@ follow-up recording start after Hermes question
 Bridge logs on the Pi:
 
 ```bash
-journalctl -u hermes2stackchan.service -f
+journalctl --user -u hermes2stackchan.service -f
+tail -f /home/wollux/.hermes/logs/hermes2stackchan.log
 ```
 
 MQTT traffic:

@@ -7,6 +7,7 @@ It streams these sources into one timestamped terminal:
 - Bridge `/healthz?status=1` summary
 - Bridge MQTT watch for `hermes-stackchan/<pair-id>/#`
 - Optional remote `journalctl --user -u hermes2stackchan.service -f`
+- Remote bridge log file: `/home/wollux/.hermes/logs/hermes2stackchan.log`
 - Power watcher log
 - Life animator log
 - Touch lamp log
@@ -41,3 +42,11 @@ Stop it with `Ctrl-C`.
 
 The serial monitor is the hardware reference. If MQTT and serial disagree,
 trust serial first and then inspect the bridge path.
+
+On the current Pi user-service install, stdout/stderr are appended to:
+
+```bash
+tail -f /home/wollux/.hermes/logs/hermes2stackchan.log
+```
+
+Use this when `journalctl --user -u hermes2stackchan.service` has no entries.
