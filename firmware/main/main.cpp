@@ -188,6 +188,7 @@ int g_pre_recording_face_intensity_pct = 60;
 int g_face_blush_alpha_pct = 0;
 int g_face_hearts_alpha_pct = 0;
 bool g_face_fx_alpha_initialized = false;
+bool g_face_pose_initialized = false;
 bool play_wav_url(const char* url);
 void play_wav_url_task(void* arg);
 bool init_camera();
@@ -340,6 +341,32 @@ uint16_t rgb565_scaled(uint8_t r, uint8_t g, uint8_t b, int alpha_pct)
     return rgb565(static_cast<uint8_t>((static_cast<int>(r) * alpha) / 100),
                   static_cast<uint8_t>((static_cast<int>(g) * alpha) / 100),
                   static_cast<uint8_t>((static_cast<int>(b) * alpha) / 100));
+}
+
+uint8_t rgb565_r(uint16_t color)
+{
+    return static_cast<uint8_t>(((color >> 11) & 0x1F) * 255 / 31);
+}
+
+uint8_t rgb565_g(uint16_t color)
+{
+    return static_cast<uint8_t>(((color >> 5) & 0x3F) * 255 / 63);
+}
+
+uint8_t rgb565_b(uint16_t color)
+{
+    return static_cast<uint8_t>((color & 0x1F) * 255 / 31);
+}
+
+uint16_t blend_rgb565(uint16_t from, uint16_t to, float t)
+{
+    t = std::max(0.0f, std::min(1.0f, t));
+    const auto lerp_byte = [t](uint8_t a, uint8_t b) -> uint8_t {
+        return static_cast<uint8_t>(std::lround(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * t));
+    };
+    return rgb565(lerp_byte(rgb565_r(from), rgb565_r(to)),
+                  lerp_byte(rgb565_g(from), rgb565_g(to)),
+                  lerp_byte(rgb565_b(from), rgb565_b(to)));
 }
 
 int clamp_int(int value, int min_value, int max_value)
@@ -2311,6 +2338,311 @@ void draw_face_fx(int blush_alpha_pct, bool sweat, bool anger, int hearts_alpha_
     }
 }
 
+struct FacePose {
+    int left_rx = 18;
+    int left_ry = 32;
+    int right_rx = 18;
+    int right_ry = 32;
+    int left_pupil_dx = 0;
+    int left_pupil_dy = 0;
+    int right_pupil_dx = 0;
+    int right_pupil_dy = 0;
+    int pupil_scale = 100;
+    int left_tilt = 0;
+    int right_tilt = 0;
+    bool left_line = false;
+    bool right_line = false;
+    bool heart_eyes = false;
+    bool x_eyes = false;
+    bool draw_brows = true;
+    int mouth_mode = 0;
+    int mouth_dx = 0;
+    int mouth_dy = 0;
+    int mouth_width = 68;
+    int mouth_height = 18;
+    int lb[4] = {70, 38, 130, 38};
+    int rb[4] = {190, 38, 250, 38};
+    int blush_alpha = 0;
+    int hearts_alpha = 0;
+    bool sweat = false;
+    bool anger = false;
+    bool glitch = false;
+    uint16_t eye_color = 0;
+    uint16_t mouth_color = 0;
+    uint16_t brow_color = 0;
+};
+
+FacePose lerp_face_pose(const FacePose& from, const FacePose& to, float t)
+{
+    t = std::max(0.0f, std::min(1.0f, t));
+    const auto li = [t](int a, int b) -> int {
+        return static_cast<int>(std::lround(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * t));
+    };
+    FacePose out = {};
+    out.left_rx = li(from.left_rx, to.left_rx);
+    out.left_ry = li(from.left_ry, to.left_ry);
+    out.right_rx = li(from.right_rx, to.right_rx);
+    out.right_ry = li(from.right_ry, to.right_ry);
+    out.left_pupil_dx = li(from.left_pupil_dx, to.left_pupil_dx);
+    out.left_pupil_dy = li(from.left_pupil_dy, to.left_pupil_dy);
+    out.right_pupil_dx = li(from.right_pupil_dx, to.right_pupil_dx);
+    out.right_pupil_dy = li(from.right_pupil_dy, to.right_pupil_dy);
+    out.pupil_scale = li(from.pupil_scale, to.pupil_scale);
+    out.left_tilt = li(from.left_tilt, to.left_tilt);
+    out.right_tilt = li(from.right_tilt, to.right_tilt);
+    out.mouth_dx = li(from.mouth_dx, to.mouth_dx);
+    out.mouth_dy = li(from.mouth_dy, to.mouth_dy);
+    out.mouth_width = li(from.mouth_width, to.mouth_width);
+    out.mouth_height = li(from.mouth_height, to.mouth_height);
+    for (int i = 0; i < 4; ++i) {
+        out.lb[i] = li(from.lb[i], to.lb[i]);
+        out.rb[i] = li(from.rb[i], to.rb[i]);
+    }
+    out.blush_alpha = li(from.blush_alpha, to.blush_alpha);
+    out.hearts_alpha = li(from.hearts_alpha, to.hearts_alpha);
+    out.eye_color = blend_rgb565(from.eye_color, to.eye_color, t);
+    out.mouth_color = blend_rgb565(from.mouth_color, to.mouth_color, t);
+    out.brow_color = blend_rgb565(from.brow_color, to.brow_color, t);
+
+    const bool use_target_symbols = t >= 0.58f;
+    out.left_line = use_target_symbols ? to.left_line : from.left_line;
+    out.right_line = use_target_symbols ? to.right_line : from.right_line;
+    out.heart_eyes = use_target_symbols ? to.heart_eyes : from.heart_eyes;
+    out.x_eyes = use_target_symbols ? to.x_eyes : from.x_eyes;
+    out.draw_brows = use_target_symbols ? to.draw_brows : from.draw_brows;
+    out.mouth_mode = use_target_symbols ? to.mouth_mode : from.mouth_mode;
+    out.sweat = use_target_symbols ? to.sweat : from.sweat;
+    out.anger = use_target_symbols ? to.anger : from.anger;
+    out.glitch = use_target_symbols ? to.glitch : from.glitch;
+    return out;
+}
+
+bool build_face_pose(const char* emotion, int intensity_pct, FacePose& pose)
+{
+    const int pulse = clamp_int(intensity_pct / 18, 0, 7);
+    const uint16_t white = rgb565(245, 250, 255);
+    pose = FacePose{};
+    pose.eye_color = emotion_eye_color(emotion);
+    pose.mouth_color = white;
+    pose.brow_color = pose.eye_color;
+    pose.left_rx = pose.right_rx = 18 + pulse;
+    pose.left_ry = pose.right_ry = 32 + pulse;
+    pose.mouth_width = 68 + pulse * 2;
+    pose.mouth_height = 18 + pulse;
+
+    if (str_eq(emotion, "soft_blink")) {
+        pose.left_ry = pose.right_ry = 18;
+        pose.mouth_width = 58;
+        pose.mouth_height = 14;
+        pose.draw_brows = false;
+    } else if (str_eq(emotion, "neutral")) {
+        pose.draw_brows = false;
+    } else if (str_eq(emotion, "friendly")) {
+        pose.left_ry = pose.right_ry = 34 + pulse;
+        pose.lb[1] = 34; pose.lb[3] = 28; pose.rb[1] = 28; pose.rb[3] = 34;
+        pose.mouth_mode = 1; pose.mouth_width = 84; pose.mouth_height = 28 + pulse;
+        pose.blush_alpha = clamp_int(55 + intensity_pct / 2, 0, 100);
+    } else if (str_eq(emotion, "super_happy")) {
+        pose.left_line = pose.right_line = true;
+        pose.left_tilt = 5; pose.right_tilt = -5;
+        pose.mouth_mode = 1; pose.mouth_width = 98; pose.mouth_height = 34 + pulse;
+        pose.blush_alpha = clamp_int(55 + intensity_pct / 2, 0, 100);
+        pose.hearts_alpha = clamp_int(45 + intensity_pct / 2, 0, 100);
+        pose.lb[1] = 26; pose.lb[3] = 20; pose.rb[1] = 20; pose.rb[3] = 26;
+    } else if (str_eq(emotion, "happy") || str_eq(emotion, "thankful")) {
+        pose.left_line = pose.right_line = true;
+        pose.left_tilt = 4; pose.right_tilt = -4;
+        pose.mouth_mode = 1; pose.mouth_width = str_eq(emotion, "thankful") ? 78 : 88; pose.mouth_height = 28 + pulse;
+        pose.blush_alpha = str_eq(emotion, "thankful") ? clamp_int(55 + intensity_pct / 2, 0, 100) : 0;
+        pose.lb[1] = 34; pose.lb[3] = 28; pose.rb[1] = 28; pose.rb[3] = 34;
+    } else if (str_eq(emotion, "love")) {
+        pose.heart_eyes = true;
+        pose.mouth_mode = 1; pose.mouth_width = 92; pose.mouth_height = 34;
+        pose.blush_alpha = clamp_int(55 + intensity_pct / 2, 0, 100);
+        pose.lb[1] = pose.lb[3] = pose.rb[1] = pose.rb[3] = 28;
+    } else if (str_eq(emotion, "mischievous") || str_eq(emotion, "smug") || str_eq(emotion, "evil_grin")) {
+        const bool evil = str_eq(emotion, "evil_grin");
+        pose.left_ry = 22 + pulse / 2; pose.right_ry = 30 + pulse / 2;
+        pose.left_pupil_dx = pose.right_pupil_dx = evil ? -8 : 8;
+        pose.mouth_mode = 5; pose.mouth_dx = evil ? -4 : 8; pose.mouth_width = 82; pose.mouth_height = 24;
+        pose.lb[1] = evil ? 24 : 44; pose.lb[3] = evil ? 52 : 36;
+        pose.rb[1] = evil ? 52 : 36; pose.rb[3] = evil ? 24 : 44;
+        if (evil) { pose.mouth_color = rgb565(255, 224, 116); pose.anger = true; }
+    } else if (str_eq(emotion, "proud")) {
+        pose.left_ry = pose.right_ry = 28; pose.left_pupil_dy = pose.right_pupil_dy = -4;
+        pose.mouth_mode = 1; pose.mouth_width = 78; pose.mouth_height = 22;
+        pose.lb[1] = 24; pose.lb[3] = 22; pose.rb[1] = 22; pose.rb[3] = 24;
+    } else if (str_eq(emotion, "shy")) {
+        pose.left_pupil_dx = pose.right_pupil_dx = -5; pose.left_pupil_dy = pose.right_pupil_dy = 6;
+        pose.left_ry = pose.right_ry = 26; pose.mouth_mode = 2; pose.mouth_width = 44; pose.mouth_height = 10;
+        pose.blush_alpha = clamp_int(55 + intensity_pct / 2, 0, 100);
+        pose.lb[1] = 36; pose.lb[3] = 42; pose.rb[1] = 42; pose.rb[3] = 36;
+    } else if (str_eq(emotion, "skeptical") || str_eq(emotion, "annoyed")) {
+        pose.left_ry = pose.right_ry = 14 + pulse / 3;
+        pose.left_pupil_dx = pose.right_pupil_dx = str_eq(emotion, "annoyed") ? 8 : -8;
+        pose.mouth_mode = 4; pose.mouth_width = 76; pose.mouth_height = 10;
+        pose.lb[1] = 40; pose.lb[3] = 36; pose.rb[1] = 34; pose.rb[3] = 38;
+    } else if (str_eq(emotion, "offended")) {
+        pose.left_ry = pose.right_ry = 16; pose.left_pupil_dx = pose.right_pupil_dx = -7;
+        pose.mouth_mode = 4; pose.mouth_width = 54; pose.mouth_dy = 10;
+        pose.lb[1] = 42; pose.lb[3] = 48; pose.rb[1] = 40; pose.rb[3] = 36;
+    } else if (str_eq(emotion, "sad")) {
+        pose.left_ry = pose.right_ry = 24 + pulse; pose.left_pupil_dy = pose.right_pupil_dy = 7;
+        pose.mouth_mode = 8; pose.mouth_width = 74; pose.mouth_height = 24;
+        pose.lb[1] = 28; pose.lb[3] = 52; pose.rb[1] = 52; pose.rb[3] = 28;
+    } else if (str_eq(emotion, "tired") || str_eq(emotion, "sleepy") || str_eq(emotion, "bored")) {
+        pose.left_ry = pose.right_ry = str_eq(emotion, "sleepy") ? 8 : 13;
+        pose.left_pupil_dx = pose.right_pupil_dx = -3; pose.left_pupil_dy = pose.right_pupil_dy = 4;
+        pose.mouth_mode = str_eq(emotion, "bored") ? 4 : 3; pose.mouth_width = 58; pose.mouth_height = 12; pose.mouth_dy = 4;
+        pose.lb[1] = pose.lb[3] = pose.rb[1] = pose.rb[3] = 46;
+    } else if (str_eq(emotion, "confused") || str_eq(emotion, "thinking")) {
+        pose.left_pupil_dx = -5; pose.right_pupil_dx = 5; pose.left_pupil_dy = pose.right_pupil_dy = str_eq(emotion, "thinking") ? -6 : 0;
+        pose.mouth_mode = 7; pose.mouth_width = 64; pose.mouth_height = 18;
+        pose.lb[1] = 24; pose.lb[3] = 44; pose.rb[1] = 50; pose.rb[3] = 28;
+    } else if (str_eq(emotion, "surprised") || str_eq(emotion, "panic") || str_eq(emotion, "scared") || str_eq(emotion, "help") || str_eq(emotion, "face_down")) {
+        const bool alarm = str_eq(emotion, "panic") || str_eq(emotion, "help") || str_eq(emotion, "face_down");
+        pose.left_rx = pose.right_rx = alarm ? 31 : 28;
+        pose.left_ry = pose.right_ry = alarm ? 40 : 36;
+        pose.pupil_scale = alarm ? 45 : 65;
+        pose.mouth_mode = 6; pose.mouth_width = alarm ? 74 : 62; pose.mouth_height = alarm ? 40 : 30;
+        pose.lb[1] = 24; pose.lb[3] = 30; pose.rb[1] = 30; pose.rb[3] = 24;
+        pose.sweat = alarm || str_eq(emotion, "scared");
+        pose.anger = alarm;
+        if (alarm) { pose.mouth_color = rgb565(255, 76, 88); }
+    } else if (str_eq(emotion, "angry")) {
+        pose.left_line = pose.right_line = true; pose.left_tilt = 18; pose.right_tilt = -18;
+        pose.mouth_mode = 4; pose.mouth_width = 82; pose.mouth_dy = 8; pose.anger = true;
+        pose.lb[1] = 22; pose.lb[3] = 54; pose.rb[1] = 54; pose.rb[3] = 22;
+    } else if (str_eq(emotion, "dramatic")) {
+        pose.left_ry = 38; pose.right_ry = 18; pose.left_pupil_dx = -7; pose.right_pupil_dx = 7;
+        pose.mouth_mode = 6; pose.mouth_width = 60; pose.mouth_height = 26; pose.sweat = true;
+        pose.lb[1] = 18; pose.lb[3] = 52; pose.rb[1] = 48; pose.rb[3] = 22;
+    } else if (str_eq(emotion, "listening")) {
+        pose.left_rx = pose.right_rx = 20 + pulse / 2;
+        pose.left_ry = pose.right_ry = 34;
+        pose.pupil_scale = 86;
+        pose.mouth_mode = 1; pose.mouth_width = 52 + pulse; pose.mouth_height = 15;
+        pose.mouth_color = rgb565(145, 255, 230);
+        pose.lb[1] = 32; pose.lb[3] = 25; pose.rb[1] = 25; pose.rb[3] = 32;
+    } else if (str_eq(emotion, "speaking")) {
+        pose.left_ry = pose.right_ry = 33 + pulse; pose.mouth_mode = 6; pose.mouth_width = 70 + pulse * 3; pose.mouth_height = 28 + pulse;
+        pose.mouth_color = rgb565(145, 255, 230); pose.draw_brows = false;
+    } else if (str_eq(emotion, "charging")) {
+        pose.left_ry = pose.right_ry = 32; pose.mouth_mode = 1; pose.mouth_width = 70; pose.mouth_height = 24; pose.mouth_color = rgb565(112, 255, 150);
+        pose.lb[1] = 32; pose.lb[3] = 28; pose.rb[1] = 28; pose.rb[3] = 32;
+    } else if (str_eq(emotion, "error") || str_eq(emotion, "dead")) {
+        pose.x_eyes = true;
+        pose.mouth_mode = str_eq(emotion, "dead") ? 3 : 8; pose.mouth_width = 76; pose.mouth_height = 24; pose.mouth_color = rgb565(255, 76, 88);
+        pose.draw_brows = false;
+    } else if (str_eq(emotion, "glitch")) {
+        pose.left_rx = 28; pose.left_ry = 37; pose.right_rx = 16; pose.right_ry = 25; pose.left_pupil_dx = 10; pose.right_pupil_dx = -8;
+        pose.mouth_mode = 7; pose.mouth_width = 76; pose.mouth_height = 22; pose.glitch = true;
+        pose.lb[1] = 20; pose.lb[3] = 58; pose.rb[1] = 54; pose.rb[3] = 18;
+        pose.brow_color = rgb565(255, 209, 102); pose.mouth_color = pose.brow_color;
+    } else {
+        return str_eq(emotion, "neutral");
+    }
+    return true;
+}
+
+void render_face_pose(const FacePose& pose)
+{
+    const int left_x = 100;
+    const int right_x = 220;
+    const int eye_y = 84;
+    const int mouth_y = 168;
+    FaceFrameGuard frame;
+    clear(kBlack);
+
+    if (pose.heart_eyes) {
+        draw_tiny_heart(left_x, eye_y, 42, rgb565(255, 92, 138));
+        draw_tiny_heart(right_x, eye_y, 42, rgb565(255, 92, 138));
+    } else if (pose.x_eyes) {
+        draw_line(left_x - 24, eye_y - 24, left_x + 24, eye_y + 24, pose.eye_color, 6);
+        draw_line(left_x + 24, eye_y - 24, left_x - 24, eye_y + 24, pose.eye_color, 6);
+        draw_line(right_x - 24, eye_y - 24, right_x + 24, eye_y + 24, pose.eye_color, 6);
+        draw_line(right_x + 24, eye_y - 24, right_x - 24, eye_y + 24, pose.eye_color, 6);
+    } else {
+        if (pose.left_line) {
+            draw_single_eye_line(left_x, eye_y, pose.left_tilt, pose.eye_color, 58);
+        } else {
+            draw_single_eye_scaled_pupil(left_x, eye_y, pose.left_rx, pose.left_ry,
+                                         pose.left_pupil_dx, pose.left_pupil_dy, pose.pupil_scale, pose.eye_color);
+        }
+        if (pose.right_line) {
+            draw_single_eye_line(right_x, eye_y, pose.right_tilt, pose.eye_color, 58);
+        } else {
+            draw_single_eye_scaled_pupil(right_x, eye_y, pose.right_rx, pose.right_ry,
+                                         pose.right_pupil_dx, pose.right_pupil_dy, pose.pupil_scale, pose.eye_color);
+        }
+    }
+
+    if (pose.draw_brows) {
+        draw_mood_brow(pose.lb[0], pose.lb[1], pose.lb[2], pose.lb[3], pose.brow_color);
+        draw_mood_brow(pose.rb[0], pose.rb[1], pose.rb[2], pose.rb[3], pose.brow_color);
+    }
+    if (pose.mouth_mode == 8) {
+        draw_mouth_curve(160 + pose.mouth_dx, mouth_y + pose.mouth_dy + 18,
+                         pose.mouth_width, pose.mouth_height, false, pose.mouth_color);
+    } else {
+        draw_simple_mouth(160 + pose.mouth_dx, mouth_y + pose.mouth_dy,
+                          pose.mouth_width, pose.mouth_height, pose.mouth_mode, pose.mouth_color);
+    }
+    draw_face_fx(pose.blush_alpha, pose.sweat, pose.anger, pose.hearts_alpha, false, pose.glitch, pose.brow_color);
+}
+
+bool animate_face_transition(const char* target_emotion, int target_intensity)
+{
+    FacePose from = {};
+    FacePose to = {};
+    const char* source_emotion = normalize_face_emotion(g_face_emotion);
+    const int source_intensity = clamp_int(g_face_intensity_pct, 0, 100);
+    if (!build_face_pose(source_emotion, source_intensity, from) ||
+        !build_face_pose(target_emotion, target_intensity, to)) {
+        return false;
+    }
+    if (!g_face_pose_initialized) {
+        g_face_pose_initialized = true;
+        g_face_blush_alpha_pct = to.blush_alpha;
+        g_face_hearts_alpha_pct = to.hearts_alpha;
+        return false;
+    }
+
+    const bool alarm = str_eq(target_emotion, "panic") || str_eq(target_emotion, "help") ||
+                       str_eq(target_emotion, "face_down") || str_eq(target_emotion, "error");
+    const bool fast = alarm || str_eq(target_emotion, "speaking") || str_eq(target_emotion, "listening");
+    const int frames = alarm ? 4 : fast ? 5 : 8;
+    const int frame_ms = alarm ? 24 : fast ? 30 : 34;
+
+    for (int i = 1; i <= frames; ++i) {
+        float t = static_cast<float>(i) / static_cast<float>(frames);
+        t = t * t * (3.0f - 2.0f * t);
+        FacePose frame_pose = lerp_face_pose(from, to, t);
+        g_face_blush_alpha_pct = frame_pose.blush_alpha;
+        g_face_hearts_alpha_pct = frame_pose.hearts_alpha;
+        render_face_pose(frame_pose);
+        vTaskDelay(pdMS_TO_TICKS(frame_ms));
+    }
+    g_face_blush_alpha_pct = to.blush_alpha;
+    g_face_hearts_alpha_pct = to.hearts_alpha;
+    g_face_fx_alpha_initialized = true;
+    return true;
+}
+
+void return_to_base_face(const char* base_emotion, int base_intensity)
+{
+    const int eye_heights[] = {26, 30, 32};
+    for (int eye_height : eye_heights) {
+        draw_life_face_frame(base_emotion,
+                             base_intensity,
+                             0,
+                             0,
+                             eye_height);
+        vTaskDelay(pdMS_TO_TICKS(34));
+    }
+    draw_face(base_emotion, base_intensity);
+}
+
 bool draw_mood_preset(const char* emotion, int intensity_pct)
 {
     const int pulse = clamp_int(intensity_pct / 18, 0, 7);
@@ -2593,7 +2925,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             draw_life_face_frame(base_emotion, base_intensity, 0, 0, eye_height);
             vTaskDelay(pdMS_TO_TICKS(42));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2607,7 +2939,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
                                  28 + clamp_int(offset, -2, 3));
             vTaskDelay(pdMS_TO_TICKS(90));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2624,7 +2956,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
                                  offset > 3 ? 1 : 0);
             vTaskDelay(pdMS_TO_TICKS(135));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2645,7 +2977,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             }
             vTaskDelay(pdMS_TO_TICKS(i >= 2 && i <= 4 ? 180 : 90));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2673,7 +3005,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             draw_mouth_curve(160 + pupil_shift, mouth_y - 8, 70, 24 + pulse, true, white);
             vTaskDelay(pdMS_TO_TICKS(80));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2691,7 +3023,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             draw_ellipse(160, 154, 8 + size / 2, 8 + size / 4, kBlack);
             vTaskDelay(pdMS_TO_TICKS(95));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2707,7 +3039,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             draw_mouth_curve(160, 146, 88, 34 + offset, true, white);
             vTaskDelay(pdMS_TO_TICKS(105));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2717,7 +3049,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			draw_custom_life_face_frame(14, 29, shift, 0, 14, 29, -shift, 0, 2, 0, 0, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(88));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2727,7 +3059,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			draw_custom_life_face_frame(14, 29, shift, 0, 14, 29, -shift, 0, 5, shift / 5, 0, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(74));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2737,7 +3069,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 				draw_custom_life_face_frame(14, 28, -3, -8 + phase, 14, 28, 7, 8 - phase, 5, -3 + phase, 1, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(115));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2749,7 +3081,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			                            size > 2 ? 6 : 0, 0, -size / 4, 0, 0, base_intensity + size);
 			vTaskDelay(pdMS_TO_TICKS(82));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2759,7 +3091,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 				draw_custom_life_face_frame(15, 24 - phase * 4, -7, 0, 15, 29, -7, 0, 7, -4, 1, 2, -1, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(120));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2769,7 +3101,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			draw_custom_life_face_frame(12, 26, dot[0], dot[1], 12, 26, dot[2], dot[3], 6, 0, 0, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(92));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2779,7 +3111,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			draw_custom_life_face_frame(14, 29, 0, 0, 14, 29, 0, 0, mode, 0, mode == 6 ? 2 : 0, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(105));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2789,7 +3121,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			draw_custom_life_face_frame(14, 28, shift / 2, 0, 14, 28, shift / 2, 0, 5, shift, 0, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(100));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2799,7 +3131,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			draw_custom_life_face_frame(15, 5, 0, 0, 15, 5, 0, 0, bounce > 0 ? 1 : 2, 0, -bounce, 2, -2, base_intensity + 8);
 			vTaskDelay(pdMS_TO_TICKS(78));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2810,7 +3142,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
 			                            height > 30 ? 6 : 2, 0, height > 30 ? -2 : 2, 0, 0, base_intensity);
 			vTaskDelay(pdMS_TO_TICKS(height < 8 ? 165 : 92));
 		}
-		draw_face(base_emotion, base_intensity);
+		return_to_base_face(base_emotion, base_intensity);
 		return;
 	}
 
@@ -2828,7 +3160,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             draw_line(126, 170 + wiggle, 194, 166 - wiggle, rgb565(245, 250, 255), 3);
             vTaskDelay(pdMS_TO_TICKS(110));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2848,7 +3180,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
             draw_ellipse(160, 158, 12 + size / 2, 4 + size / 2, kBlack);
             vTaskDelay(pdMS_TO_TICKS(i >= 2 && i <= 4 ? 160 : 95));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2873,7 +3205,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
                                  mouth_modes[i]);
             vTaskDelay(pdMS_TO_TICKS(110));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2901,7 +3233,7 @@ void animate_transient_face(const char* emotion, int intensity_pct)
                                  static_cast<int>(std::lround(target_pupil_dy * phase)));
             vTaskDelay(pdMS_TO_TICKS(95));
         }
-        draw_face(base_emotion, base_intensity);
+        return_to_base_face(base_emotion, base_intensity);
         return;
     }
 
@@ -2926,15 +3258,22 @@ void animate_transient_face(const char* emotion, int intensity_pct)
                              28 + clamp_int(base_intensity / 24, 0, 4));
         vTaskDelay(pdMS_TO_TICKS(80));
     }
-    draw_face(base_emotion, base_intensity);
+    return_to_base_face(base_emotion, base_intensity);
 }
 
 void draw_face(const char* emotion, int intensity_pct)
 {
     wake_display_if_needed();
     copy_ui_mode(g_face_extra_mode == FaceExtraMode::VoiceWaveform ? "recording" : "face");
-    copy_face_emotion(emotion, intensity_pct);
-    if (animate_face_fx_transition(g_face_emotion, intensity_pct)) {
+    const char* target_emotion = normalize_face_emotion(emotion);
+    const int target_intensity = clamp_int(intensity_pct, 0, 100);
+    if (!is_transient_face_emotion(target_emotion) &&
+        animate_face_transition(target_emotion, target_intensity)) {
+        copy_face_emotion(target_emotion, target_intensity);
+        return;
+    }
+    copy_face_emotion(target_emotion, target_intensity);
+    if (animate_face_fx_transition(g_face_emotion, target_intensity)) {
         return;
     }
     FaceFrameGuard frame;
@@ -2946,7 +3285,7 @@ void draw_face(const char* emotion, int intensity_pct)
 	    const uint16_t red = rgb565(255, 55, 70);
 	    const uint16_t face_color = emotion_eye_color(g_face_emotion);
     const uint16_t accent = std::strcmp(g_face_emotion, "sleep") == 0 ? rgb565(80, 130, 160) : cyan;
-    const int pulse = clamp_int(intensity_pct / 18, 0, 6);
+    const int pulse = clamp_int(target_intensity / 18, 0, 6);
 	    const int left_x = 100;
 	    const int right_x = 220;
 	    const int eye_y = 84;
@@ -2954,7 +3293,7 @@ void draw_face(const char* emotion, int intensity_pct)
 
     clear(kBlack);
 
-    if (draw_mood_preset(g_face_emotion, intensity_pct)) {
+    if (draw_mood_preset(g_face_emotion, target_intensity)) {
         return;
     }
 
