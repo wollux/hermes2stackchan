@@ -265,6 +265,20 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(normal_reply, "Normalmodus ist aktiv.")
         self.assertIn({"action": "privacy", "privacy_mode": "normal"}, normal_actions)
 
+    def test_local_motion_profile_commands_are_handled_without_hermes(self) -> None:
+        dance = direct_local_command_from_transcript("Tanze fuer mich.")
+        self.assertIsNotNone(dance)
+        assert dance is not None
+        dance_reply, dance_actions, dance_post_tts = dance
+        self.assertEqual(dance_reply, "Ich tanze.")
+        self.assertEqual(dance_post_tts, "")
+        self.assertIn({"action": "motion_profile", "profile": "rescue_dance", "intensity_pct": 82}, dance_actions)
+
+        nod = direct_local_command_from_transcript("Nicke langsam.")
+        self.assertIsNotNone(nod)
+        assert nod is not None
+        self.assertIn({"action": "motion_profile", "profile": "slow_nod", "intensity_pct": 68}, nod[1])
+
     def test_normalize_companion_mood_unknown_falls_back_to_playful(self) -> None:
         self.assertEqual(normalize_companion_mood("wat"), "playful")
         self.assertEqual(normalize_companion_mood("question"), "curious")

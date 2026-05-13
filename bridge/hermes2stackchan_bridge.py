@@ -3669,6 +3669,93 @@ def local_companion_mode_reply_from_command(command: str) -> tuple[str, list[dic
     return None
 
 
+def local_motion_profile_reply_from_command(command: str) -> tuple[str, list[dict[str, Any]], str] | None:
+    padded = f" {command} "
+    profile_specs: tuple[tuple[tuple[str, ...], str, str, int, str], ...] = (
+        (
+            (" langsam nicken ", " nicke langsam ", " langsames nicken "),
+            "Ich nicke langsam.",
+            "slow_nod",
+            68,
+            "friendly",
+        ),
+        (
+            (" nicken ", " nicke ", " sag ja mit dem kopf ", " ja sagen "),
+            "Ja.",
+            "slow_nod",
+            74,
+            "friendly",
+        ),
+        (
+            (" kopf schuetteln ", " schuettel den kopf ", " schuettle den kopf ", " nein sagen ", " schnelles nein "),
+            "Nein.",
+            "fast_shake",
+            76,
+            "annoyed",
+        ),
+        (
+            (" neugierig schauen ", " neugieriger blick ", " schau neugierig ", " guck neugierig "),
+            "Neugierig.",
+            "curious_look",
+            68,
+            "curious",
+        ),
+        (
+            (" verwirrt schwenken ", " verwirrter blick ", " schau verwirrt ", " guck verwirrt "),
+            "Verwirrt.",
+            "confused_sway",
+            70,
+            "confused",
+        ),
+        (
+            (" stolz hoch ", " stolz gucken ", " stolz schauen ", " guck stolz ", " schau stolz "),
+            "Stolz.",
+            "proud_look_up",
+            72,
+            "happy",
+        ),
+        (
+            (" muede absinken ", " sink muede ", " lass den kopf haengen ", " haeng den kopf "),
+            "Muede.",
+            "tired_sink",
+            64,
+            "tired",
+        ),
+        (
+            (" tanz ", " tanze ", " tanzen ", " dance "),
+            "Ich tanze.",
+            "rescue_dance",
+            82,
+            "playful",
+        ),
+        (
+            (" streck dich ", " aufwach strecken ", " strecken "),
+            "Ich strecke mich.",
+            "wake_stretch",
+            68,
+            "friendly",
+        ),
+        (
+            (" schlafpose ", " schlaf pose ", " kopf runter schlafen "),
+            "Schlafpose.",
+            "sleep_pose",
+            62,
+            "sleepy",
+        ),
+    )
+    for phrases, reply, profile, intensity, face in profile_specs:
+        if any(phrase in padded for phrase in phrases):
+            return (
+                reply,
+                [
+                    {"action": "face", "emotion": face, "intensity_pct": clamp_int(intensity - 8, 50, 90)},
+                    {"action": "motion_profile", "profile": profile, "intensity_pct": intensity},
+                ],
+                "",
+            )
+    return None
+
+
 def direct_local_command_from_transcript(
     text: str,
     status: Any = STATUS_NOT_PROVIDED,
@@ -3698,6 +3785,10 @@ def direct_local_command_from_transcript(
     ):
         if local_reply:
             return local_reply
+
+    motion_reply = local_motion_profile_reply_from_command(command)
+    if motion_reply:
+        return motion_reply
 
     face_reply = local_face_reply_from_command(command)
     if face_reply:
