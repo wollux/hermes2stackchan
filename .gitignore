@@ -41,3 +41,4 @@ firmware_clock/managed_components/
 *.wav
 *.mp3
 *.ogg
+.run/local-secrets/

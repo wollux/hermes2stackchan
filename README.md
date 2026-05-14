@@ -2,6 +2,10 @@
 
 Hermes2StackChan connects one Hermes agent to one StackChan companion device.
 
+Current locked baseline: **v0.5**.
+Operational wiring, ownership, and recovery flow are documented in:
+[`docs/operations-baseline-v0.5.md`](docs/operations-baseline-v0.5.md)
+
 The design is intentionally split:
 
 - StackChan firmware is the safe hardware body: display, face, LEDs, touch, audio capture, speaker, servos, status.
